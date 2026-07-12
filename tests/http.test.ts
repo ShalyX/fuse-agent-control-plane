@@ -114,6 +114,17 @@ describe("POST /v1/chat/completions", () => {
 
     const state = await request(createFuseApp(dependencies)).get("/api/state");
     expect(state.body.root.settledUsdc).toBe("0.004500");
+    expect(state.headers["cache-control"]).toContain("no-store");
+
+    const run = await request(createFuseApp(dependencies)).get("/api/runs/demo-mandate");
+    expect(run.status).toBe(200);
+    expect(run.body).toMatchObject({
+      recordId: "demo-mandate",
+      persistence: "memory",
+      state: { root: { settledUsdc: "0.004500" } },
+      receipts: [{ requestId: "cold-start-1", childId: "scout" }],
+    });
+    expect(run.headers["cache-control"]).toContain("no-store");
   });
 
   it("serves the control desk and machine-readable budget tree", async () => {

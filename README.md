@@ -102,10 +102,11 @@ npm run dev
 ## Public demo
 
 - Control desk: [fuse-agent-control-plane.vercel.app/desk](https://fuse-agent-control-plane.vercel.app/desk)
-- State API: [fuse-agent-control-plane.vercel.app/api/state](https://fuse-agent-control-plane.vercel.app/api/state)
+- State API (current mutable record): [fuse-agent-control-plane.vercel.app/api/state](https://fuse-agent-control-plane.vercel.app/api/state)
+- Direct persisted record (`demo-mandate`): [fuse-agent-control-plane.vercel.app/api/runs/demo-mandate](https://fuse-agent-control-plane.vercel.app/api/runs/demo-mandate)
 - Source and evidence: [github.com/ShalyX/fuse-agent-control-plane](https://github.com/ShalyX/fuse-agent-control-plane)
 
-The public deployment is backed by Neon Postgres. Ledger state, reservations, circuits, held provider responses, idempotency results, and released receipts survive serverless cold starts. The public `/api/state` currently exposes the persisted golden-run outcome plus a live Builder cold-start probe.
+The public deployment is backed by Neon Postgres. The off-chain state record ID is `demo-mandate`; this is separate from the Arc contract's hashed mandate ID `0xa12a9146913454b8e14e132a1ee07df1a114cbc01e80e2c1a0bc8bfd58e88c6c`. Ledger state, reservations, circuits, held provider responses, idempotency results, and released receipts survive serverless cold starts. `/api/state` and `/api/runs/demo-mandate` send explicit `no-store` CDN and browser cache headers. The direct run endpoint returns the current database-backed state, its persisted receipts, and the Arc anchor boundary in one response.
 
 A live durability probe deliberately split one paid request across two Node processes: process A performed the real AgentRouter inference and returned HTTP `402`; it was stopped; process B loaded the held response from Neon, accepted Circle authorization `75aa0a58-2fc7-412b-b5bf-44a366e94ce8`, and returned HTTP `200` without repeating inference. Evidence: [`evidence/cold-start-paid-retry-2026-07-12.json`](evidence/cold-start-paid-retry-2026-07-12.json).
 

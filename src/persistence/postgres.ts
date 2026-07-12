@@ -3,10 +3,12 @@ import type { FuseServiceState } from "../core/service.js";
 import {
   deserializeState,
   serializeState,
+  type PersistedReceipt,
   type ServiceStateStore,
 } from "./store.js";
 
 export class PostgresStateStore implements ServiceStateStore {
+  readonly kind = "postgres" as const;
   private initialized?: Promise<void>;
 
   constructor(
@@ -57,6 +59,18 @@ export class PostgresStateStore implements ServiceStateStore {
     );
     if (!result.rows[0]) throw new Error("PERSISTED_STATE_NOT_FOUND");
     return deserializeState(result.rows[0].state_json);
+  }
+
+  async listReceipts(): Promise<PersistedReceipt[]> {
+    await this.ensureSchema();
+    const result = await this.pool.query<{ receipt_json: PersistedReceipt }>(
+      `SELECT receipt_json
+       FROM fuse_receipts
+       WHERE mandate_id = $1
+       ORDER BY sequence`,
+      [this.mandateId],
+    );
+    return result.rows.map(({ receipt_json }) => receipt_json);
   }
 
   async mutate<T>(initial: () => FuseServiceState, operation: (state: FuseServiceState) => Promise<{

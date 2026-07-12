@@ -12,8 +12,16 @@ export function deserializeState(value: string): FuseServiceState {
       : entry) as FuseServiceState;
 }
 
+export interface PersistedReceipt {
+  requestId: string;
+  childId: string;
+  [key: string]: unknown;
+}
+
 export interface ServiceStateStore {
+  readonly kind: "memory" | "postgres";
   read(initial: () => FuseServiceState): Promise<FuseServiceState>;
+  listReceipts(): Promise<PersistedReceipt[]>;
   mutate<T>(initial: () => FuseServiceState, operation: (state: FuseServiceState) => Promise<{
     state: FuseServiceState;
     result: T;
@@ -21,11 +29,20 @@ export interface ServiceStateStore {
 }
 
 export class MemoryStateStore implements ServiceStateStore {
+  readonly kind = "memory" as const;
   private state?: FuseServiceState;
 
   async read(initial: () => FuseServiceState) {
     this.state ??= initial();
     return deserializeState(serializeState(this.state));
+  }
+
+  async listReceipts(): Promise<PersistedReceipt[]> {
+    if (!this.state) return [];
+    return this.state.pending
+      .map(([, pending]) => pending.released?.receipt)
+      .filter((receipt): receipt is NonNullable<typeof receipt> => Boolean(receipt))
+      .map((receipt) => JSON.parse(JSON.stringify(receipt)) as PersistedReceipt);
   }
 
   async mutate<T>(initial: () => FuseServiceState, operation: (state: FuseServiceState) => Promise<{
