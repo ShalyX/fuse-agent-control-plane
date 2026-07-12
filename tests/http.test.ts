@@ -90,6 +90,9 @@ describe("POST /v1/chat/completions", () => {
     expect(desk.status).toBe(200);
     expect(desk.text).toContain("Fuse Control Desk");
     expect(desk.text).toContain("Deterministic isolation scenario");
+    expect(desk.text).toContain("LIVE INSTANCE STATE");
+    expect(desk.text).not.toContain("<span>$0.009</span>");
+    expect(desk.text).not.toContain("<span id=\"review-spend\">$0.004</span>");
 
     const state = await request(app).get("/api/state");
     expect(state.status).toBe(200);
