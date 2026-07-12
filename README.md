@@ -99,6 +99,14 @@ The `3.00` input / `15.00` output USDC-per-million values are Fuse's current con
 npm run dev
 ```
 
+## Public demo
+
+- Control desk: [fuse-agent-control-plane.vercel.app/desk](https://fuse-agent-control-plane.vercel.app/desk)
+- State API: [fuse-agent-control-plane.vercel.app/api/state](https://fuse-agent-control-plane.vercel.app/api/state)
+- Source and evidence: [github.com/ShalyX/fuse-agent-control-plane](https://github.com/ShalyX/fuse-agent-control-plane)
+
+The public deployment makes the desk and initial state independently inspectable. The current ledger and held-response cache are still in memory; the committed golden run was executed against one persistent local process. Do not present the serverless deployment as durable payment infrastructure until the ledger moves to transactional storage.
+
 ## Golden combined run
 
 The live combined run now exercises the full system in one process:
