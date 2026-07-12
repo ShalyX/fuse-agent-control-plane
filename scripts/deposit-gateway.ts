@@ -12,6 +12,11 @@ const apiKey = env["CIRCLE_API_KEY"]?.trim();
 const entitySecret = env["CIRCLE_ENTITY_SECRET"]?.trim();
 if (!apiKey || !entitySecret) throw new Error("Missing Circle credentials");
 
+const depositUsdc = env["GATEWAY_DEPOSIT_USDC"] ?? "0.001";
+if (!/^\d+(\.\d{1,6})?$/.test(depositUsdc)) throw new Error("INVALID_GATEWAY_DEPOSIT_USDC");
+const [whole, fraction = ""] = depositUsdc.split(".");
+const amountAtomic = (BigInt(whole) * 1_000_000n + BigInt(fraction.padEnd(6, "0"))).toString();
+
 const circle = initiateDeveloperControlledWalletsClient({ apiKey, entitySecret });
 const wallets = (await circle.listWallets()).data?.wallets ?? [];
 const candidates = wallets.filter((wallet) =>
@@ -30,7 +35,7 @@ if (!selected) throw new Error("NO_FUNDED_ARC_TESTNET_EOA");
 const queryKey = `0x${"11".repeat(32)}` as Hex;
 const gateway = new GatewayClient({ chain: "arcTestnet", privateKey: queryKey });
 const before = await gateway.getBalances(selected.address as `0x${string}`);
-if (before.gateway.available >= 1_000n) {
+if (before.gateway.available >= BigInt(amountAtomic)) {
   console.log(JSON.stringify({
     status: "already_deposited",
     walletId: selected.id,
@@ -40,7 +45,6 @@ if (before.gateway.available >= 1_000n) {
   process.exit(0);
 }
 
-const amountAtomic = "1000"; // 0.001 USDC at 6 decimals
 const fee = { type: "level" as const, config: { feeLevel: "LOW" as const } };
 
 async function submitAndWait(label: string, input: Parameters<typeof circle.createContractExecutionTransaction>[0]) {

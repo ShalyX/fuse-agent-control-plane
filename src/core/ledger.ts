@@ -97,13 +97,24 @@ export class FuseLedger {
     return { ...reservation };
   }
 
+  reclaimAvailable(childId: string): bigint {
+    const child = this.children[childId];
+    if (!child) throw new Error("UNKNOWN_CHILD");
+    const reclaimedMicros = available(child);
+    child.authorizedMicros -= reclaimedMicros;
+    return reclaimedMicros;
+  }
+
   snapshot() {
     const serialize = (account: Account) => ({
       ...account,
       availableMicros: available(account),
     });
+    const parentUnallocatedMicros = this.root.authorizedMicros
+      - Object.values(this.children).reduce((sum, account) => sum + account.authorizedMicros, 0n);
     return {
       mandateId: this.mandateId,
+      parentUnallocatedMicros,
       root: serialize(this.root),
       children: Object.fromEntries(
         Object.entries(this.children).map(([id, account]) => [id, serialize(account)]),

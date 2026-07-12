@@ -43,6 +43,7 @@ type Receipt = {
   settlementStatus: "pending_batch";
   circuitState: string;
   circuitReason: string;
+  reclaimedUsdc?: string;
 };
 
 type ReleasedCompletion = {
@@ -142,6 +143,9 @@ export class FuseService {
     if (pending.released) return pending.released;
 
     this.ledger.reconcile(requestId, pending.exactCostMicros);
+    const reclaimedMicros = pending.circuit.state === "TRIPPED"
+      ? this.ledger.reclaimAvailable(pending.request.childId)
+      : 0n;
     pending.released = {
       status: "completed",
       httpStatus: 200,
@@ -158,6 +162,7 @@ export class FuseService {
         settlementStatus: "pending_batch",
         circuitState: pending.circuit.state,
         circuitReason: pending.circuit.reason,
+        ...(reclaimedMicros > 0n ? { reclaimedUsdc: microsToUsdc(reclaimedMicros) } : {}),
       },
     };
     return pending.released;

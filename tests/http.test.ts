@@ -95,6 +95,7 @@ describe("POST /v1/chat/completions", () => {
     expect(state.status).toBe(200);
     expect(state.body).toMatchObject({
       mandateId: "demo-mandate",
+      parentUnallocatedUsdc: "0.020000",
       root: { authorizedUsdc: "0.250000" },
       children: {
         scout: { circuitState: "HEALTHY", authorizedUsdc: "0.060000" },

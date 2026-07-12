@@ -1,0 +1,43 @@
+{
+  "status": "golden_run_complete",
+  "recordedAt": "2026-07-12",
+  "network": "eip155:5042002",
+  "payer": "0x68abdce904bd68c53b0daf43c9b83a5aa8c0b2f7",
+  "scout": [
+    {
+      "usage": { "prompt_tokens": 30, "completion_tokens": 6, "total_tokens": 36 },
+      "costUsdc": "0.000180",
+      "circuitState": "HEALTHY",
+      "circuitReason": "ALLOW",
+      "authorizationHash": "fe4ca2ea-a142-4e3c-9c3a-feebcca359ee"
+    },
+    {
+      "usage": { "prompt_tokens": 320, "completion_tokens": 6, "total_tokens": 326 },
+      "costUsdc": "0.001050",
+      "circuitState": "ELEVATED",
+      "circuitReason": "ALLOW",
+      "authorizationHash": "62797f8b-55a2-45ff-a875-60c8d3f9c516"
+    },
+    {
+      "usage": { "prompt_tokens": 1420, "completion_tokens": 6, "total_tokens": 1426 },
+      "costUsdc": "0.004350",
+      "circuitState": "TRIPPED",
+      "circuitReason": "REPEATED_COST_ACCELERATION",
+      "authorizationHash": "99f365d3-6af9-46d4-a640-b23202cba2ac",
+      "reclaimedUsdc": "0.054420"
+    }
+  ],
+  "blockedScout": { "httpStatus": 409, "code": "BRANCH_TRIPPED" },
+  "reviewer": {
+    "usage": { "prompt_tokens": 36, "completion_tokens": 6, "total_tokens": 42 },
+    "costUsdc": "0.000198",
+    "circuitState": "HEALTHY",
+    "authorizationHash": "6e9e0fb9-eb89-438c-96cb-e9e32607ede5"
+  },
+  "finalState": {
+    "parentUnallocatedUsdc": "0.074420",
+    "rootSettledUsdc": "0.005778",
+    "scout": { "authorizedUsdc": "0.005580", "availableUsdc": "0.000000", "circuitState": "TRIPPED" },
+    "reviewer": { "settledUsdc": "0.000198", "availableUsdc": "0.049802", "circuitState": "HEALTHY" }
+  }
+}

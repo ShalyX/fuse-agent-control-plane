@@ -99,6 +99,27 @@ The `3.00` input / `15.00` output USDC-per-million values are Fuse's current con
 npm run dev
 ```
 
+## Golden combined run
+
+The live combined run now exercises the full system in one process:
+
+1. Three real AgentRouter calls from Scout with provider-reported token usage.
+2. One real Circle Gateway Nanopayment per completed call.
+3. Genuine cost acceleration from growing prompt context: `$0.000180 → $0.001050 → $0.004350`.
+4. `HEALTHY → ELEVATED → TRIPPED` after two consecutive increases above 4×.
+5. Automatic reclaim of Scout's remaining `$0.054420` allowance to the parent pool.
+6. A subsequent Scout request blocked with HTTP `409 BRANCH_TRIPPED` before inference.
+7. A real Reviewer inference and `$0.000198` payment succeeding while Scout remains tripped.
+
+The resulting parent reserve increased from `$0.020000` to `$0.074420`. The complete receipt set is committed at [`evidence/golden-run-2026-07-12.json`](evidence/golden-run-2026-07-12.json).
+
+Run it with:
+
+```bash
+npm run dev
+node --env-file=.env --import tsx scripts/golden-run.ts
+```
+
 ## Control desk
 
 `GET /desk` serves the browser-tested control plane for the hackathon demo. It includes:

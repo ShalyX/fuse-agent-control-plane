@@ -50,6 +50,7 @@ describe("branch isolation", () => {
     expect(tripped.receipt).toMatchObject({
       circuitState: "TRIPPED",
       circuitReason: "REPEATED_COST_ACCELERATION",
+      reclaimedUsdc: "0.028500",
     });
 
     await expect(service.prepareCompletion({
@@ -63,10 +64,13 @@ describe("branch isolation", () => {
 
     const reviewer = await run("reviewer", "r1");
     expect(reviewer.receipt.circuitState).toBe("HEALTHY");
-    expect(service.snapshot().circuits).toMatchObject({
+    const snapshot = service.snapshot();
+    expect(snapshot.circuits).toMatchObject({
       scout: { state: "TRIPPED" },
       reviewer: { state: "HEALTHY" },
     });
+    expect(snapshot.ledger.parentUnallocatedMicros).toBe(48_500n);
+    expect(snapshot.ledger.children.scout.availableMicros).toBe(0n);
   });
 });
 

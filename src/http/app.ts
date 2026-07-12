@@ -47,6 +47,7 @@ export function createFuseApp(dependencies: AppDependencies) {
     const usdc = (value: bigint) => microsToUsdc(value);
     response.json({
       mandateId: snapshot.ledger.mandateId,
+      parentUnallocatedUsdc: usdc(snapshot.ledger.parentUnallocatedMicros),
       root: {
         authorizedUsdc: usdc(snapshot.ledger.root.authorizedMicros),
         reservedUsdc: usdc(snapshot.ledger.root.reservedMicros),
