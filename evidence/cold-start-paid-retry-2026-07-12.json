@@ -1,0 +1,46 @@
+{
+  "status": "live_cold_start_paid_retry_complete",
+  "recordedAt": "2026-07-12",
+  "network": "eip155:5042002",
+  "persistence": "Neon Postgres",
+  "requestId": "cold-start-live-builder-2026-07-12",
+  "sequence": [
+    {
+      "phase": "prepare",
+      "httpStatus": 402,
+      "providerCalled": true,
+      "heldResponsePersisted": true
+    },
+    {
+      "phase": "process_restart",
+      "oldProcessStopped": true,
+      "newProcessStarted": true
+    },
+    {
+      "phase": "paid_retry",
+      "httpStatus": 200,
+      "providerCalledAgain": false,
+      "heldResponseReleased": true
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 24,
+    "completion_tokens": 8,
+    "total_tokens": 32
+  },
+  "receipt": {
+    "childId": "builder",
+    "costUsdc": "0.000192",
+    "authorizationHash": "75aa0a58-2fc7-412b-b5bf-44a366e94ce8",
+    "gatewayStatus": "accepted",
+    "settlementStatus": "pending_batch",
+    "circuitState": "HEALTHY"
+  },
+  "publicReadback": {
+    "url": "https://fuse-agent-control-plane.vercel.app/api/state",
+    "rootSettledUsdc": "0.007494",
+    "builderSettledUsdc": "0.000192",
+    "builderCircuitState": "HEALTHY"
+  },
+  "boundary": "This Builder probe occurred after the separately closed Arc mandate for the persistent golden run and is not included in that mandate receipt hash."
+}
