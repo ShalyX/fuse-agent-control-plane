@@ -46,7 +46,19 @@ The integration must prove, against current Circle documentation and SDKs:
 4. Complete an x402 paid retry.
 5. Verify buyer/seller Gateway balances and settlement evidence.
 
-Until this succeeds, Fuse reports its Circle adapter as **blocked by credentials**, not simulated or complete.
+Until this succeeds, Fuse reports its Circle adapter as **blocked by credentials or testnet funding**, not simulated or complete.
+
+### Live Phase 0 evidence
+
+- Circle API authentication succeeded.
+- Ten live Arc Testnet Developer-Controlled EOA wallets were discovered.
+- A funded Arc Testnet EOA was selected and its wallet balance was verified.
+- Gateway balance query succeeded; the selected wallet currently has no Gateway deposit.
+- ERC-20 approval succeeded on Arc Testnet: `0x7e42dab5bf341e328546bbfee0507d2e8c75bc5068da97c59af0e9fff47c994a`.
+- Gateway deposit was attempted twice and honestly failed with `INSUFFICIENT_NATIVE_TOKEN`.
+- Circle's programmatic faucet endpoint returned HTTP 403 for the current API key.
+
+The selected wallet requires additional Arc Testnet native USDC for gas before the deposit can complete.
 
 ## Architecture boundary
 
