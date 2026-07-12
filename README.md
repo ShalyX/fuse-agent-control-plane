@@ -21,6 +21,16 @@ npm run demo
 
 ## Circle Phase 0 status
 
+The official integration packages are installed and their current TypeScript declarations compile in this repository:
+
+- `@circle-fin/x402-batching`
+- `@x402/core`
+- `@x402/evm`
+- `@circle-fin/developer-controlled-wallets`
+- `viem`
+
+Fuse now includes a tested adapter from Circle Developer-Controlled Wallet `client.signTypedData(...)` to the signer interface required by `BatchEvmScheme`. The adapter enforces the `GatewayWalletBatched` EIP-712 domain and serializes bigint payment fields safely.
+
 The live Circle flow is deliberately not mocked. It requires:
 
 - `CIRCLE_API_KEY`

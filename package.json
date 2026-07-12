@@ -12,7 +12,12 @@
     "check": "npm test && npm run build"
   },
   "dependencies": {
+    "@circle-fin/developer-controlled-wallets": "^10.8.0",
+    "@circle-fin/x402-batching": "^3.2.0",
+    "@x402/core": "^2.18.0",
+    "@x402/evm": "^2.18.0",
     "express": "^5.1.0",
+    "viem": "^2.55.0",
     "zod": "^3.25.67"
   },
   "devDependencies": {
