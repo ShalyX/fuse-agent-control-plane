@@ -1,6 +1,7 @@
 import express, { type RequestHandler } from "express";
 import { z } from "zod";
 import { FuseService, type InferenceProvider } from "../core/service.js";
+import { MemoryStateStore, type ServiceStateStore } from "../persistence/store.js";
 import { renderControlDesk } from "./desk.js";
 
 const completionSchema = z.object({
@@ -20,6 +21,7 @@ type AppDependencies = {
   estimateInputTokens: (messages: Array<{ role: string; content: string }>) => number;
   payerWallet?: string;
   price?: { inputUsdPerMillion: string; outputUsdPerMillion: string };
+  stateStore?: ServiceStateStore;
 };
 
 function microsToUsdc(micros: bigint): string {
@@ -28,10 +30,20 @@ function microsToUsdc(micros: bigint): string {
 
 export function createFuseApp(dependencies: AppDependencies) {
   const app = express();
-  const service = FuseService.createDemo(dependencies.provider, {
+  const stateStore = dependencies.stateStore ?? new MemoryStateStore();
+  const initialState = () => FuseService.createDemo(dependencies.provider, {
     payerWallet: dependencies.payerWallet,
     price: dependencies.price,
-  });
+  }).exportState();
+  const readService = async () => FuseService.fromState(dependencies.provider, await stateStore.read(initialState));
+  const mutateService = <T>(operation: (service: FuseService) => Promise<T>) => stateStore.mutate(
+    initialState,
+    async (state) => {
+      const service = FuseService.fromState(dependencies.provider, state);
+      const result = await operation(service);
+      return { state: service.exportState(), result };
+    },
+  );
   app.use(express.json({ limit: "1mb" }));
 
   app.get("/health", (_request, response) => {
@@ -42,10 +54,12 @@ export function createFuseApp(dependencies: AppDependencies) {
     response.type("html").send(renderControlDesk());
   });
 
-  app.get("/api/state", (_request, response) => {
-    const snapshot = service.snapshot();
-    const usdc = (value: bigint) => microsToUsdc(value);
-    response.json({
+  app.get("/api/state", async (_request, response, next) => {
+    try {
+      const service = await readService();
+      const snapshot = service.snapshot();
+      const usdc = (value: bigint) => microsToUsdc(value);
+      response.json({
       mandateId: snapshot.ledger.mandateId,
       parentUnallocatedUsdc: usdc(snapshot.ledger.parentUnallocatedMicros),
       root: {
@@ -64,7 +78,10 @@ export function createFuseApp(dependencies: AppDependencies) {
           circuitState: snapshot.circuits[childId]?.state ?? "UNKNOWN",
         },
       ])),
-    });
+      });
+    } catch (error) {
+      next(error);
+    }
   });
 
   app.post("/v1/chat/completions", async (request, response, next) => {
@@ -87,18 +104,18 @@ export function createFuseApp(dependencies: AppDependencies) {
         return;
       }
 
-      const quote = await service.prepareCompletion({
+      const quote = await mutateService((service) => service.prepareCompletion({
         requestId,
         childId,
         model: parsed.data.model,
         inputTokens: dependencies.estimateInputTokens(parsed.data.messages),
         maxOutputTokens: parsed.data.max_tokens,
         messages: parsed.data.messages,
-      });
+      }));
       const priceUsdc = microsToUsdc(quote.exactCostMicros);
       const guard = dependencies.paymentGuard(priceUsdc);
 
-      guard(request, response, () => {
+      guard(request, response, async () => {
         try {
           const gatewayPayment = (request as express.Request & {
             payment?: { transaction?: string; network?: string; payer?: string };
@@ -107,7 +124,8 @@ export function createFuseApp(dependencies: AppDependencies) {
             authorizationHash: gatewayPayment?.transaction ?? "gateway-accepted",
             gatewayStatus: "accepted",
           };
-          const completed = service.releasePaidCompletion(requestId, payment);
+          const completed = await mutateService(async (service) =>
+            service.releasePaidCompletion(requestId, payment));
           response.json({
             id: completed.response.id,
             object: "chat.completion",

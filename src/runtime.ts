@@ -1,6 +1,7 @@
 import { createFuseApp } from "./http/app.js";
 import { createCirclePaymentGuard } from "./circle/paymentGuard.js";
 import { AgentRouterProvider } from "./providers/agentRouter.js";
+import { PostgresStateStore } from "./persistence/postgres.js";
 
 export function createRuntimeApp(env: NodeJS.ProcessEnv = process.env) {
   const apiKey = env["ANTHROPIC_API_KEY"]?.trim();
@@ -14,6 +15,7 @@ export function createRuntimeApp(env: NodeJS.ProcessEnv = process.env) {
     provider: new AgentRouterProvider({ apiKey, baseUrl, userAgent }),
     paymentGuard: createCirclePaymentGuard({ sellerAddress }),
     payerWallet,
+    stateStore: env["DATABASE_URL"] ? PostgresStateStore.fromConnectionString(env["DATABASE_URL"]) : undefined,
     price: {
       inputUsdPerMillion: env["FUSE_INPUT_USD_PER_M"] ?? "3.00",
       outputUsdPerMillion: env["FUSE_OUTPUT_USD_PER_M"] ?? "15.00",

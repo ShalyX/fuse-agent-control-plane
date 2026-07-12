@@ -22,6 +22,13 @@ function available(account: Account): bigint {
   return account.authorizedMicros - account.reservedMicros - account.settledMicros;
 }
 
+export type LedgerState = {
+  mandateId: string;
+  root: Account;
+  children: Record<string, Account>;
+  reservations: Reservation[];
+};
+
 export class FuseLedger {
   readonly mandateId: string;
   private readonly root: Account;
@@ -46,6 +53,33 @@ export class FuseLedger {
         { authorizedMicros: amount, reservedMicros: 0n, settledMicros: 0n },
       ]),
     );
+  }
+
+  static fromState(state: LedgerState): FuseLedger {
+    const ledger = new FuseLedger({
+      mandateId: state.mandateId,
+      maximumSpendMicros: state.root.authorizedMicros,
+      children: Object.fromEntries(
+        Object.entries(state.children).map(([id, account]) => [id, account.authorizedMicros]),
+      ),
+    });
+    Object.assign(ledger.root, state.root);
+    for (const [id, account] of Object.entries(state.children)) Object.assign(ledger.children[id], account);
+    for (const reservation of state.reservations) {
+      ledger.reservations.set(reservation.requestId, { ...reservation });
+    }
+    return ledger;
+  }
+
+  exportState(): LedgerState {
+    return {
+      mandateId: this.mandateId,
+      root: { ...this.root },
+      children: Object.fromEntries(
+        Object.entries(this.children).map(([id, account]) => [id, { ...account }]),
+      ),
+      reservations: [...this.reservations.values()].map((reservation) => ({ ...reservation })),
+    };
   }
 
   reserve(childId: string, maximumMicros: bigint, requestId: string): Reservation {

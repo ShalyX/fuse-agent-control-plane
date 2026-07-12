@@ -1,0 +1,30 @@
+{
+  "status": "mandate_closed",
+  "network": "ARC-TESTNET",
+  "chainId": 5042002,
+  "contractAddress": "0xf736609aa15b255322df4d5dfe6ea66b59b7c663",
+  "contractDeploymentTxHash": "0x43ed368219810c9ece449336004ba7ad535a4fc08bf61f42590a98b3a1346579",
+  "mandateId": "0x933e73d5efb7ec43f5c2eceebcae1ed9661cfad512b0d08a2efb1492c610e35b",
+  "controller": "0x68abdce904bd68c53b0daf43c9b83a5aa8c0b2f7",
+  "maximumSpendAtomic": "250000",
+  "totalPaidAtomic": "5778",
+  "receiptHash": "0xe079a2d459ac16a2d866e79bc5c10a58cc7abf611c0711cac118fa9334bb7a74",
+  "openedAt": 1783864161,
+  "closedAt": 1783864164,
+  "openTxHash": "0x92f5195cc463a752f77ebb57b650a70d3563eb6add0d4fc1c3c90b8fe5c77610",
+  "closeTxHash": "0x13ea1dc9b0e02a0a935c25e8a39f3cea121e2800ad76a50874833a8a8bbe9141",
+  "explorer": {
+    "contract": "https://testnet.arcscan.app/address/0xf736609aa15b255322df4d5dfe6ea66b59b7c663",
+    "deployment": "https://testnet.arcscan.app/tx/0x43ed368219810c9ece449336004ba7ad535a4fc08bf61f42590a98b3a1346579",
+    "open": "https://testnet.arcscan.app/tx/0x92f5195cc463a752f77ebb57b650a70d3563eb6add0d4fc1c3c90b8fe5c77610",
+    "close": "https://testnet.arcscan.app/tx/0x13ea1dc9b0e02a0a935c25e8a39f3cea121e2800ad76a50874833a8a8bbe9141"
+  },
+  "onchainReadback": {
+    "controller": "0x68aBdCe904BD68c53b0DaF43C9B83A5AA8C0b2F7",
+    "maximumSpendAtomic": "250000",
+    "totalPaidAtomic": "5778",
+    "receiptHash": "0xe079a2d459ac16a2d866e79bc5c10a58cc7abf611c0711cac118fa9334bb7a74",
+    "openedAt": "1783864161",
+    "closedAt": "1783864164"
+  }
+}

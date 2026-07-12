@@ -65,7 +65,7 @@ Phase 0 proves, against current Circle documentation and SDKs:
 
 ## Architecture boundary
 
-Children are logical Fuse identities. The parent Circle wallet is the payer and owns the shared Gateway balance. Fuse checks each child capability and root mandate before requesting a parent-wallet signature. The Arc mandate contract, when added, is an audit/revocation commitment—not the enforcement point.
+Children are logical Fuse identities. The parent Circle wallet is the payer and owns the shared Gateway balance. Fuse checks each child capability and root mandate before requesting a parent-wallet signature. The Arc mandate contract anchors the session maximum and one final receipt-bundle hash; per-completion metering, circuit enforcement, and Nanopayment authorization remain off-chain.
 
 ## Phase 1 API spine
 
@@ -105,7 +105,7 @@ npm run dev
 - State API: [fuse-agent-control-plane.vercel.app/api/state](https://fuse-agent-control-plane.vercel.app/api/state)
 - Source and evidence: [github.com/ShalyX/fuse-agent-control-plane](https://github.com/ShalyX/fuse-agent-control-plane)
 
-The public deployment makes the desk and initial state independently inspectable. The current ledger and held-response cache are still in memory; the committed golden run was executed against one persistent local process. Do not present the serverless deployment as durable payment infrastructure until the ledger moves to transactional storage.
+The runtime now supports transactional Postgres persistence when `DATABASE_URL` is configured. Ledger state, reservations, circuits, held provider responses, idempotency results, and released receipts survive serverless cold starts. The public deployment remains on the in-memory fallback until a database resource is connected; do not present that deployment as durable payment infrastructure yet.
 
 ## Golden combined run
 
@@ -120,6 +120,21 @@ The live combined run now exercises the full system in one process:
 7. A real Reviewer inference and `$0.000198` payment succeeding while Scout remains tripped.
 
 The resulting parent reserve increased from `$0.020000` to `$0.074420`. The complete receipt set is committed at [`evidence/golden-run-2026-07-12.json`](evidence/golden-run-2026-07-12.json).
+
+## Arc mandate anchor
+
+`FuseSpendMandate` is deployed on Arc Testnet at [`0xf736609aa15b255322df4d5dfe6ea66b59b7c663`](https://testnet.arcscan.app/address/0xf736609aa15b255322df4d5dfe6ea66b59b7c663).
+
+The contract deliberately exposes only a two-transaction lifecycle:
+
+1. `openMandate(mandateId, maximumSpendAtomic, controller)` once per session.
+2. `closeMandate(mandateId, totalPaidAtomic, receiptHash)` once per session.
+
+There is no per-completion `recordSettlement` method. The golden run was anchored with a `250000` atomic cap, `5778` atomic final spend, and canonical receipt hash `0xe079a2d459ac16a2d866e79bc5c10a58cc7abf611c0711cac118fa9334bb7a74`.
+
+- [Open transaction](https://testnet.arcscan.app/tx/0x92f5195cc463a752f77ebb57b650a70d3563eb6add0d4fc1c3c90b8fe5c77610)
+- [Close transaction](https://testnet.arcscan.app/tx/0x13ea1dc9b0e02a0a935c25e8a39f3cea121e2800ad76a50874833a8a8bbe9141)
+- [Machine-readable on-chain evidence](evidence/arc-mandate-2026-07-12.json)
 
 Run it with:
 
@@ -139,8 +154,8 @@ node --env-file=.env --import tsx scripts/golden-run.ts
 - The real live AgentRouter/Circle settlement reference as payment evidence.
 - Responsive layout and reduced-motion handling.
 
-`GET /api/state` exposes the current in-memory ledger and circuit state without serializing bigint values directly.
+`GET /api/state` exposes the current persisted ledger and circuit state without serializing bigint values directly.
 
-## Current implementation note
+## Persistence
 
-The current ledger is in-memory and suitable only for the executable spine. Before deploying the multi-child API, reservations must move to transactional SQLite/PostgreSQL so concurrent workers cannot overspend through races.
+Set `DATABASE_URL` to enable the transactional Postgres store. Each mutation locks the mandate row with `SELECT ... FOR UPDATE`, preserving root/child reservation invariants across concurrent serverless workers. Without `DATABASE_URL`, Fuse intentionally falls back to an in-memory store for local development and tests.

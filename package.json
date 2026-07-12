@@ -16,17 +16,22 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.111.0",
     "@circle-fin/developer-controlled-wallets": "^10.8.0",
+    "@circle-fin/smart-contract-platform": "^10.8.0",
     "@circle-fin/x402-batching": "^3.2.0",
     "@x402/core": "^2.18.0",
     "@x402/evm": "^2.18.0",
     "express": "^5.1.0",
+    "pg": "^8.22.0",
     "viem": "^2.55.0",
     "zod": "^3.25.67"
   },
   "devDependencies": {
     "@types/express": "^5.0.3",
     "@types/node": "^24.0.10",
+    "@types/pg": "^8.20.0",
     "@types/supertest": "^7.2.0",
+    "pg-mem": "^3.0.14",
+    "solc": "^0.8.36",
     "supertest": "^7.2.2",
     "tsx": "^4.20.3",
     "typescript": "^5.8.3",

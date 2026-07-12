@@ -11,6 +11,12 @@ export type CircuitResult = {
   consecutiveViolations: number;
 };
 
+export type CircuitStateSnapshot = {
+  state: CircuitState;
+  consecutiveViolations: number;
+  previousCostMicros?: bigint;
+};
+
 export class BranchCircuit {
   private state: CircuitState = "HEALTHY";
   private previousCostMicros?: bigint;
@@ -20,6 +26,17 @@ export class BranchCircuit {
     perCallCeilingMicros: bigint;
     minimumSpikeDeltaMicros: bigint;
   }) {}
+
+  static fromState(config: {
+    perCallCeilingMicros: bigint;
+    minimumSpikeDeltaMicros: bigint;
+  }, state: CircuitStateSnapshot): BranchCircuit {
+    const circuit = new BranchCircuit(config);
+    circuit.state = state.state;
+    circuit.consecutiveViolations = state.consecutiveViolations;
+    circuit.previousCostMicros = state.previousCostMicros;
+    return circuit;
+  }
 
   evaluate(currentCostMicros: bigint): CircuitResult {
     if (this.state === "TRIPPED") throw new Error("BRANCH_TRIPPED");

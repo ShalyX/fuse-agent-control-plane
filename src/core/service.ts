@@ -59,6 +59,19 @@ function microsToUsdc(micros: bigint): string {
   return `${whole}.${fraction}`;
 }
 
+export type FuseServiceState = {
+  ledger: ReturnType<FuseLedger["exportState"]>;
+  price: TokenPrice;
+  payerWallet: string;
+  circuits: Record<string, ReturnType<BranchCircuit["snapshot"]>>;
+  pending: Array<[string, Pending]>;
+};
+
+const circuitConfig = {
+  perCallCeilingMicros: 50_000n,
+  minimumSpikeDeltaMicros: 1n,
+};
+
 export class FuseService {
   private readonly pending = new Map<string, Pending>();
 
@@ -85,12 +98,36 @@ export class FuseService {
       options.payerWallet ?? "0xDemoParentWallet",
       Object.fromEntries(["scout", "builder", "reviewer"].map((childId) => [
         childId,
-        new BranchCircuit({
-          perCallCeilingMicros: 50_000n,
-          minimumSpikeDeltaMicros: 1n,
-        }),
+        new BranchCircuit(circuitConfig),
       ])),
     );
+  }
+
+  static fromState(provider: InferenceProvider, state: FuseServiceState): FuseService {
+    const service = new FuseService(
+      provider,
+      FuseLedger.fromState(state.ledger),
+      state.price,
+      state.payerWallet,
+      Object.fromEntries(Object.entries(state.circuits).map(([childId, snapshot]) => [
+        childId,
+        BranchCircuit.fromState(circuitConfig, snapshot),
+      ])),
+    );
+    for (const [requestId, pending] of state.pending) service.pending.set(requestId, pending);
+    return service;
+  }
+
+  exportState(): FuseServiceState {
+    return {
+      ledger: this.ledger.exportState(),
+      price: this.price,
+      payerWallet: this.payerWallet,
+      circuits: Object.fromEntries(
+        Object.entries(this.circuits).map(([childId, circuit]) => [childId, circuit.snapshot()]),
+      ),
+      pending: [...this.pending.entries()].map(([requestId, pending]) => [requestId, pending]),
+    };
   }
 
   async prepareCompletion(request: CompletionRequest) {

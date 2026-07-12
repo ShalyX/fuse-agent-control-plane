@@ -3,6 +3,7 @@ import request from "supertest";
 import type { RequestHandler } from "express";
 import { createFuseApp } from "../src/http/app.js";
 import type { InferenceProvider } from "../src/core/service.js";
+import { MemoryStateStore } from "../src/persistence/store.js";
 
 class FakeProvider implements InferenceProvider {
   calls = 0;
@@ -78,6 +79,41 @@ describe("POST /v1/chat/completions", () => {
       },
     });
     expect(provider.calls).toBe(1);
+  });
+
+  it("survives a cold start between the unpaid quote and paid retry", async () => {
+    const provider = new FakeProvider();
+    const stateStore = new MemoryStateStore();
+    const dependencies = {
+      provider,
+      paymentGuard: fakePaymentGuard,
+      estimateInputTokens: () => 1000,
+      stateStore,
+    };
+    const body = {
+      model: "claude-sonnet",
+      max_tokens: 1000,
+      messages: [{ role: "user", content: "Research Arc" }],
+    };
+    const unpaid = await request(createFuseApp(dependencies))
+      .post("/v1/chat/completions")
+      .set("Idempotency-Key", "cold-start-1")
+      .set("X-Fuse-Child", "scout")
+      .send(body);
+    expect(unpaid.status).toBe(402);
+
+    const paid = await request(createFuseApp(dependencies))
+      .post("/v1/chat/completions")
+      .set("Idempotency-Key", "cold-start-1")
+      .set("X-Fuse-Child", "scout")
+      .set("PAYMENT-SIGNATURE", "signed-eip3009")
+      .send(body);
+    expect(paid.status).toBe(200);
+    expect(paid.body.fuse.receipt.costUsdc).toBe("0.004500");
+    expect(provider.calls).toBe(1);
+
+    const state = await request(createFuseApp(dependencies)).get("/api/state");
+    expect(state.body.root.settledUsdc).toBe("0.004500");
   });
 
   it("serves the control desk and machine-readable budget tree", async () => {
