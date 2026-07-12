@@ -31,34 +31,37 @@ The official integration packages are installed and their current TypeScript dec
 
 Fuse now includes a tested adapter from Circle Developer-Controlled Wallet `client.signTypedData(...)` to the signer interface required by `BatchEvmScheme`. The adapter enforces the `GatewayWalletBatched` EIP-712 domain and serializes bigint payment fields safely.
 
-The live Circle flow is deliberately not mocked. It requires:
+The live Circle flow is deliberately not mocked. It uses:
 
 - `CIRCLE_API_KEY`
 - `CIRCLE_ENTITY_SECRET`
-- `CIRCLE_WALLET_SET_ID`
+- A live Arc Testnet Developer-Controlled EOA
 - Arc Testnet USDC
 
-The integration must prove, against current Circle documentation and SDKs:
+Phase 0 proves, against current Circle documentation and SDKs:
 
-1. Create/use a Developer-Controlled Wallet on Arc Testnet.
+1. Use a Developer-Controlled Wallet on Arc Testnet.
 2. Deposit USDC into Circle Gateway.
 3. Produce the exact EIP-3009 authorization required by Gateway Nanopayments.
 4. Complete an x402 paid retry.
-5. Verify buyer/seller Gateway balances and settlement evidence.
+5. Verify payer balance movement and Gateway settlement evidence.
 
-Until this succeeds, Fuse reports its Circle adapter as **blocked by credentials or testnet funding**, not simulated or complete.
+**Phase 0 is complete.** Final seller balance credit remains asynchronous because Gateway batches settlement; its settlement reference is recorded below.
 
 ### Live Phase 0 evidence
 
 - Circle API authentication succeeded.
 - Ten live Arc Testnet Developer-Controlled EOA wallets were discovered.
 - A funded Arc Testnet EOA was selected and its wallet balance was verified.
-- Gateway balance query succeeded; the selected wallet currently has no Gateway deposit.
-- ERC-20 approval succeeded on Arc Testnet: `0x7e42dab5bf341e328546bbfee0507d2e8c75bc5068da97c59af0e9fff47c994a`.
-- Gateway deposit was attempted twice and honestly failed with `INSUFFICIENT_NATIVE_TOKEN`.
-- Circle's programmatic faucet endpoint returned HTTP 403 for the current API key.
-
-The selected wallet requires additional Arc Testnet native USDC for gas before the deposit can complete.
+- ERC-20 approval completed on Arc Testnet: `0x7e42dab5bf341e328546bbfee0507d2e8c75bc5068da97c59af0e9fff47c994a`.
+- Gateway deposit completed on Arc Testnet: `0x06a89c672cddac713ad3de55a5727b53fbc36aa797cfa5b2b2bbe79f382616b2`.
+- Gateway balance was verified at `0.001` USDC after deposit.
+- A real protected endpoint returned HTTP `402 Payment Required`.
+- The parent Developer-Controlled EOA signed the real `GatewayWalletBatched` EIP-712 payload through Circle `signTypedData`.
+- Circle Gateway accepted and settled the paid retry; the endpoint returned HTTP `200`.
+- Gateway settlement reference: `d6ceaae5-6a63-42f6-9630-78af396d18fa` on `eip155:5042002`.
+- Buyer Gateway available balance decreased from `0.001` to `0.000999` USDC.
+- Seller credit was not yet visible during the first minute of balance polling, consistent with the payment remaining in Gateway's batch-settlement lifecycle; do not claim final seller credit until observed.
 
 ## Architecture boundary
 

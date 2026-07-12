@@ -40,9 +40,21 @@ export function createCircleGatewaySigner(config: {
         throw new Error("UNEXPECTED_TYPED_DATA_DOMAIN");
       }
 
+      const circleTypedData = {
+        ...parameters,
+        types: {
+          EIP712Domain: [
+            { name: "name", type: "string" },
+            { name: "version", type: "string" },
+            { name: "chainId", type: "uint256" },
+            { name: "verifyingContract", type: "address" },
+          ],
+          ...parameters.types,
+        },
+      };
       const response = await config.client.signTypedData({
         walletId: config.walletId,
-        data: stringifyTypedData(parameters),
+        data: stringifyTypedData(circleTypedData),
         memo: "Fuse x402 Gateway Nanopayment",
       });
       const signature = response.data?.signature;

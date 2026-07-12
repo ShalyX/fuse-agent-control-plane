@@ -31,5 +31,12 @@ it("adapts Circle Developer-Controlled Wallet typed-data signing to Gateway sign
   expect(signature).toBe(`0x${"ab".repeat(65)}`);
   expect(calls).toHaveLength(1);
   expect(calls[0]).toMatchObject({ walletId: "wallet-id" });
-  expect(JSON.parse((calls[0] as { data: string }).data).message.value).toBe("1000");
+  const submitted = JSON.parse((calls[0] as { data: string }).data);
+  expect(submitted.message.value).toBe("1000");
+  expect(submitted.types.EIP712Domain).toEqual([
+    { name: "name", type: "string" },
+    { name: "version", type: "string" },
+    { name: "chainId", type: "uint256" },
+    { name: "verifyingContract", type: "address" },
+  ]);
 });
