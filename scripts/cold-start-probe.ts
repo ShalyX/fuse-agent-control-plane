@@ -13,7 +13,7 @@ const { initiateDeveloperControlledWalletsClient } = require("@circle-fin/develo
 const mode = process.argv[2];
 const statePath = "/tmp/fuse-cold-start-payment.json";
 const endpoint = process.env["FUSE_URL"] ?? "http://127.0.0.1:8787";
-const model = process.env["AGENTROUTER_MODEL"] ?? "claude-opus-4-8";
+const model = process.env["ANTHROPIC_MODEL"] ?? "claude-sonnet-4-6";
 const requestId = process.env["COLD_START_REQUEST_ID"] ?? "cold-start-live-builder-2026-07-12";
 const headers = {
   "content-type": "application/json",

@@ -29,7 +29,7 @@ const client = new x402Client();
 registerBatchScheme(client, { signer });
 const http = new x402HTTPClient(client);
 const endpoint = env["FUSE_URL"] ?? "http://127.0.0.1:8787";
-const model = env["AGENTROUTER_MODEL"] ?? "claude-opus-4-8";
+const model = env["ANTHROPIC_MODEL"] ?? "claude-sonnet-4-6";
 
 type FuseResponse = {
   usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number };

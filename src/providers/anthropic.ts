@@ -1,14 +1,23 @@
-import Anthropic from "@anthropic-ai/sdk";
 import type { CompletionRequest, InferenceProvider } from "../core/service.js";
 
-export class AnthropicProvider implements InferenceProvider {
-  private readonly client: Anthropic;
+type AnthropicResponse = {
+  id?: string;
+  content?: Array<{ type?: string; text?: string }>;
+  usage?: { input_tokens?: number; output_tokens?: number };
+  error?: { message?: string };
+};
 
-  constructor(apiKey: string) {
-    this.client = new Anthropic({ apiKey });
-  }
+export class AnthropicProvider implements InferenceProvider {
+  constructor(private readonly config: {
+    apiKey: string;
+    model: string;
+    baseUrl?: string;
+    fetch?: typeof fetch;
+    timeoutMs?: number;
+  }) {}
 
   async complete(request: CompletionRequest) {
+    const fetcher = this.config.fetch ?? fetch;
     const system = request.messages
       .filter((message) => message.role === "system")
       .map((message) => message.content)
@@ -16,28 +25,48 @@ export class AnthropicProvider implements InferenceProvider {
     const messages = request.messages
       .filter((message) => message.role !== "system")
       .map((message) => ({
-        role: message.role === "assistant" ? "assistant" as const : "user" as const,
+        role: message.role === "assistant" ? "assistant" : "user",
         content: message.content,
       }));
-
-    const response = await this.client.messages.create({
-      model: request.model,
+    const payload: Record<string, unknown> = {
+      model: this.config.model,
       max_tokens: request.maxOutputTokens,
-      system: system || undefined,
       messages,
+    };
+    if (system) payload.system = system;
+
+    const response = await fetcher(`${this.config.baseUrl ?? "https://api.anthropic.com/v1"}/messages`, {
+      method: "POST",
+      headers: {
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+        "x-api-key": this.config.apiKey,
+      },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(this.config.timeoutMs ?? 60_000),
     });
-    const content = response.content
-      .filter((block) => block.type === "text")
+    let body: AnthropicResponse | undefined;
+    try {
+      body = await response.json() as AnthropicResponse;
+    } catch {
+      body = undefined;
+    }
+    if (!response.ok) {
+      throw new Error(`ANTHROPIC_${response.status}: ${body?.error?.message ?? "upstream request failed"}`);
+    }
+    const content = body?.content
+      ?.filter((block) => block.type === "text" && typeof block.text === "string")
       .map((block) => block.text)
       .join("\n");
-
+    const inputTokens = body?.usage?.input_tokens;
+    const outputTokens = body?.usage?.output_tokens;
+    if (!body?.id || content === undefined || inputTokens === undefined || outputTokens === undefined) {
+      throw new Error("ANTHROPIC_INVALID_RESPONSE");
+    }
     return {
-      id: response.id,
+      id: body.id,
       content,
-      usage: {
-        inputTokens: response.usage.input_tokens,
-        outputTokens: response.usage.output_tokens,
-      },
+      usage: { inputTokens, outputTokens },
     };
   }
 }

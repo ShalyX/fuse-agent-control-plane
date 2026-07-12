@@ -79,13 +79,13 @@ The OpenAI-compatible `POST /v1/chat/completions` route is implemented and teste
 6. Reuses the cached inference on the paid retry.
 7. Reconciles the reservation and returns an OpenAI-compatible response with a Fuse receipt.
 
-The production server is wired to AgentRouter's OpenAI-compatible endpoint with its mandatory exact User-Agent and real Circle Gateway middleware.
+The production runtime targets Anthropic's official Messages API at `https://api.anthropic.com/v1/messages` with `x-api-key` authentication and provider-reported `input_tokens` / `output_tokens`. The gateway-facing route remains OpenAI-compatible so calling agents do not need to speak Anthropic's wire format.
 
-### Live metered inference evidence
+### Historical metered inference evidence
 
-A live `claude-opus-4-8` request completed through the entire Fuse path:
+The committed July 12 evidence below was produced before the official-Anthropic migration, using the previous AgentRouter backend. It remains valid evidence of Fuse's metering, Circle payment, circuit, persistence, and Arc commitment behavior, but it is not presented as official Anthropic traffic:
 
-- AgentRouter returned real usage: 27 input tokens and 15 output tokens.
+- The provider returned real usage: 27 input tokens and 15 output tokens.
 - Fuse calculated an exact charge of `0.000306` USDC using the configured demo price schedule.
 - The first Fuse response was HTTP `402`.
 - The Circle Developer-Controlled parent EOA signed the exact EIP-3009 authorization.
@@ -93,7 +93,7 @@ A live `claude-opus-4-8` request completed through the entire Fuse path:
 - The paid retry returned HTTP `200` with `FUSE LIVE PAID OK`.
 - The receipt identifies the real parent payer, logical child `scout`, exact token usage, exact charge, and Gateway settlement reference.
 
-The `3.00` input / `15.00` output USDC-per-million values are Fuse's current configurable demo schedule; they are not represented as AgentRouter's underlying provider price.
+The `3.00` input / `15.00` output USDC-per-million values are Fuse's configurable demo tariff for `claude-sonnet-4-6`; they should be reviewed against the official Anthropic pricing page before production billing changes.
 
 ```bash
 npm run dev
@@ -108,13 +108,13 @@ npm run dev
 
 The public deployment is backed by Neon Postgres. The off-chain state record ID is `demo-mandate`; this is separate from the Arc contract's hashed mandate ID `0xa12a9146913454b8e14e132a1ee07df1a114cbc01e80e2c1a0bc8bfd58e88c6c`. Ledger state, reservations, circuits, held provider responses, idempotency results, and released receipts survive serverless cold starts. `/api/state` and `/api/runs/demo-mandate` send explicit `no-store` CDN and browser cache headers. The direct run endpoint returns the current database-backed state, its persisted receipts, and the Arc anchor boundary in one response.
 
-A live durability probe deliberately split one paid request across two Node processes: process A performed the real AgentRouter inference and returned HTTP `402`; it was stopped; process B loaded the held response from Neon, accepted Circle authorization `75aa0a58-2fc7-412b-b5bf-44a366e94ce8`, and returned HTTP `200` without repeating inference. Evidence: [`evidence/cold-start-paid-retry-2026-07-12.json`](evidence/cold-start-paid-retry-2026-07-12.json).
+The committed durability probe predates the official-Anthropic migration: process A performed one real provider inference and returned HTTP `402`; it was stopped; process B loaded the held response from Neon, accepted Circle authorization `75aa0a58-2fc7-412b-b5bf-44a366e94ce8`, and returned HTTP `200` without repeating inference. Evidence: [`evidence/cold-start-paid-retry-2026-07-12.json`](evidence/cold-start-paid-retry-2026-07-12.json).
 
 ## Golden combined run
 
 The live combined run now exercises the full system in one process:
 
-1. Three real AgentRouter calls from Scout with provider-reported token usage.
+1. Three real legacy-provider calls from Scout with provider-reported token usage.
 2. One real Circle Gateway Nanopayment per completed call.
 3. Genuine cost acceleration from growing prompt context: `$0.000180 → $0.001050 → $0.005874`.
 4. `HEALTHY → ELEVATED → TRIPPED` after two consecutive increases above 4×.
@@ -154,10 +154,17 @@ node --env-file=.env --import tsx scripts/golden-run.ts
 - A clearly labeled deterministic isolation replay that does not incur provider or payment charges.
 - `HEALTHY → ELEVATED → TRIPPED` Scout progression.
 - Reviewer continuation after Scout isolation.
-- The real live AgentRouter/Circle settlement reference as payment evidence.
+- The committed legacy-provider/Circle settlement reference as historical payment evidence.
 - Responsive layout and reduced-motion handling.
 
 `GET /api/state` exposes the current persisted ledger and circuit state without serializing bigint values directly.
+
+## Submission assets
+
+- [Pitch deck source](docs/pitch-deck.md)
+- [Three-minute demo script](docs/demo-script.md)
+- [Encode / Arc submission copy](docs/submission.md)
+- [System architecture diagram](docs/fuse-architecture.svg)
 
 ## Persistence
 

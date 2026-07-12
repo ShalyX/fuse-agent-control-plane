@@ -127,6 +127,21 @@ describe("POST /v1/chat/completions", () => {
     expect(run.headers["cache-control"]).toContain("no-store");
   });
 
+  it("serves a proof-forward landing page with direct verification links", async () => {
+    const app = createFuseApp({
+      provider: new FakeProvider(),
+      paymentGuard: fakePaymentGuard,
+      estimateInputTokens: () => 1000,
+    });
+    const landing = await request(app).get("/");
+    expect(landing.status).toBe(200);
+    expect(landing.text).toContain("Programmable spend control for autonomous agents");
+    expect(landing.text).toContain("/api/runs/demo-mandate");
+    expect(landing.text).toContain("testnet.arcscan.app/address/0xf736609aa15b255322df4d5dfe6ea66b59b7c663");
+    expect(landing.text).toContain("Historical paid run");
+    expect(landing.text).not.toContain("fake");
+  });
+
   it("serves the control desk and machine-readable budget tree", async () => {
     const app = createFuseApp({
       provider: new FakeProvider(),

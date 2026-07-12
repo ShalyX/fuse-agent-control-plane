@@ -30,7 +30,7 @@ const http = new x402HTTPClient(core);
 const url = "http://127.0.0.1:8787/v1/chat/completions";
 const requestId = `live-${Date.now()}`;
 const body = {
-  model: env["AGENTROUTER_MODEL"] ?? "claude-opus-4-8",
+  model: env["ANTHROPIC_MODEL"] ?? "claude-sonnet-4-6",
   max_tokens: 64,
   messages: [{ role: "user", content: "Reply with exactly: FUSE LIVE PAID OK" }],
 };

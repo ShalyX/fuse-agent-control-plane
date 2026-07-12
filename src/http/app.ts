@@ -3,6 +3,7 @@ import { z } from "zod";
 import { FuseService, type InferenceProvider } from "../core/service.js";
 import { MemoryStateStore, type ServiceStateStore } from "../persistence/store.js";
 import { renderControlDesk } from "./desk.js";
+import { renderLandingPage } from "./landing.js";
 
 const completionSchema = z.object({
   model: z.string().min(1),
@@ -79,6 +80,10 @@ export function createFuseApp(dependencies: AppDependencies) {
     });
   };
   app.use(express.json({ limit: "1mb" }));
+
+  app.get("/", (_request, response) => {
+    response.type("html").send(renderLandingPage());
+  });
 
   app.get("/health", (_request, response) => {
     response.json({ ok: true, service: "fuse" });
