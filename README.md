@@ -67,6 +67,24 @@ Phase 0 proves, against current Circle documentation and SDKs:
 
 Children are logical Fuse identities. The parent Circle wallet is the payer and owns the shared Gateway balance. Fuse checks each child capability and root mandate before requesting a parent-wallet signature. The Arc mandate contract, when added, is an audit/revocation commitment—not the enforcement point.
 
+## Phase 1 API spine
+
+The OpenAI-compatible `POST /v1/chat/completions` route is implemented and tested end-to-end with an injected provider and payment guard:
+
+1. Requires `Idempotency-Key` and `X-Fuse-Child` headers.
+2. Reserves worst-case token cost against child and root budgets.
+3. Calls the provider only once and holds the response.
+4. Computes an exact micro-USDC quote from provider-reported usage.
+5. Dynamically invokes Circle Gateway x402 middleware for that exact price.
+6. Reuses the cached inference on the paid retry.
+7. Reconciles the reservation and returns an OpenAI-compatible response with a Fuse receipt.
+
+The production server is wired to the Anthropic SDK and real Circle Gateway middleware. A live Claude request remains blocked until `ANTHROPIC_API_KEY` is configured; this path is not mocked.
+
+```bash
+npm run dev
+```
+
 ## Current implementation note
 
 The current ledger is in-memory and suitable only for the executable spine. Before deploying the multi-child API, reservations must move to transactional SQLite/PostgreSQL so concurrent workers cannot overspend through races.

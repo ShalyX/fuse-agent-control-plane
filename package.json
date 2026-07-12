@@ -7,11 +7,13 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "build": "tsc -p tsconfig.json",
-    "start": "node dist/server.js",
+    "start": "node dist/src/server.js",
+    "dev": "node --env-file=.env --import tsx src/server.ts",
     "demo": "tsx scripts/demo.ts",
     "check": "npm test && npm run build"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.111.0",
     "@circle-fin/developer-controlled-wallets": "^10.8.0",
     "@circle-fin/x402-batching": "^3.2.0",
     "@x402/core": "^2.18.0",
@@ -23,6 +25,8 @@
   "devDependencies": {
     "@types/express": "^5.0.3",
     "@types/node": "^24.0.10",
+    "@types/supertest": "^7.2.0",
+    "supertest": "^7.2.2",
     "tsx": "^4.20.3",
     "typescript": "^5.8.3",
     "vitest": "^3.2.4"
