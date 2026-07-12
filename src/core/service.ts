@@ -1,3 +1,4 @@
+import { BranchCircuit, type CircuitResult } from "./circuit.js";
 import { FuseLedger } from "./ledger.js";
 import { calculateCostMicros, calculateMaximumCostMicros, type TokenPrice } from "./pricing.js";
 
@@ -24,6 +25,7 @@ type Pending = {
   request: CompletionRequest;
   result: ProviderResult;
   exactCostMicros: bigint;
+  circuit: CircuitResult;
   released?: ReleasedCompletion;
 };
 
@@ -39,6 +41,8 @@ type Receipt = {
   authorizationHash: string;
   gatewayStatus: string;
   settlementStatus: "pending_batch";
+  circuitState: string;
+  circuitReason: string;
 };
 
 type ReleasedCompletion = {
@@ -62,6 +66,7 @@ export class FuseService {
     private readonly ledger: FuseLedger,
     private readonly price: TokenPrice,
     private readonly payerWallet: string,
+    private readonly circuits: Record<string, BranchCircuit>,
   ) {}
 
   static createDemo(provider: InferenceProvider, options: {
@@ -77,6 +82,13 @@ export class FuseService {
       }),
       options.price ?? { inputUsdPerMillion: "3.00", outputUsdPerMillion: "15.00" },
       options.payerWallet ?? "0xDemoParentWallet",
+      Object.fromEntries(["scout", "builder", "reviewer"].map((childId) => [
+        childId,
+        new BranchCircuit({
+          perCallCeilingMicros: 50_000n,
+          minimumSpikeDeltaMicros: 1n,
+        }),
+      ])),
     );
   }
 
@@ -90,6 +102,10 @@ export class FuseService {
         paymentRequirements: this.paymentRequirements(request.requestId, cached.exactCostMicros),
       };
     }
+
+    const circuit = this.circuits[request.childId];
+    if (!circuit) throw new Error("UNKNOWN_CHILD");
+    circuit.assertOpen();
 
     const maximumMicros = calculateMaximumCostMicros(
       { inputTokens: request.inputTokens, maxOutputTokens: request.maxOutputTokens },
@@ -105,7 +121,13 @@ export class FuseService {
     }
 
     const exactCostMicros = calculateCostMicros(result.usage, this.price);
-    this.pending.set(request.requestId, { request, result, exactCostMicros });
+    const circuitResult = circuit.evaluate(exactCostMicros);
+    this.pending.set(request.requestId, {
+      request,
+      result,
+      exactCostMicros,
+      circuit: circuitResult,
+    });
     return {
       status: "payment_required" as const,
       httpStatus: 402 as const,
@@ -134,9 +156,20 @@ export class FuseService {
         authorizationHash: payment.authorizationHash,
         gatewayStatus: payment.gatewayStatus,
         settlementStatus: "pending_batch",
+        circuitState: pending.circuit.state,
+        circuitReason: pending.circuit.reason,
       },
     };
     return pending.released;
+  }
+
+  snapshot() {
+    return {
+      ledger: this.ledger.snapshot(),
+      circuits: Object.fromEntries(
+        Object.entries(this.circuits).map(([childId, circuit]) => [childId, circuit.snapshot()]),
+      ),
+    };
   }
 
   private paymentRequirements(requestId: string, amountMicros: bigint) {

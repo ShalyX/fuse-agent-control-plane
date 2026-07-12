@@ -99,6 +99,19 @@ The `3.00` input / `15.00` output USDC-per-million values are Fuse's current con
 npm run dev
 ```
 
+## Control desk
+
+`GET /desk` serves the browser-tested control plane for the hackathon demo. It includes:
+
+- Root and child budget tree for Scout, Builder, and Reviewer.
+- A clearly labeled deterministic isolation replay that does not incur provider or payment charges.
+- `HEALTHY → ELEVATED → TRIPPED` Scout progression.
+- Reviewer continuation after Scout isolation.
+- The real live AgentRouter/Circle settlement reference as payment evidence.
+- Responsive layout and reduced-motion handling.
+
+`GET /api/state` exposes the current in-memory ledger and circuit state without serializing bigint values directly.
+
 ## Current implementation note
 
 The current ledger is in-memory and suitable only for the executable spine. Before deploying the multi-child API, reservations must move to transactional SQLite/PostgreSQL so concurrent workers cannot overspend through races.

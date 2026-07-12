@@ -1,6 +1,7 @@
 import express, { type RequestHandler } from "express";
 import { z } from "zod";
 import { FuseService, type InferenceProvider } from "../core/service.js";
+import { renderControlDesk } from "./desk.js";
 
 const completionSchema = z.object({
   model: z.string().min(1),
@@ -35,6 +36,34 @@ export function createFuseApp(dependencies: AppDependencies) {
 
   app.get("/health", (_request, response) => {
     response.json({ ok: true, service: "fuse" });
+  });
+
+  app.get("/desk", (_request, response) => {
+    response.type("html").send(renderControlDesk());
+  });
+
+  app.get("/api/state", (_request, response) => {
+    const snapshot = service.snapshot();
+    const usdc = (value: bigint) => microsToUsdc(value);
+    response.json({
+      mandateId: snapshot.ledger.mandateId,
+      root: {
+        authorizedUsdc: usdc(snapshot.ledger.root.authorizedMicros),
+        reservedUsdc: usdc(snapshot.ledger.root.reservedMicros),
+        settledUsdc: usdc(snapshot.ledger.root.settledMicros),
+        availableUsdc: usdc(snapshot.ledger.root.availableMicros),
+      },
+      children: Object.fromEntries(Object.entries(snapshot.ledger.children).map(([childId, account]) => [
+        childId,
+        {
+          authorizedUsdc: usdc(account.authorizedMicros),
+          reservedUsdc: usdc(account.reservedMicros),
+          settledUsdc: usdc(account.settledMicros),
+          availableUsdc: usdc(account.availableMicros),
+          circuitState: snapshot.circuits[childId]?.state ?? "UNKNOWN",
+        },
+      ])),
+    });
   });
 
   app.post("/v1/chat/completions", async (request, response, next) => {

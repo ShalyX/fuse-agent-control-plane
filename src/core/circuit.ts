@@ -50,6 +50,18 @@ export class BranchCircuit {
     );
   }
 
+  snapshot() {
+    return {
+      state: this.state,
+      consecutiveViolations: this.consecutiveViolations,
+      previousCostMicros: this.previousCostMicros,
+    };
+  }
+
+  assertOpen() {
+    if (this.state === "TRIPPED") throw new Error("BRANCH_TRIPPED");
+  }
+
   private result(
     currentCostMicros: bigint,
     decision: "allow" | "trip",

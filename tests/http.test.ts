@@ -80,6 +80,29 @@ describe("POST /v1/chat/completions", () => {
     expect(provider.calls).toBe(1);
   });
 
+  it("serves the control desk and machine-readable budget tree", async () => {
+    const app = createFuseApp({
+      provider: new FakeProvider(),
+      paymentGuard: fakePaymentGuard,
+      estimateInputTokens: () => 1000,
+    });
+    const desk = await request(app).get("/desk");
+    expect(desk.status).toBe(200);
+    expect(desk.text).toContain("Fuse Control Desk");
+    expect(desk.text).toContain("Deterministic isolation scenario");
+
+    const state = await request(app).get("/api/state");
+    expect(state.status).toBe(200);
+    expect(state.body).toMatchObject({
+      mandateId: "demo-mandate",
+      root: { authorizedUsdc: "0.250000" },
+      children: {
+        scout: { circuitState: "HEALTHY", authorizedUsdc: "0.060000" },
+        reviewer: { circuitState: "HEALTHY", authorizedUsdc: "0.050000" },
+      },
+    });
+  });
+
   it("requires idempotency and child capability headers", async () => {
     const app = createFuseApp({
       provider: new FakeProvider(),
