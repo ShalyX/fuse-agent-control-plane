@@ -8,8 +8,8 @@ const { initiateDeveloperControlledWalletsClient } = require("@circle-fin/develo
   initiateDeveloperControlledWalletsClient: typeof InitiateClient;
 };
 const env = process.env;
-const apiKey = env["CIRCLE_API_KEY"];
-const entitySecret = env["CIRCLE_ENTITY_SECRET"];
+const apiKey = env["CIRCLE_API_KEY"]?.trim();
+const entitySecret = env["CIRCLE_ENTITY_SECRET"]?.trim();
 if (!apiKey || !entitySecret) throw new Error("Missing Circle credentials");
 
 const circle = initiateDeveloperControlledWalletsClient({ apiKey, entitySecret });

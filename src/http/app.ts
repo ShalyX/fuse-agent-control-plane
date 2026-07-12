@@ -17,6 +17,8 @@ type AppDependencies = {
   provider: InferenceProvider;
   paymentGuard: PaymentGuardFactory;
   estimateInputTokens: (messages: Array<{ role: string; content: string }>) => number;
+  payerWallet?: string;
+  price?: { inputUsdPerMillion: string; outputUsdPerMillion: string };
 };
 
 function microsToUsdc(micros: bigint): string {
@@ -25,7 +27,10 @@ function microsToUsdc(micros: bigint): string {
 
 export function createFuseApp(dependencies: AppDependencies) {
   const app = express();
-  const service = FuseService.createDemo(dependencies.provider);
+  const service = FuseService.createDemo(dependencies.provider, {
+    payerWallet: dependencies.payerWallet,
+    price: dependencies.price,
+  });
   app.use(express.json({ limit: "1mb" }));
 
   app.get("/health", (_request, response) => {

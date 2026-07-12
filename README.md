@@ -79,7 +79,21 @@ The OpenAI-compatible `POST /v1/chat/completions` route is implemented and teste
 6. Reuses the cached inference on the paid retry.
 7. Reconciles the reservation and returns an OpenAI-compatible response with a Fuse receipt.
 
-The production server is wired to the Anthropic SDK and real Circle Gateway middleware. A live Claude request remains blocked until `ANTHROPIC_API_KEY` is configured; this path is not mocked.
+The production server is wired to AgentRouter's OpenAI-compatible endpoint with its mandatory exact User-Agent and real Circle Gateway middleware.
+
+### Live metered inference evidence
+
+A live `claude-opus-4-8` request completed through the entire Fuse path:
+
+- AgentRouter returned real usage: 27 input tokens and 15 output tokens.
+- Fuse calculated an exact charge of `0.000306` USDC using the configured demo price schedule.
+- The first Fuse response was HTTP `402`.
+- The Circle Developer-Controlled parent EOA signed the exact EIP-3009 authorization.
+- Circle Gateway accepted settlement reference `8b9f04db-4d52-44d4-b12e-d932c8315bfb` on `eip155:5042002`.
+- The paid retry returned HTTP `200` with `FUSE LIVE PAID OK`.
+- The receipt identifies the real parent payer, logical child `scout`, exact token usage, exact charge, and Gateway settlement reference.
+
+The `3.00` input / `15.00` output USDC-per-million values are Fuse's current configurable demo schedule; they are not represented as AgentRouter's underlying provider price.
 
 ```bash
 npm run dev

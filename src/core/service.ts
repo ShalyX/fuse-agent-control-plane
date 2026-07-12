@@ -64,7 +64,10 @@ export class FuseService {
     private readonly payerWallet: string,
   ) {}
 
-  static createDemo(provider: InferenceProvider): FuseService {
+  static createDemo(provider: InferenceProvider, options: {
+    payerWallet?: string;
+    price?: TokenPrice;
+  } = {}): FuseService {
     return new FuseService(
       provider,
       new FuseLedger({
@@ -72,8 +75,8 @@ export class FuseService {
         maximumSpendMicros: 250_000n,
         children: { scout: 60_000n, builder: 120_000n, reviewer: 50_000n },
       }),
-      { inputUsdPerMillion: "3.00", outputUsdPerMillion: "15.00" },
-      "0xDemoParentWallet",
+      options.price ?? { inputUsdPerMillion: "3.00", outputUsdPerMillion: "15.00" },
+      options.payerWallet ?? "0xDemoParentWallet",
     );
   }
 
