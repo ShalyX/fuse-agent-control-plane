@@ -20,9 +20,9 @@ export function createRuntimeApp(env: NodeJS.ProcessEnv = process.env) {
       inputUsdPerMillion: env["FUSE_INPUT_USD_PER_M"] ?? "3.00",
       outputUsdPerMillion: env["FUSE_OUTPUT_USD_PER_M"] ?? "15.00",
     },
-    // UTF-8 bytes are a conservative reservation bound. Provider-reported
+    // Reserve UTF-8 bytes plus fixed provider-envelope overhead. Provider-reported
     // usage remains authoritative for the exact post-inference quote.
-    estimateInputTokens: (messages) => new TextEncoder().encode(
+    estimateInputTokens: (messages) => 512 + new TextEncoder().encode(
       messages.map((message) => `${message.role}:${message.content}`).join("\n"),
     ).length,
   });

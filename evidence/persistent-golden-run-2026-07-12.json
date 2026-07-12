@@ -1,0 +1,47 @@
+{
+  "status": "persistent_golden_run_complete",
+  "recordedAt": "2026-07-12",
+  "network": "eip155:5042002",
+  "persistence": "Neon Postgres",
+  "payer": "0x68abdce904bd68c53b0daf43c9b83a5aa8c0b2f7",
+  "scout": [
+    {
+      "usage": { "prompt_tokens": 30, "completion_tokens": 6, "total_tokens": 36 },
+      "costUsdc": "0.000180",
+      "circuitState": "HEALTHY",
+      "circuitReason": "ALLOW",
+      "authorizationHash": "db215a84-4280-46e4-83ad-401fa84a32f0"
+    },
+    {
+      "usage": { "prompt_tokens": 320, "completion_tokens": 6, "total_tokens": 326 },
+      "costUsdc": "0.001050",
+      "circuitState": "ELEVATED",
+      "circuitReason": "ALLOW",
+      "authorizationHash": "eb6b3f64-ffa7-4a20-8c88-1e90acbbbd98"
+    },
+    {
+      "usage": { "prompt_tokens": 1928, "completion_tokens": 6, "total_tokens": 1934 },
+      "costUsdc": "0.005874",
+      "circuitState": "TRIPPED",
+      "circuitReason": "REPEATED_COST_ACCELERATION",
+      "authorizationHash": "11d015a1-1fcc-4d35-93ca-5f59d84f1569",
+      "reclaimedUsdc": "0.052896"
+    }
+  ],
+  "blockedScout": { "httpStatus": 409, "code": "BRANCH_TRIPPED" },
+  "reviewer": {
+    "usage": { "prompt_tokens": 36, "completion_tokens": 6, "total_tokens": 42 },
+    "costUsdc": "0.000198",
+    "circuitState": "HEALTHY",
+    "authorizationHash": "3c5cb227-1922-48e1-b474-d6cf053b6862"
+  },
+  "state": {
+    "parentUnallocatedUsdc": "0.072896",
+    "rootSettledUsdc": "0.007302",
+    "scoutSettledUsdc": "0.007104",
+    "scoutAvailableUsdc": "0.000000",
+    "scoutCircuitState": "TRIPPED",
+    "reviewerSettledUsdc": "0.000198",
+    "reviewerCircuitState": "HEALTHY"
+  }
+}

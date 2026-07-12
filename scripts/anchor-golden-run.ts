@@ -13,10 +13,10 @@ const entitySecret = process.env["CIRCLE_ENTITY_SECRET"]?.trim();
 if (!apiKey || !entitySecret) throw new Error("Missing Circle credentials");
 const contractAddress = "0xf736609aa15b255322df4d5dfe6ea66b59b7c663";
 const controllerAddress = "0x68abdce904bd68c53b0daf43c9b83a5aa8c0b2f7";
-const runId = "golden-run-2026-07-12-v2";
+const runId = "persistent-golden-run-2026-07-12-v3";
 const mandateId = keccak256(toHex(runId));
 
-const evidence = JSON.parse(readFileSync(new URL("../evidence/golden-run-2026-07-12.json", import.meta.url), "utf8"));
+const evidence = JSON.parse(readFileSync(new URL("../evidence/persistent-golden-run-2026-07-12.json", import.meta.url), "utf8"));
 const rawReceipts = [...evidence.scout, evidence.reviewer];
 const receipts: CommittedReceipt[] = rawReceipts.map((entry: any, index: number) => {
   const childId = index < evidence.scout.length ? "scout" : "reviewer";
@@ -32,7 +32,7 @@ const receipts: CommittedReceipt[] = rawReceipts.map((entry: any, index: number)
   };
 });
 const commitment = buildReceiptCommitment(mandateId, receipts);
-if (commitment.totalPaidAtomic !== 5_778n) throw new Error("UNEXPECTED_GOLDEN_TOTAL");
+if (commitment.totalPaidAtomic !== 7_302n) throw new Error("UNEXPECTED_GOLDEN_TOTAL");
 
 const circle = initiateDeveloperControlledWalletsClient({ apiKey, entitySecret });
 const wallets = (await circle.listWallets()).data?.wallets ?? [];

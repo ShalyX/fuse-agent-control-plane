@@ -105,7 +105,7 @@ npm run dev
 - State API: [fuse-agent-control-plane.vercel.app/api/state](https://fuse-agent-control-plane.vercel.app/api/state)
 - Source and evidence: [github.com/ShalyX/fuse-agent-control-plane](https://github.com/ShalyX/fuse-agent-control-plane)
 
-The runtime now supports transactional Postgres persistence when `DATABASE_URL` is configured. Ledger state, reservations, circuits, held provider responses, idempotency results, and released receipts survive serverless cold starts. The public deployment remains on the in-memory fallback until a database resource is connected; do not present that deployment as durable payment infrastructure yet.
+The public deployment is backed by Neon Postgres. Ledger state, reservations, circuits, held provider responses, idempotency results, and released receipts survive serverless cold starts. The public `/api/state` currently exposes the persisted golden-run outcome.
 
 ## Golden combined run
 
@@ -113,13 +113,13 @@ The live combined run now exercises the full system in one process:
 
 1. Three real AgentRouter calls from Scout with provider-reported token usage.
 2. One real Circle Gateway Nanopayment per completed call.
-3. Genuine cost acceleration from growing prompt context: `$0.000180 → $0.001050 → $0.004350`.
+3. Genuine cost acceleration from growing prompt context: `$0.000180 → $0.001050 → $0.005874`.
 4. `HEALTHY → ELEVATED → TRIPPED` after two consecutive increases above 4×.
-5. Automatic reclaim of Scout's remaining `$0.054420` allowance to the parent pool.
+5. Automatic reclaim of Scout's remaining `$0.052896` allowance to the parent pool.
 6. A subsequent Scout request blocked with HTTP `409 BRANCH_TRIPPED` before inference.
 7. A real Reviewer inference and `$0.000198` payment succeeding while Scout remains tripped.
 
-The resulting parent reserve increased from `$0.020000` to `$0.074420`. The complete receipt set is committed at [`evidence/golden-run-2026-07-12.json`](evidence/golden-run-2026-07-12.json).
+The persistent run settled `$0.007302` total and increased parent reserve from `$0.020000` to `$0.072896`. Its complete receipt set is committed at [`evidence/persistent-golden-run-2026-07-12.json`](evidence/persistent-golden-run-2026-07-12.json).
 
 ## Arc mandate anchor
 
@@ -130,10 +130,10 @@ The contract deliberately exposes only a two-transaction lifecycle:
 1. `openMandate(mandateId, maximumSpendAtomic, controller)` once per session.
 2. `closeMandate(mandateId, totalPaidAtomic, receiptHash)` once per session.
 
-There is no per-completion `recordSettlement` method. The golden run was anchored with a `250000` atomic cap, `5778` atomic final spend, and canonical receipt hash `0xe079a2d459ac16a2d866e79bc5c10a58cc7abf611c0711cac118fa9334bb7a74`.
+There is no per-completion `recordSettlement` method. The persistent golden run was anchored with a `250000` atomic cap, `7302` atomic final spend, and canonical receipt hash `0x91391b64514c0b4ec350b864dc1f8ad34b51d69180746e818c8420a75f70325c`.
 
-- [Open transaction](https://testnet.arcscan.app/tx/0x92f5195cc463a752f77ebb57b650a70d3563eb6add0d4fc1c3c90b8fe5c77610)
-- [Close transaction](https://testnet.arcscan.app/tx/0x13ea1dc9b0e02a0a935c25e8a39f3cea121e2800ad76a50874833a8a8bbe9141)
+- [Open transaction](https://testnet.arcscan.app/tx/0xe92bb389d8b05c6121274c2bc7e1edf4a2ecd150afd18dc339eec8aa2aecab9b)
+- [Close transaction](https://testnet.arcscan.app/tx/0x03a9f53dc180865a7168cf44f6f0ed2da03fe246aa7f68ddb286abe6cd27d772)
 - [Machine-readable on-chain evidence](evidence/arc-mandate-2026-07-12.json)
 
 Run it with:
