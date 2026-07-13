@@ -73,7 +73,7 @@ const requestTransitions: Record<RequestState, readonly RequestState[]> = {
   reservation_expired: [],
   payment_rejected: [],
   response_expired: [],
-  manual_review: ["admitted", "reserved", "payment_pending", "compensation_required"],
+  manual_review: [],
   compensation_required: [],
 };
 
@@ -109,8 +109,8 @@ const mandateTransitions: Record<MandateState, readonly MandateState[]> = {
   closed: [],
   exhausted: ["closing", "reconciliation_hold"],
   tripped: ["active", "closing", "reconciliation_hold"],
-  expired: ["closing", "reconciliation_hold"],
-  reconciliation_hold: ["active", "paused", "closing"],
+  expired: ["closing"],
+  reconciliation_hold: ["closing"],
 };
 
 export const createRequestLifecycle = (id: string) =>

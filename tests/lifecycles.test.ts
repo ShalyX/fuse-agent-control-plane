@@ -68,6 +68,23 @@ describe("production lifecycle state machines", () => {
     expect(mandate.state).toBe("closed");
   });
 
+  it("does not allow manual review to bypass admission and reservation", () => {
+    const request = createRequestLifecycle("req-1");
+    request.transition("manual_review", context);
+    expect(() => request.transition("payment_pending", context)).toThrow(
+      "LIFECYCLE_TRANSITION_INVALID:request:manual_review->payment_pending",
+    );
+  });
+
+  it("does not resurrect an expired mandate through reconciliation hold", () => {
+    const mandate = createMandateLifecycle("mandate-1");
+    mandate.transition("active", context);
+    mandate.transition("expired", context);
+    expect(() => mandate.transition("reconciliation_hold", context)).toThrow(
+      "LIFECYCLE_TRANSITION_INVALID:mandate:expired->reconciliation_hold",
+    );
+  });
+
   it("requires actor and causal identity for transitions", () => {
     const mandate = createMandateLifecycle("mandate-1");
     expect(() => mandate.transition("active", { ...context, actorId: "" })).toThrow(

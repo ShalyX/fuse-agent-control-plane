@@ -113,7 +113,11 @@ export class ProductionFoundationStore {
 
   async appendJournalEntry(organizationId: string, entry: JournalEntry): Promise<void> {
     if (!organizationId.trim()) throw new Error("JOURNAL_ORGANIZATION_REQUIRED");
-    new FinancialLedger().append(entry);
+    const snapshot: JournalEntry = {
+      ...entry,
+      postings: entry.postings.map((posting) => ({ ...posting })),
+    };
+    new FinancialLedger().append(snapshot);
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
@@ -121,14 +125,14 @@ export class ProductionFoundationStore {
         `INSERT INTO journal_entries
          (id, organization_id, actor_id, causation_id, occurred_at, description)
          VALUES ($1, $2, $3, $4, $5, $6)`,
-        [entry.id, organizationId, entry.actorId, entry.causationId, entry.occurredAt, entry.description],
+        [snapshot.id, organizationId, snapshot.actorId, snapshot.causationId, snapshot.occurredAt, snapshot.description],
       );
-      for (const [index, posting] of entry.postings.entries()) {
+      for (const [index, posting] of snapshot.postings.entries()) {
         await client.query(
           `INSERT INTO journal_postings
            (entry_id, line_number, account_id, asset_id, side, amount_atomic)
            VALUES ($1, $2, $3, $4, $5, $6)`,
-          [entry.id, index, posting.accountId, posting.assetId, posting.side, posting.amountAtomic.toString()],
+          [snapshot.id, index, posting.accountId, posting.assetId, posting.side, posting.amountAtomic.toString()],
         );
       }
       await client.query("COMMIT");

@@ -179,7 +179,7 @@ The hackathon state record remains intact for reproducible public evidence while
 - Immutable actor and causation metadata for every journal entry.
 - Independent request, payment, and mandate lifecycle state machines.
 - Explicit `accepted`, `pending_batch`, and `finalized` payment states.
-- Postgres-backed immutable audit events and journal entries.
+- Postgres-backed append-only store APIs for audit events and journal entries; database-role or trigger enforcement is still pending.
 - Duplicate-ID protection and transactional journal/posting persistence.
 
 These modules do not provision wallets or assume who controls a signer. Real-money wallet and settlement work remains gated by the authority/custody decision in the [production roadmap](docs/production-roadmap.md).

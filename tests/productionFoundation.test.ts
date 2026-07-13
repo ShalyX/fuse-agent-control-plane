@@ -62,6 +62,18 @@ describe("ProductionFoundationStore", () => {
     await pool.end();
   });
 
+  it("persists the same immutable journal snapshot that was validated", async () => {
+    const { store, pool } = await createStore();
+    const original = journalEntry();
+    const pending = store.appendJournalEntry("org-1", original);
+    original.description = "mutated after validation";
+    original.postings[1]!.amountAtomic = 1n;
+    await pending;
+
+    expect(await store.listJournalEntries("org-1")).toEqual([journalEntry()]);
+    await pool.end();
+  });
+
   it("rejects an unbalanced journal before writing any rows", async () => {
     const { store, pool } = await createStore();
     const invalid = journalEntry();

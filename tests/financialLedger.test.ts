@@ -74,6 +74,13 @@ describe("FinancialLedger", () => {
     }))).toThrow("JOURNAL_POSTING_ASSET_REQUIRED");
   });
 
+  it("rejects invalid posting sides received across runtime boundaries", () => {
+    const ledger = new FinancialLedger();
+    const invalid = entry();
+    invalid.postings[0]!.side = "bogus" as "debit";
+    expect(() => ledger.append(invalid)).toThrow("JOURNAL_POSTING_SIDE_INVALID");
+  });
+
   it("requires a description and valid event timestamp", () => {
     const ledger = new FinancialLedger();
     expect(() => ledger.append(entry({ description: "" }))).toThrow("JOURNAL_ENTRY_DESCRIPTION_REQUIRED");

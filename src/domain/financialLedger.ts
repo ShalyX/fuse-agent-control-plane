@@ -39,6 +39,9 @@ export class FinancialLedger {
     for (const posting of candidate.postings) {
       if (!posting.accountId.trim()) throw new Error("JOURNAL_POSTING_ACCOUNT_REQUIRED");
       if (!posting.assetId.trim()) throw new Error("JOURNAL_POSTING_ASSET_REQUIRED");
+      if (posting.side !== "debit" && posting.side !== "credit") {
+        throw new Error("JOURNAL_POSTING_SIDE_INVALID");
+      }
       if (posting.amountAtomic <= 0n) throw new Error("JOURNAL_POSTING_AMOUNT_INVALID");
       const total = totals.get(posting.assetId) ?? { debits: 0n, credits: 0n };
       total[posting.side === "debit" ? "debits" : "credits"] += posting.amountAtomic;
