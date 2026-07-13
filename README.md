@@ -161,6 +161,7 @@ node --env-file=.env --import tsx scripts/golden-run.ts
 
 ## Submission assets
 
+- [Production roadmap](docs/production-roadmap.md)
 - [Pitch deck source](docs/pitch-deck.md)
 - [Three-minute demo script](docs/demo-script.md)
 - [Encode / Arc submission copy](docs/submission.md)
@@ -169,3 +170,16 @@ node --env-file=.env --import tsx scripts/golden-run.ts
 ## Persistence
 
 Set `DATABASE_URL` to enable the transactional Postgres store. Each mutation locks the mandate row with `SELECT ... FOR UPDATE`, preserving root/child reservation invariants across concurrent serverless workers. Without `DATABASE_URL`, Fuse intentionally falls back to an in-memory store for local development and tests.
+
+## Production foundation
+
+The hackathon state record remains intact for reproducible public evidence while the custody-agnostic production core is built beside it. The first production slice adds:
+
+- An append-only, per-asset balanced financial journal using atomic integer amounts.
+- Immutable actor and causation metadata for every journal entry.
+- Independent request, payment, and mandate lifecycle state machines.
+- Explicit `accepted`, `pending_batch`, and `finalized` payment states.
+- Postgres-backed immutable audit events and journal entries.
+- Duplicate-ID protection and transactional journal/posting persistence.
+
+These modules do not provision wallets or assume who controls a signer. Real-money wallet and settlement work remains gated by the authority/custody decision in the [production roadmap](docs/production-roadmap.md).
