@@ -4,6 +4,7 @@ import { FuseService, type InferenceProvider } from "../core/service.js";
 import { MemoryStateStore, type ServiceStateStore } from "../persistence/store.js";
 import { renderControlDesk } from "./desk.js";
 import { renderLandingPage } from "./landing.js";
+import { createCapabilityGuard, type CredentialAuthenticator } from "./auth.js";
 
 const completionSchema = z.object({
   model: z.string().min(1),
@@ -23,6 +24,7 @@ type AppDependencies = {
   payerWallet?: string;
   price?: { inputUsdPerMillion: string; outputUsdPerMillion: string };
   stateStore?: ServiceStateStore;
+  credentialAuthenticator?: CredentialAuthenticator;
 };
 
 function microsToUsdc(micros: bigint): string {
@@ -92,6 +94,17 @@ export function createFuseApp(dependencies: AppDependencies) {
   app.get("/desk", (_request, response) => {
     response.type("html").send(renderControlDesk());
   });
+
+  if (dependencies.credentialAuthenticator) {
+    app.get(
+      "/api/v1/identity",
+      createCapabilityGuard(dependencies.credentialAuthenticator, "mandates:read"),
+      (_request, response) => {
+        disableCaching(response);
+        response.json(response.locals.fusePrincipal);
+      },
+    );
+  }
 
   app.get("/api/state", async (_request, response, next) => {
     try {

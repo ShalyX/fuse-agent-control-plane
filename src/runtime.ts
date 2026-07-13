@@ -1,7 +1,8 @@
 import { createFuseApp } from "./http/app.js";
 import { createCirclePaymentGuard } from "./circle/paymentGuard.js";
 import { AnthropicProvider } from "./providers/anthropic.js";
-import { PostgresStateStore } from "./persistence/postgres.js";
+import { PostgresStateStore, createPostgresPool } from "./persistence/postgres.js";
+import { IdentityStore } from "./persistence/identityStore.js";
 
 export function createRuntimeApp(env: NodeJS.ProcessEnv = process.env) {
   const apiKey = env["ANTHROPIC_API_KEY"]?.trim();
@@ -9,6 +10,9 @@ export function createRuntimeApp(env: NodeJS.ProcessEnv = process.env) {
   const anthropicBaseUrl = env["ANTHROPIC_BASE_URL"] ?? "https://api.anthropic.com/v1";
   const payerWallet = env["FUSE_PAYER_ADDRESS"] ?? "0x68abdce904bd68c53b0daf43c9b83a5aa8c0b2f7";
   const sellerAddress = env["FUSE_SELLER_ADDRESS"] ?? "0xa1984d65d411bb30bfd5fb6148c61fcc3cd3332c";
+  const databaseUrl = env["DATABASE_URL"];
+  const databasePool = databaseUrl ? createPostgresPool(databaseUrl) : undefined;
+  const identityStore = databasePool ? new IdentityStore(databasePool) : undefined;
   if (!apiKey) throw new Error("ANTHROPIC_API_KEY is required");
 
   return createFuseApp({
@@ -19,7 +23,8 @@ export function createRuntimeApp(env: NodeJS.ProcessEnv = process.env) {
     }),
     paymentGuard: createCirclePaymentGuard({ sellerAddress }),
     payerWallet,
-    stateStore: env["DATABASE_URL"] ? PostgresStateStore.fromConnectionString(env["DATABASE_URL"]) : undefined,
+    stateStore: databasePool ? new PostgresStateStore(databasePool) : undefined,
+    credentialAuthenticator: identityStore,
     price: {
       inputUsdPerMillion: env["FUSE_INPUT_USD_PER_M"] ?? "3.00",
       outputUsdPerMillion: env["FUSE_OUTPUT_USD_PER_M"] ?? "15.00",

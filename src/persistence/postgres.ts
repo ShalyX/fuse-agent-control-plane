@@ -7,6 +7,15 @@ import {
   type ServiceStateStore,
 } from "./store.js";
 
+export function createPostgresPool(connectionString: string): Pool {
+  const config: PoolConfig = {
+    connectionString,
+    max: 5,
+    ssl: connectionString.includes("localhost") ? false : { rejectUnauthorized: false },
+  };
+  return new Pool(config);
+}
+
 export class PostgresStateStore implements ServiceStateStore {
   readonly kind = "postgres" as const;
   private initialized?: Promise<void>;
@@ -17,12 +26,7 @@ export class PostgresStateStore implements ServiceStateStore {
   ) {}
 
   static fromConnectionString(connectionString: string) {
-    const config: PoolConfig = {
-      connectionString,
-      max: 5,
-      ssl: connectionString.includes("localhost") ? false : { rejectUnauthorized: false },
-    };
-    return new PostgresStateStore(new Pool(config));
+    return new PostgresStateStore(createPostgresPool(connectionString));
   }
 
   private ensureSchema() {

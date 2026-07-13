@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { newDb } from "pg-mem";
 import type { Pool } from "pg";
 import { FuseService, type InferenceProvider } from "../src/core/service.js";
-import { PostgresStateStore } from "../src/persistence/postgres.js";
+import { PostgresStateStore, createPostgresPool } from "../src/persistence/postgres.js";
 
 class NoopProvider implements InferenceProvider {
   async complete() {
@@ -11,6 +11,13 @@ class NoopProvider implements InferenceProvider {
 }
 
 describe("PostgresStateStore", () => {
+  it("creates a serverless-safe shared pool configuration", async () => {
+    const pool = createPostgresPool("postgres://user:pass@localhost:5432/fuse");
+    expect(pool.options.max).toBe(5);
+    expect(pool.options.ssl).toBe(false);
+    await pool.end();
+  });
+
   it("persists bigint service state across store instances", async () => {
     const memoryDb = newDb({ noAstCoverageCheck: true });
     const adapter = memoryDb.adapters.createPg();

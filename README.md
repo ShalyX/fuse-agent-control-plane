@@ -183,3 +183,17 @@ The hackathon state record remains intact for reproducible public evidence while
 - Duplicate-ID protection and transactional journal/posting persistence.
 
 These modules do not provision wallets or assume who controls a signer. Real-money wallet and settlement work remains gated by the authority/custody decision in the [production roadmap](docs/production-roadmap.md).
+
+### Identity and control-mode boundary
+
+The second custody-agnostic slice adds:
+
+- Normalized organizations and agent identities.
+- Transactional audit events for organization creation, agent registration, credential issuance, and revocation.
+- One-time, high-entropy `fuse_sk_…` credentials; only the SHA-256 hash and a display prefix are persisted.
+- Explicit capabilities for inference, mandate reads/writes, and receipt reads.
+- Credential expiry, revocation, active-agent checks, and constant-time credential-digest comparison.
+- A fail-closed capability middleware with stable `401`, `403`, and sanitized `503` responses.
+- `GET /api/v1/identity`, protected by `mandates:read`, while the public hackathon evidence routes remain unchanged.
+
+There is deliberately no public credential-provisioning endpoint yet. Issuance is a trusted administrative operation until organization-user authentication and administrative role separation are implemented.

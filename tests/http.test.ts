@@ -4,6 +4,7 @@ import type { RequestHandler } from "express";
 import { createFuseApp } from "../src/http/app.js";
 import type { InferenceProvider } from "../src/core/service.js";
 import { MemoryStateStore } from "../src/persistence/store.js";
+import type { CredentialAuthenticator } from "../src/http/auth.js";
 
 class FakeProvider implements InferenceProvider {
   calls = 0;
@@ -167,6 +168,36 @@ describe("POST /v1/chat/completions", () => {
         reviewer: { circuitState: "HEALTHY", authorizedUsdc: "0.050000" },
       },
     });
+  });
+
+  it("exposes authenticated principal context without changing public evidence routes", async () => {
+    const credentialAuthenticator: CredentialAuthenticator = {
+      authenticateToken: async () => ({
+        organizationId: "org-1",
+        agentId: "agent-1",
+        credentialId: "cred-1",
+        capabilities: ["mandates:read"],
+      }),
+    };
+    const app = createFuseApp({
+      provider: new FakeProvider(),
+      paymentGuard: fakePaymentGuard,
+      estimateInputTokens: () => 1000,
+      credentialAuthenticator,
+    });
+
+    const response = await request(app)
+      .get("/api/v1/identity")
+      .set("Authorization", "Bearer fuse_sk_valid");
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({
+      organizationId: "org-1",
+      agentId: "agent-1",
+      credentialId: "cred-1",
+      capabilities: ["mandates:read"],
+    });
+    expect(response.headers["cache-control"]).toContain("no-store");
+    expect((await request(app).get("/api/state")).status).toBe(200);
   });
 
   it("requires idempotency and child capability headers", async () => {
