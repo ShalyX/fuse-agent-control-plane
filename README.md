@@ -196,4 +196,28 @@ The second custody-agnostic slice adds:
 - A fail-closed capability middleware with stable `401`, `403`, and sanitized `503` responses.
 - `GET /api/v1/identity`, protected by `mandates:read`, while the public hackathon evidence routes remain unchanged.
 
-There is deliberately no public credential-provisioning endpoint yet. Issuance is a trusted administrative operation until organization-user authentication and administrative role separation are implemented.
+There is deliberately no public user-provisioning endpoint yet. Organization users are modeled for the future operator console, while administrative API access is bootstrapped through a service account.
+
+### Administrative bootstrap and credential rotation
+
+Run the bootstrap command once against a new organization:
+
+```bash
+DATABASE_URL='<postgres-url>' \
+FUSE_BOOTSTRAP_ORG_ID='<organization-id>' \
+FUSE_BOOTSTRAP_ORG_NAME='<organization-name>' \
+FUSE_BOOTSTRAP_SERVICE_ACCOUNT_ID='<service-account-id>' \
+FUSE_BOOTSTRAP_SERVICE_ACCOUNT_NAME='<service-account-name>' \
+npm run identity:bootstrap
+```
+
+The command atomically creates the organization, administrative service account, credential, and their audit events, then prints the high-entropy bearer token exactly once. Only the digest is stored. The bootstrap credential expires after 24 hours by default; set `FUSE_BOOTSTRAP_EXPIRES_AT` to an explicit ISO timestamp when a different short bootstrap window is required. Re-running with the same identifiers fails rather than silently minting another administrative credential.
+
+A service account with the required capability can then call:
+
+- `POST /api/v1/admin/agent-credentials` with `credentials:issue`.
+- `POST /api/v1/admin/agent-credentials/:credentialId/revoke` with `credentials:revoke`.
+- `POST /api/v1/admin/service-account-credentials` with `credentials:issue` to mint a replacement administrative credential.
+- `POST /api/v1/admin/service-account-credentials/:credentialId/revoke` with `credentials:revoke` to invalidate the prior credential after rotation.
+
+Administrative routes require an `admin` service-account role in addition to the route capability. Operators and viewers are limited to role-compatible runtime/read capabilities at credential issuance and authentication. All endpoints derive the organization from the authenticated service account, require `X-Request-Id` for audit causation, return no-store responses, and never accept an organization identifier from the request body.

@@ -5,6 +5,8 @@ import { MemoryStateStore, type ServiceStateStore } from "../persistence/store.j
 import { renderControlDesk } from "./desk.js";
 import { renderLandingPage } from "./landing.js";
 import { createCapabilityGuard, type CredentialAuthenticator } from "./auth.js";
+import type { CredentialAdministrationPort } from "../identity/credentialAdministration.js";
+import { API_CAPABILITIES } from "../identity/apiCredentials.js";
 
 const completionSchema = z.object({
   model: z.string().min(1),
@@ -17,6 +19,27 @@ const completionSchema = z.object({
 
 type PaymentGuardFactory = (priceUsdc: string) => RequestHandler;
 
+const agentCredentialIssueSchema = z.object({
+  credentialId: z.string().min(1).max(128),
+  agentId: z.string().min(1).max(128),
+  name: z.string().min(1).max(128),
+  capabilities: z.array(z.enum([
+    "inference:invoke",
+    "mandates:read",
+    "mandates:write",
+    "receipts:read",
+  ])).min(1),
+  expiresAt: z.string().datetime().nullable().optional(),
+}).strict();
+
+const serviceCredentialIssueSchema = z.object({
+  credentialId: z.string().min(1).max(128),
+  serviceAccountId: z.string().min(1).max(128),
+  name: z.string().min(1).max(128),
+  capabilities: z.array(z.enum(API_CAPABILITIES)).min(1),
+  expiresAt: z.string().datetime().nullable().optional(),
+}).strict();
+
 type AppDependencies = {
   provider: InferenceProvider;
   paymentGuard: PaymentGuardFactory;
@@ -25,6 +48,7 @@ type AppDependencies = {
   price?: { inputUsdPerMillion: string; outputUsdPerMillion: string };
   stateStore?: ServiceStateStore;
   credentialAuthenticator?: CredentialAuthenticator;
+  credentialAdministration?: CredentialAdministrationPort;
 };
 
 function microsToUsdc(micros: bigint): string {
@@ -102,6 +126,162 @@ export function createFuseApp(dependencies: AppDependencies) {
       (_request, response) => {
         disableCaching(response);
         response.json(response.locals.fusePrincipal);
+      },
+    );
+  }
+
+  if (dependencies.credentialAuthenticator && dependencies.credentialAdministration) {
+    app.post(
+      "/api/v1/admin/agent-credentials",
+      createCapabilityGuard(dependencies.credentialAuthenticator, "credentials:issue"),
+      async (request, response) => {
+        disableCaching(response);
+        const requestId = request.header("X-Request-Id")?.trim();
+        if (!requestId) {
+          response.status(400).json({ error: { code: "REQUEST_ID_REQUIRED" } });
+          return;
+        }
+        const parsed = agentCredentialIssueSchema.safeParse(request.body);
+        if (!parsed.success) {
+          response.status(400).json({ error: { code: "INVALID_CREDENTIAL_REQUEST" } });
+          return;
+        }
+        try {
+          const issued = await dependencies.credentialAdministration!.issueAgentCredential(
+            response.locals.fusePrincipal,
+            { ...parsed.data, requestId },
+          );
+          response.status(201).json(issued);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "";
+          const databaseCode = typeof error === "object" && error !== null && "code" in error
+            ? String((error as { code?: unknown }).code ?? "") : "";
+          if (message === "SERVICE_ACCOUNT_REQUIRED" || message === "SERVICE_ACCOUNT_ADMIN_REQUIRED" || message === "ADMIN_CAPABILITY_REQUIRED") {
+            response.status(403).json({ error: { code: message } });
+          } else if (databaseCode === "23505") {
+            response.status(409).json({ error: { code: "CREDENTIAL_ID_CONFLICT" } });
+          } else if (databaseCode === "23503") {
+            response.status(404).json({ error: { code: "AGENT_NOT_FOUND" } });
+          } else if (message.endsWith("_REQUIRED") || message.endsWith("_INVALID")) {
+            response.status(400).json({ error: { code: message } });
+          } else {
+            response.status(503).json({ error: { code: "IDENTITY_ADMINISTRATION_UNAVAILABLE" } });
+          }
+        }
+      },
+    );
+
+    app.post(
+      "/api/v1/admin/agent-credentials/:credentialId/revoke",
+      createCapabilityGuard(dependencies.credentialAuthenticator, "credentials:revoke"),
+      async (request, response) => {
+        disableCaching(response);
+        const requestId = request.header("X-Request-Id")?.trim();
+        if (!requestId) {
+          response.status(400).json({ error: { code: "REQUEST_ID_REQUIRED" } });
+          return;
+        }
+        try {
+          const credentialIdParam = request.params["credentialId"];
+          const credentialId = typeof credentialIdParam === "string"
+            ? credentialIdParam
+            : credentialIdParam?.[0] ?? "";
+          await dependencies.credentialAdministration!.revokeAgentCredential(
+            response.locals.fusePrincipal,
+            credentialId,
+            requestId,
+          );
+          response.status(204).send();
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "";
+          if (message === "SERVICE_ACCOUNT_REQUIRED" || message === "SERVICE_ACCOUNT_ADMIN_REQUIRED" || message === "ADMIN_CAPABILITY_REQUIRED") {
+            response.status(403).json({ error: { code: message } });
+          } else if (message === "API_CREDENTIAL_NOT_ACTIVE") {
+            response.status(404).json({ error: { code: "CREDENTIAL_NOT_ACTIVE" } });
+          } else if (message.endsWith("_REQUIRED") || message.endsWith("_INVALID")) {
+            response.status(400).json({ error: { code: message } });
+          } else {
+            response.status(503).json({ error: { code: "IDENTITY_ADMINISTRATION_UNAVAILABLE" } });
+          }
+        }
+      },
+    );
+    app.post(
+      "/api/v1/admin/service-account-credentials",
+      createCapabilityGuard(dependencies.credentialAuthenticator, "credentials:issue"),
+      async (request, response) => {
+        disableCaching(response);
+        const requestId = request.header("X-Request-Id")?.trim();
+        if (!requestId) {
+          response.status(400).json({ error: { code: "REQUEST_ID_REQUIRED" } });
+          return;
+        }
+        const parsed = serviceCredentialIssueSchema.safeParse(request.body);
+        if (!parsed.success) {
+          response.status(400).json({ error: { code: "INVALID_CREDENTIAL_REQUEST" } });
+          return;
+        }
+        try {
+          const issued = await dependencies.credentialAdministration!.issueServiceAccountCredential(
+            response.locals.fusePrincipal,
+            { ...parsed.data, requestId },
+          );
+          response.status(201).json(issued);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "";
+          const databaseCode = typeof error === "object" && error !== null && "code" in error
+            ? String((error as { code?: unknown }).code ?? "") : "";
+          if (["SERVICE_ACCOUNT_REQUIRED", "SERVICE_ACCOUNT_ADMIN_REQUIRED", "ADMIN_CAPABILITY_REQUIRED"]
+            .includes(message)) {
+            response.status(403).json({ error: { code: message } });
+          } else if (databaseCode === "23505") {
+            response.status(409).json({ error: { code: "CREDENTIAL_ID_CONFLICT" } });
+          } else if (message === "SERVICE_ACCOUNT_NOT_ACTIVE") {
+            response.status(404).json({ error: { code: message } });
+          } else if (message.endsWith("_REQUIRED") || message.endsWith("_INVALID")
+            || message === "SERVICE_CREDENTIAL_CAPABILITY_FOR_ROLE") {
+            response.status(400).json({ error: { code: message } });
+          } else {
+            response.status(503).json({ error: { code: "IDENTITY_ADMINISTRATION_UNAVAILABLE" } });
+          }
+        }
+      },
+    );
+
+    app.post(
+      "/api/v1/admin/service-account-credentials/:credentialId/revoke",
+      createCapabilityGuard(dependencies.credentialAuthenticator, "credentials:revoke"),
+      async (request, response) => {
+        disableCaching(response);
+        const requestId = request.header("X-Request-Id")?.trim();
+        if (!requestId) {
+          response.status(400).json({ error: { code: "REQUEST_ID_REQUIRED" } });
+          return;
+        }
+        const credentialIdParam = request.params["credentialId"];
+        const credentialId = typeof credentialIdParam === "string"
+          ? credentialIdParam
+          : credentialIdParam?.[0] ?? "";
+        try {
+          await dependencies.credentialAdministration!.revokeServiceAccountCredential(
+            response.locals.fusePrincipal,
+            credentialId,
+            requestId,
+          );
+          response.status(204).send();
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "";
+          if (["SERVICE_ACCOUNT_REQUIRED", "SERVICE_ACCOUNT_ADMIN_REQUIRED", "ADMIN_CAPABILITY_REQUIRED"]
+            .includes(message)) {
+            response.status(403).json({ error: { code: message } });
+          } else if (message === "SERVICE_CREDENTIAL_NOT_ACTIVE") {
+            response.status(404).json({ error: { code: "CREDENTIAL_NOT_ACTIVE" } });
+          } else if (message.endsWith("_REQUIRED") || message.endsWith("_INVALID")) {
+            response.status(400).json({ error: { code: message } });
+          } else {
+            response.status(503).json({ error: { code: "IDENTITY_ADMINISTRATION_UNAVAILABLE" } });
+          }
+        }
       },
     );
   }

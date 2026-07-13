@@ -36,8 +36,9 @@ describe("capability authentication middleware", () => {
   it("rejects a valid credential that lacks the required capability", async () => {
     const limited: CredentialAuthenticator = {
       authenticateToken: async () => ({
+        principalType: "agent",
+        principalId: "agent-1",
         organizationId: "org-1",
-        agentId: "agent-1",
         credentialId: "cred-1",
         capabilities: ["receipts:read"],
       }),

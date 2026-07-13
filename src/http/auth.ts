@@ -1,11 +1,13 @@
 import type { RequestHandler } from "express";
-import type { ApiCapability } from "../identity/apiCredentials.js";
+import type { ApiCapability, ServiceAccountRole } from "../identity/apiCredentials.js";
 
 export interface AuthenticatedPrincipal {
+  principalType: "agent" | "service_account";
+  principalId: string;
   organizationId: string;
-  agentId: string;
   credentialId: string;
   capabilities: ApiCapability[];
+  role?: ServiceAccountRole;
 }
 
 export interface CredentialAuthenticator {

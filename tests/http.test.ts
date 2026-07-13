@@ -5,6 +5,7 @@ import { createFuseApp } from "../src/http/app.js";
 import type { InferenceProvider } from "../src/core/service.js";
 import { MemoryStateStore } from "../src/persistence/store.js";
 import type { CredentialAuthenticator } from "../src/http/auth.js";
+import type { CredentialAdministrationPort } from "../src/identity/credentialAdministration.js";
 
 class FakeProvider implements InferenceProvider {
   calls = 0;
@@ -173,8 +174,9 @@ describe("POST /v1/chat/completions", () => {
   it("exposes authenticated principal context without changing public evidence routes", async () => {
     const credentialAuthenticator: CredentialAuthenticator = {
       authenticateToken: async () => ({
+        principalType: "agent",
+        principalId: "agent-1",
         organizationId: "org-1",
-        agentId: "agent-1",
         credentialId: "cred-1",
         capabilities: ["mandates:read"],
       }),
@@ -191,13 +193,101 @@ describe("POST /v1/chat/completions", () => {
       .set("Authorization", "Bearer fuse_sk_valid");
     expect(response.status).toBe(200);
     expect(response.body).toEqual({
+      principalType: "agent",
+      principalId: "agent-1",
       organizationId: "org-1",
-      agentId: "agent-1",
       credentialId: "cred-1",
       capabilities: ["mandates:read"],
     });
     expect(response.headers["cache-control"]).toContain("no-store");
     expect((await request(app).get("/api/state")).status).toBe(200);
+  });
+
+  it("provides tenant-scoped service-account credential administration routes", async () => {
+    const credentialAuthenticator: CredentialAuthenticator = {
+      authenticateToken: async () => ({
+        principalType: "service_account",
+        role: "admin",
+        principalId: "service-1",
+        organizationId: "org-1",
+        credentialId: "service-cred-1",
+        capabilities: ["credentials:issue", "credentials:revoke"],
+      }),
+    };
+    const calls: unknown[] = [];
+    const credentialAdministration: CredentialAdministrationPort = {
+      issueAgentCredential: async (principal, input) => {
+        calls.push({ action: "issue", principal, input });
+        return {
+          credentialId: input.credentialId,
+          token: "fuse_sk_once",
+          tokenPrefix: "fuse_sk_once",
+          capabilities: [...input.capabilities],
+          expiresAt: input.expiresAt ?? null,
+        };
+      },
+      revokeAgentCredential: async (principal, credentialId, requestId) => {
+        calls.push({ action: "revoke", principal, credentialId, requestId });
+      },
+      issueServiceAccountCredential: async (principal, input) => {
+        calls.push({ action: "issue-service", principal, input });
+        return {
+          credentialId: input.credentialId,
+          token: "fuse_sk_service_once",
+          tokenPrefix: "fuse_sk_service_once".slice(0, 20),
+          capabilities: [...input.capabilities],
+          expiresAt: input.expiresAt ?? null,
+        };
+      },
+      revokeServiceAccountCredential: async (principal, credentialId, requestId) => {
+        calls.push({ action: "revoke-service", principal, credentialId, requestId });
+      },
+    };
+    const app = createFuseApp({
+      provider: new FakeProvider(), paymentGuard: fakePaymentGuard,
+      estimateInputTokens: () => 1000, credentialAuthenticator, credentialAdministration,
+    });
+
+    const issue = await request(app)
+      .post("/api/v1/admin/agent-credentials")
+      .set("Authorization", "Bearer service-key")
+      .set("X-Request-Id", "request:issue-1")
+      .send({
+        credentialId: "agent-cred-1",
+        agentId: "agent-1",
+        name: "Scout runtime",
+        capabilities: ["inference:invoke"],
+        expiresAt: "2026-08-13T18:00:00.000Z",
+      });
+    expect(issue.status).toBe(201);
+    expect(issue.body).toMatchObject({ credentialId: "agent-cred-1", token: "fuse_sk_once" });
+    expect(issue.headers["cache-control"]).toContain("no-store");
+
+    const revoke = await request(app)
+      .post("/api/v1/admin/agent-credentials/agent-cred-1/revoke")
+      .set("Authorization", "Bearer service-key")
+      .set("X-Request-Id", "request:revoke-1");
+    expect(revoke.status).toBe(204);
+
+    const rotateService = await request(app)
+      .post("/api/v1/admin/service-account-credentials")
+      .set("Authorization", "Bearer service-key")
+      .set("X-Request-Id", "request:rotate-service-1")
+      .send({
+        credentialId: "service-cred-2",
+        serviceAccountId: "service-1",
+        name: "rotated admin",
+        capabilities: ["credentials:issue", "credentials:revoke"],
+        expiresAt: "2026-07-14T18:00:00.000Z",
+      });
+    expect(rotateService.status).toBe(201);
+    expect(rotateService.headers["cache-control"]).toContain("no-store");
+    const revokeService = await request(app)
+      .post("/api/v1/admin/service-account-credentials/service-cred-1/revoke")
+      .set("Authorization", "Bearer service-key")
+      .set("X-Request-Id", "request:revoke-service-1");
+    expect(revokeService.status).toBe(204);
+    expect(calls).toHaveLength(4);
   });
 
   it("requires idempotency and child capability headers", async () => {
