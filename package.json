@@ -12,6 +12,9 @@
     "dev": "node --env-file=.env --import tsx src/server.ts",
     "demo": "tsx scripts/demo.ts",
     "identity:bootstrap": "tsx scripts/bootstrap-identity.ts",
+    "ops:check": "tsx scripts/check-operations.ts",
+    "ops:reconcile": "tsx scripts/reconcile-inference.ts",
+    "mainnet:readiness": "tsx scripts/check-mainnet-readiness.ts",
     "check": "npm test && npm run build"
   },
   "dependencies": {

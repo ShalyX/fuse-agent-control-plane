@@ -251,6 +251,15 @@ it("does not resurrect a terminal mandate when late provider evidence enters hol
   expect((await pool.query(
     "SELECT state FROM control_mandates WHERE organization_id = 'org-shaly' AND id = 'shaly-main'",
   )).rows[0]).toEqual({ state: "closed" });
+  await policies.resolveReconciliation({
+    organizationId: "org-shaly", requestId: "req-late-overrun", resolution: "settle",
+    actualCostAtomic: 10_000n, note: "Late provider response verified",
+    externalReference: "provider-ledger:gen-late", actorId: "service_account:admin-1",
+    causationId: "resolve-late", occurredAt: "2026-07-13T23:05:00.000Z",
+  });
+  expect((await pool.query(
+    "SELECT state FROM control_mandates WHERE organization_id = 'org-shaly' AND id = 'shaly-main'",
+  )).rows[0]).toEqual({ state: "closed" });
   await pool.end();
 });
 

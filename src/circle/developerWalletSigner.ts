@@ -1,3 +1,4 @@
+import { getAddress, recoverTypedDataAddress } from "viem";
 import type { Address, Hex } from "viem";
 
 type TypedDataParameters = {
@@ -58,10 +59,15 @@ export function createCircleGatewaySigner(config: {
         memo: "Fuse x402 Gateway Nanopayment",
       });
       const signature = response.data?.signature;
-      if (!signature || !/^0x[0-9a-fA-F]+$/.test(signature)) {
+      if (!signature || !/^0x[0-9a-fA-F]{130}$/.test(signature)) {
         throw new Error("CIRCLE_SIGNATURE_MISSING");
       }
-      return signature as Hex;
+      const typedSignature = signature as Hex;
+      const recoveredAddress = await recoverTypedDataAddress({ ...parameters, signature: typedSignature });
+      if (getAddress(recoveredAddress) !== getAddress(config.walletAddress)) {
+        throw new Error("CIRCLE_SIGNATURE_INVALID");
+      }
+      return typedSignature;
     },
   };
 }

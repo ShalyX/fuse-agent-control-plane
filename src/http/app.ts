@@ -85,6 +85,20 @@ const mandatePolicySchema = z.object({
   policyId: z.string().min(1).max(128),
   policyVersion: z.number().int().positive().max(1_000_000),
 }).strict();
+const reconciliationResolutionSchema = z.object({
+  resolution: z.enum(["settle", "confirm_not_billed"]),
+  actualCostAtomic: atomicAmountSchema.optional(),
+  note: z.string().trim().min(1).max(2_000),
+  externalReference: z.string().trim().min(1).max(512),
+}).strict().superRefine((value, context) => {
+  if (value.resolution === "settle" && value.actualCostAtomic === undefined) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: "actual cost required" });
+  }
+  if (value.resolution === "confirm_not_billed" && value.actualCostAtomic !== undefined) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: "actual cost forbidden" });
+  }
+});
+
 const mandateTransitionSchema = z.object({
   to: z.enum([
     "draft", "active", "paused", "closing", "closed", "exhausted", "tripped",
@@ -172,8 +186,13 @@ export function createFuseApp(dependencies: AppDependencies) {
       response.status(403).json({ error: { code: message } });
     } else if (databaseCode === "23505") {
       response.status(409).json({ error: { code: "POLICY_RESOURCE_CONFLICT" } });
-    } else if (databaseCode === "23503" || message === "CONTROL_MANDATE_NOT_FOUND") {
-      response.status(404).json({ error: { code: "POLICY_RESOURCE_NOT_FOUND" } });
+    } else if (databaseCode === "23503" || message === "CONTROL_MANDATE_NOT_FOUND"
+      || message === "INFERENCE_EXECUTION_NOT_FOUND") {
+      response.status(404).json({ error: { code: message === "INFERENCE_EXECUTION_NOT_FOUND"
+        ? "RECONCILIATION_CASE_NOT_FOUND" : "POLICY_RESOURCE_NOT_FOUND" } });
+    } else if (message === "RECONCILIATION_CASE_NOT_OPEN"
+      || message === "RECONCILIATION_RESOLUTION_CONFLICT") {
+      response.status(409).json({ error: { code: message } });
     } else if (message.startsWith("CONTROL_MANDATE_TRANSITION_INVALID")
       || message === "CONTROL_MANDATE_POLICY_CHANGE_REQUIRES_PAUSE") {
       response.status(409).json({ error: { code: message === "CONTROL_MANDATE_POLICY_CHANGE_REQUIRES_PAUSE"
@@ -553,6 +572,64 @@ export function createFuseApp(dependencies: AppDependencies) {
           await dependencies.policyAdministration!.setMandatePolicy(
             response.locals.fusePrincipal,
             { mandateId, ...parsed.data, requestId },
+          );
+          response.status(204).send();
+        } catch (error) {
+          handlePolicyError(error, response);
+        }
+      },
+    );
+    app.get(
+      "/api/v1/admin/reconciliation",
+      createCapabilityGuard(dependencies.credentialAuthenticator, "policies:read"),
+      async (_request, response) => {
+        disableCaching(response);
+        try {
+          const cases = await dependencies.policyAdministration!.listReconciliationCases(
+            response.locals.fusePrincipal,
+          );
+          response.json({
+            cases: cases.map((item) => ({
+              ...item,
+              reservedCostAtomic: item.reservedCostAtomic.toString(),
+              reportedCostAtomic: item.reportedCostAtomic?.toString() ?? null,
+            })),
+          });
+        } catch (error) {
+          handlePolicyError(error, response);
+        }
+      },
+    );
+    app.post(
+      "/api/v1/admin/reconciliation/:requestId/resolve",
+      createCapabilityGuard(dependencies.credentialAuthenticator, "mandates:admin"),
+      async (request, response) => {
+        disableCaching(response);
+        const causationId = request.header("X-Request-Id")?.trim();
+        const executionRequestIdParam = request.params["requestId"];
+        const executionRequestId = typeof executionRequestIdParam === "string"
+          ? executionRequestIdParam : executionRequestIdParam?.[0] ?? "";
+        const parsed = reconciliationResolutionSchema.safeParse(request.body);
+        if (!causationId) {
+          response.status(400).json({ error: { code: "REQUEST_ID_REQUIRED" } });
+          return;
+        }
+        if (!executionRequestId || !parsed.success) {
+          response.status(400).json({ error: { code: "INVALID_RECONCILIATION_RESOLUTION" } });
+          return;
+        }
+        try {
+          await dependencies.policyAdministration!.resolveReconciliation(
+            response.locals.fusePrincipal,
+            {
+              executionRequestId,
+              resolution: parsed.data.resolution,
+              ...(parsed.data.actualCostAtomic === undefined
+                ? {} : { actualCostAtomic: BigInt(parsed.data.actualCostAtomic) }),
+              note: parsed.data.note,
+              externalReference: parsed.data.externalReference,
+              requestId: causationId,
+            },
           );
           response.status(204).send();
         } catch (error) {

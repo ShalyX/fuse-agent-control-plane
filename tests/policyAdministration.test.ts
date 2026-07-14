@@ -110,6 +110,22 @@ describe("PolicyAdministration", () => {
     await pool.end();
   });
 
+  it("gates reconciliation inspection and resolution by tenant administrator capabilities", async () => {
+    const { pool, administration } = await setup();
+    await expect(administration.listReconciliationCases({
+      ...principal, principalType: "agent", role: undefined,
+      capabilities: ["policies:read"],
+    })).rejects.toThrow("SERVICE_ACCOUNT_REQUIRED");
+    await expect(administration.resolveReconciliation({
+      ...principal, role: "viewer", capabilities: ["mandates:admin"],
+    }, {
+      executionRequestId: "held-request", resolution: "confirm_not_billed",
+      note: "Provider confirms no charge", externalReference: "provider:no-charge",
+      requestId: "request:resolve",
+    })).rejects.toThrow("SERVICE_ACCOUNT_ADMIN_REQUIRED");
+    await pool.end();
+  });
+
   it("requires both admin role and the exact policy capability", async () => {
     const { pool, administration } = await setup();
     const input = {

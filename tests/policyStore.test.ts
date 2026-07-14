@@ -1,4 +1,5 @@
 import { newDb } from "pg-mem";
+import type { Pool } from "pg";
 import { describe, expect, it } from "vitest";
 import { IdentityStore } from "../src/persistence/identityStore.js";
 import { PolicyStore } from "../src/persistence/policyStore.js";
@@ -53,8 +54,25 @@ describe("PolicyStore", () => {
       new PolicyStore(pool).ensureSchema(),
       new PolicyStore(pool).ensureSchema(),
     ]);
-    expect((await pool.query("SELECT version FROM policy_schema_migrations")).rows)
-      .toEqual([{ version: 1 }]);
+    expect((await pool.query("SELECT version FROM policy_schema_migrations ORDER BY version")).rows)
+      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }]);
+    await pool.end();
+  });
+
+  it("fails closed on an unversioned reconciliation table", async () => {
+    const db = newDb({ noAstCoverageCheck: true });
+    const adapter = db.adapters.createPg();
+    const pool = new adapter.Pool();
+    await new IdentityStore(pool).ensureSchema();
+    await new PolicyStore(pool).ensureSchema();
+    await pool.query("DELETE FROM policy_schema_migrations WHERE version >= 2");
+    expect((await pool.query(
+      "SELECT version FROM policy_schema_migrations ORDER BY version",
+    )).rows).toEqual([{ version: 1 }]);
+
+    await expect(new PolicyStore(pool).ensureSchema())
+      .rejects.toThrow("UNVERSIONED_RECONCILIATION_SCHEMA_UNSUPPORTED");
+    // pg-mem does not roll back the migration marker; real PostgreSQL does.
     await pool.end();
   });
 
@@ -117,6 +135,152 @@ describe("PolicyStore", () => {
       { organization_id: "org-1", id: "shared-mandate-id" },
       { organization_id: "org-2", id: "shared-mandate-id" },
     ]);
+    await pool.end();
+  });
+
+  it("lists and settles a held execution without redispatching it", async () => {
+    const { pool, policies } = await setup();
+    await policies.publishPolicy(version(), context);
+    await policies.createMandate({
+      id: "mandate-1", organizationId: "org-1", name: "Inference allowance",
+      assetId: "usd-micros", maximumSpendAtomic: 250_000n, state: "draft",
+      policyId: "policy-1", policyVersion: 1, expiresAt: null, ...context,
+    });
+    await policies.assignAgent({
+      organizationId: "org-1", mandateId: "mandate-1", agentId: "agent-1", ...context,
+    });
+    await policies.transitionMandateState("org-1", "mandate-1", "active", context);
+    await policies.admitInference({
+      requestId: "held-request", requestFingerprint: "a".repeat(64), organizationId: "org-1",
+      mandateId: "mandate-1", agentId: "agent-1",
+      agentCapabilities: ["inference:invoke"], provider: "anthropic",
+      model: "claude-sonnet-4-6", estimatedCostAtomic: 1_000n,
+      inputTokens: 10, maxOutputTokens: 10, spentHourAtomic: 0n,
+      spentDayAtomic: 0n, mandateSpentAtomic: 0n, mandateMaximumAtomic: 250_000n,
+      requestCountLastMinute: 0, decidedAt: "2026-07-13T20:01:00.000Z",
+    });
+    await policies.holdInference({
+      organizationId: "org-1", requestId: "held-request",
+      reasonCode: "PROVIDER_OUTCOME_AMBIGUOUS",
+      response: { id: "provider-1", content: "held", usage: { inputTokens: 10, outputTokens: 2 } },
+      heldAt: "2026-07-13T20:02:00.000Z",
+    });
+
+    expect(await policies.listReconciliationCases("org-1")).toEqual([
+      expect.objectContaining({
+        requestId: "held-request", mandateId: "mandate-1",
+        reasonCode: "PROVIDER_OUTCOME_AMBIGUOUS", reservedCostAtomic: 1_000n,
+        hasProviderResponse: true,
+      }),
+    ]);
+    await policies.resolveReconciliation({
+      organizationId: "org-1", requestId: "held-request", resolution: "settle",
+      actualCostAtomic: 125n, note: "Confirmed against provider usage ledger",
+      externalReference: "provider-ledger:provider-1",
+      actorId: "service_account:admin-1", causationId: "request:resolve",
+      occurredAt: "2026-07-13T20:03:00.000Z",
+    });
+
+    expect(await policies.listReconciliationCases("org-1")).toEqual([]);
+    expect((await pool.query(
+      "SELECT status, actual_cost_atomic::text FROM inference_executions WHERE request_id = 'held-request'",
+    )).rows[0]).toEqual({ status: "completed", actual_cost_atomic: "125" });
+    expect((await pool.query(
+      "SELECT state FROM control_mandates WHERE organization_id = 'org-1' AND id = 'mandate-1'",
+    )).rows[0]).toEqual({ state: "paused" });
+    expect((await pool.query(
+      "SELECT resolution, external_reference FROM reconciliation_resolutions",
+    )).rows).toEqual([{ resolution: "settle", external_reference: "provider-ledger:provider-1" }]);
+
+    await policies.transitionMandateState("org-1", "mandate-1", "active", {
+      ...context, causationId: "request:resume-after-review",
+    });
+    await policies.admitInference({
+      requestId: "unbilled-request", requestFingerprint: "b".repeat(64), organizationId: "org-1",
+      mandateId: "mandate-1", agentId: "agent-1", agentCapabilities: ["inference:invoke"],
+      provider: "anthropic", model: "claude-sonnet-4-6", estimatedCostAtomic: 1_000n,
+      inputTokens: 10, maxOutputTokens: 10, decidedAt: "2026-07-13T20:04:00.000Z",
+    });
+    await policies.holdInference({
+      organizationId: "org-1", requestId: "unbilled-request",
+      reasonCode: "PROVIDER_OUTCOME_AMBIGUOUS", heldAt: "2026-07-13T20:05:00.000Z",
+    });
+    await policies.resolveReconciliation({
+      organizationId: "org-1", requestId: "unbilled-request",
+      resolution: "confirm_not_billed", note: "Provider ledger confirms no request",
+      externalReference: "provider-ledger:none", actorId: "service_account:admin-1",
+      causationId: "request:resolve-unbilled", occurredAt: "2026-07-13T20:06:00.000Z",
+    });
+    expect((await pool.query(
+      `SELECT status, actual_cost_atomic::text, failure_code
+       FROM inference_executions WHERE request_id = 'unbilled-request'`,
+    )).rows[0]).toEqual({
+      status: "failed", actual_cost_atomic: "0", failure_code: "RECONCILED_NOT_BILLED",
+    });
+    await policies.resolveReconciliation({
+      organizationId: "org-1", requestId: "unbilled-request",
+      resolution: "confirm_not_billed", note: "Provider ledger confirms no request",
+      externalReference: "provider-ledger:none", actorId: "service_account:admin-1",
+      causationId: "request:retry", occurredAt: "2026-07-13T20:07:00.000Z",
+    });
+    await expect(policies.resolveReconciliation({
+      organizationId: "org-1", requestId: "unbilled-request",
+      resolution: "confirm_not_billed", note: "Conflicting evidence",
+      externalReference: "provider-ledger:none", actorId: "service_account:admin-1",
+      causationId: "request:conflict", occurredAt: "2026-07-13T20:08:00.000Z",
+    })).rejects.toThrow("RECONCILIATION_RESOLUTION_CONFLICT");
+
+    await policies.transitionMandateState("org-1", "mandate-1", "active", {
+      ...context, causationId: "request:resume-for-billed-no-response",
+    });
+    await policies.admitInference({
+      requestId: "billed-no-response", requestFingerprint: "c".repeat(64), organizationId: "org-1",
+      mandateId: "mandate-1", agentId: "agent-1", agentCapabilities: ["inference:invoke"],
+      provider: "anthropic", model: "claude-sonnet-4-6", estimatedCostAtomic: 1_000n,
+      inputTokens: 10, maxOutputTokens: 10, decidedAt: "2026-07-13T20:09:00.000Z",
+    });
+    await policies.admitInference({
+      requestId: "second-billed-no-response", requestFingerprint: "d".repeat(64), organizationId: "org-1",
+      mandateId: "mandate-1", agentId: "agent-1", agentCapabilities: ["inference:invoke"],
+      provider: "anthropic", model: "claude-sonnet-4-6", estimatedCostAtomic: 1_000n,
+      inputTokens: 10, maxOutputTokens: 10, decidedAt: "2026-07-13T20:09:01.000Z",
+    });
+    await policies.transitionMandateState("org-1", "mandate-1", "closing", {
+      ...context, causationId: "request:close-while-executing",
+    });
+    await policies.holdInference({
+      organizationId: "org-1", requestId: "billed-no-response",
+      reasonCode: "PROVIDER_OUTCOME_AMBIGUOUS", heldAt: "2026-07-13T20:10:00.000Z",
+    });
+    await policies.holdInference({
+      organizationId: "org-1", requestId: "second-billed-no-response",
+      reasonCode: "PROVIDER_OUTCOME_AMBIGUOUS", heldAt: "2026-07-13T20:10:01.000Z",
+    });
+    await Promise.all([
+      policies.resolveReconciliation({
+        organizationId: "org-1", requestId: "billed-no-response", resolution: "settle",
+        actualCostAtomic: 75n, note: "Provider ledger confirms a billed request without response",
+        externalReference: "provider-ledger:billed-timeout", actorId: "service_account:admin-1",
+        causationId: "request:resolve-billed-timeout", occurredAt: "2026-07-13T20:11:00.000Z",
+      }),
+      policies.resolveReconciliation({
+        organizationId: "org-1", requestId: "second-billed-no-response", resolution: "settle",
+        actualCostAtomic: 25n, note: "Second provider ledger entry confirms billing",
+        externalReference: "provider-ledger:second-timeout", actorId: "service_account:admin-1",
+        causationId: "request:resolve-second-timeout", occurredAt: "2026-07-13T20:11:01.000Z",
+      }),
+    ]);
+    expect(await policies.listReconciliationCases("org-1")).toEqual([]);
+    expect((await pool.query(
+      `SELECT status, actual_cost_atomic::text, failure_code FROM inference_executions
+       WHERE request_id = 'billed-no-response'`,
+    )).rows[0]).toEqual({
+      status: "failed", actual_cost_atomic: "75",
+      failure_code: "RECONCILED_BILLED_NO_RESPONSE",
+    });
+    expect((await pool.query(
+      "SELECT state FROM control_mandates WHERE organization_id = 'org-1' AND id = 'mandate-1'",
+    )).rows[0]).toEqual({ state: "closing" });
     await pool.end();
   });
 

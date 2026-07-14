@@ -253,7 +253,20 @@ Administrative policy routes are:
 - `POST /api/v1/admin/mandates/:mandateId/transitions` with `mandates:admin`.
 - `POST /api/v1/admin/mandates/:mandateId/policy` with `mandates:admin`.
 - `GET /api/v1/admin/mandates/:mandateId/decisions` with `policies:read`.
+- `GET /api/v1/admin/reconciliation` with `policies:read`.
+- `POST /api/v1/admin/reconciliation/:requestId/resolve` with `mandates:admin`, an explicit resolution, operator note, external evidence reference, and request ID.
 
 `policies:write` and `mandates:admin` are admin-only service-account capabilities. `policies:read` is available to admin, operator, and viewer service accounts. Policy versions and decisions are append-only through the application API; database-role or trigger enforcement against direct `UPDATE`/`DELETE` remains pending.
 
-With `DATABASE_URL` configured, authenticated `/v1/chat/completions` requests use policy admission, transactional reservation, provider invocation, and usage reconciliation. OpenRouter cannot start without that controlled path. The no-database direct-Anthropic route remains a legacy compatibility mode and is not part of the policy-control evidence. Real-money settlement remains gated by the custody decision.
+With `DATABASE_URL` configured, authenticated `/v1/chat/completions` requests use policy admission, transactional reservation, provider invocation, and usage reconciliation. OpenRouter cannot start without that controlled path. The no-database direct-Anthropic route remains a legacy compatibility mode and is not part of the policy-control evidence.
+
+The repository also contains an independently deployable signer boundary and operator tools:
+
+- `npm run ops:check` reports health and open reconciliation holds without printing credentials.
+- `npm run ops:reconcile -- ... --yes resolve` resolves one reviewed hold and requires an evidence note plus external reference; it never redispatches inference.
+- `vercel.signer.json` is the separate signer build configuration; it does not select a Vercel project by itself. Signer deployment must run through an isolated Vercel link whose inspected project name is exactly `fuse-shaly-signer`, never through the control-plane repository link. The service binds one organization, wallet, Gateway contract, recipient, chain, validity window, exact EIP-712 type shape, per-authorization ceiling, and cumulative authority ceiling before invoking Circle signing. A dedicated PostgreSQL authorization ledger payload-binds idempotency keys, replays completed signatures, serializes concurrent requests, and retains ambiguous Circle outcomes for review without automatic redispatch.
+- `npm run mainnet:readiness` is read-only. It requires the Base Gateway available balance to equal the deliberately small configured cap and verifies the authenticated Shaly signer boundary reports the exact payer wallet, Base chain ID, Gateway contract, recipient, LIVE/BASE/DEVELOPER wallet classification, zero ambiguous authorizations, and the same authority ceiling.
+
+Signer startup verifies through Circle that the configured signer is the exact-address, `LIVE`, developer-controlled `BASE` wallet. Test API credentials and testnet wallets fail closed and cannot back Base mainnet signing. The control-plane runtime rejects Circle and signer-database secrets at startup. A remote-signer adapter is present for the eventual outbound payment workflow, but no public control-plane route invokes signing yet; payment orchestration remains disabled until mandate/accounting integration and a separate release review are complete.
+
+These controls reduce authority exposure but do not settle the legal/custody model. The signer service is not part of the public control-plane deployment, and a Base mainnet payment remains gated on explicit operator approval immediately before transaction submission.

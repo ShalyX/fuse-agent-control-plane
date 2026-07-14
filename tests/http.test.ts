@@ -438,6 +438,17 @@ describe("POST /v1/chat/completions", () => {
         },
         createdAt: "2026-07-13T21:00:00.000Z",
       }),
+      listReconciliationCases: async () => [{
+        requestId: "held-request", mandateId: "mandate-1", agentId: "agent-1",
+        provider: "openrouter", model: "anthropic/claude-sonnet-4.6",
+        reasonCode: "PROVIDER_OUTCOME_AMBIGUOUS", reservedCostAtomic: 1_800n,
+        reportedCostAtomic: null, hasProviderResponse: true,
+        heldAt: "2026-07-13T21:01:00.000Z",
+      }],
+      resolveReconciliation: async (_principal, input) => {
+        if (input.note === "Conflicting evidence") throw new Error("RECONCILIATION_RESOLUTION_CONFLICT");
+        calls.push(`reconcile:${input.executionRequestId}:${input.resolution}`);
+      },
       listDecisions: async (principal, mandateId) => [{
         id: "decision-1",
         requestId: "request:inference-1",
@@ -499,10 +510,34 @@ describe("POST /v1/chat/completions", () => {
       mandateSpentAtomic: "0",
       mandateMaximumAtomic: "250000",
     });
+    const cases = await request(app).get("/api/v1/admin/reconciliation").set(auth);
+    expect(cases.status).toBe(200);
+    expect(cases.body.cases[0]).toMatchObject({
+      requestId: "held-request", reservedCostAtomic: "1800", reportedCostAtomic: null,
+    });
+    const resolved = await request(app)
+      .post("/api/v1/admin/reconciliation/held-request/resolve")
+      .set(auth)
+      .send({
+        resolution: "settle", actualCostAtomic: "125",
+        note: "Confirmed against provider usage ledger",
+        externalReference: "provider-ledger:provider-1",
+      });
+    expect(resolved.status).toBe(204);
+    const conflict = await request(app)
+      .post("/api/v1/admin/reconciliation/held-request/resolve")
+      .set(auth)
+      .send({
+        resolution: "settle", actualCostAtomic: "126",
+        note: "Conflicting evidence", externalReference: "provider-ledger:provider-1",
+      });
+    expect(conflict.status).toBe(409);
+    expect(conflict.body).toEqual({ error: { code: "RECONCILIATION_RESOLUTION_CONFLICT" } });
     expect(calls).toEqual([
       "policy:policy-1", "mandate:mandate-1", "assign:agent-1", "transition:active",
       "transition:paused",
       "policy-bind:2",
+      "reconcile:held-request:settle",
     ]);
   });
 

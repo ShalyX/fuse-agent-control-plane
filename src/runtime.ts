@@ -11,6 +11,12 @@ import { PolicyAdministration } from "./policy/policyAdministration.js";
 import { InferenceExecutionService } from "./inference/inferenceExecution.js";
 
 export function createRuntimeApp(env: NodeJS.ProcessEnv = process.env) {
+  const signerOnlySecrets = [
+    "CIRCLE_API_KEY", "CIRCLE_ENTITY_SECRET", "CIRCLE_WALLET_ID", "CIRCLE_WALLET_SET_ID",
+    "SIGNER_DATABASE_URL", "SIGNER_AUTH_TOKEN",
+  ];
+  const misplacedSecret = signerOnlySecrets.find((name) => Boolean(env[name]?.trim()));
+  if (misplacedSecret) throw new Error(`CONTROL_PLANE_SIGNER_SECRET_FORBIDDEN:${misplacedSecret}`);
   const providerName = env["FUSE_PROVIDER"]?.trim().toLowerCase() ?? "anthropic";
   let provider: InferenceProvider;
   let providerModel: string;

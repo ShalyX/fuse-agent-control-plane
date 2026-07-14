@@ -17,6 +17,7 @@ import type {
   InferenceExecutionStore,
 } from "../inference/inferenceExecution.js";
 import type { MandateState } from "../domain/lifecycles.js";
+import { withSchemaBootstrapLock } from "./schemaBootstrap.js";
 
 const mandateTransitions: Record<MandateState, readonly MandateState[]> = {
   draft: ["active", "expired"],
@@ -84,6 +85,30 @@ export interface StoredPolicyDecision {
   policyVersion: number;
   result: PolicyDecisionResult;
   input: PolicyDecisionInput;
+}
+
+export interface ReconciliationCase {
+  requestId: string;
+  mandateId: string;
+  agentId: string;
+  provider: string;
+  model: string;
+  reasonCode: string;
+  reservedCostAtomic: bigint;
+  reportedCostAtomic: bigint | null;
+  hasProviderResponse: boolean;
+  heldAt: string;
+}
+
+export type ReconciliationResolution = "settle" | "confirm_not_billed";
+
+export interface ResolveReconciliationInput extends PolicyMutationContext {
+  organizationId: string;
+  requestId: string;
+  resolution: ReconciliationResolution;
+  actualCostAtomic?: bigint;
+  note: string;
+  externalReference: string;
 }
 
 export class PolicyStore implements InferenceExecutionStore {
@@ -480,14 +505,20 @@ export class PolicyStore implements InferenceExecutionStore {
         request_count_last_minute: number;
       }>(
         `SELECT
-           COALESCE(SUM(CASE WHEN created_at >= $3 AND status IN ('executing','completed','reconciliation_hold')
-             THEN CASE WHEN status = 'completed' THEN actual_cost_atomic ELSE reserved_cost_atomic END
+           COALESCE(SUM(CASE WHEN created_at >= $3 AND (status IN ('executing','completed','reconciliation_hold')
+             OR failure_code = 'RECONCILED_BILLED_NO_RESPONSE')
+             THEN CASE WHEN status = 'completed' OR failure_code = 'RECONCILED_BILLED_NO_RESPONSE'
+               THEN actual_cost_atomic ELSE reserved_cost_atomic END
              ELSE 0 END), 0)::text AS spent_hour_atomic,
-           COALESCE(SUM(CASE WHEN created_at >= $4 AND status IN ('executing','completed','reconciliation_hold')
-             THEN CASE WHEN status = 'completed' THEN actual_cost_atomic ELSE reserved_cost_atomic END
+           COALESCE(SUM(CASE WHEN created_at >= $4 AND (status IN ('executing','completed','reconciliation_hold')
+             OR failure_code = 'RECONCILED_BILLED_NO_RESPONSE')
+             THEN CASE WHEN status = 'completed' OR failure_code = 'RECONCILED_BILLED_NO_RESPONSE'
+               THEN actual_cost_atomic ELSE reserved_cost_atomic END
              ELSE 0 END), 0)::text AS spent_day_atomic,
-           COALESCE(SUM(CASE WHEN status IN ('executing','completed','reconciliation_hold')
-             THEN CASE WHEN status = 'completed' THEN actual_cost_atomic ELSE reserved_cost_atomic END
+           COALESCE(SUM(CASE WHEN (status IN ('executing','completed','reconciliation_hold')
+             OR failure_code = 'RECONCILED_BILLED_NO_RESPONSE')
+             THEN CASE WHEN status = 'completed' OR failure_code = 'RECONCILED_BILLED_NO_RESPONSE'
+               THEN actual_cost_atomic ELSE reserved_cost_atomic END
              ELSE 0 END), 0)::text AS mandate_spent_atomic,
            COALESCE(SUM(CASE WHEN created_at >= $5 AND status <> 'denied' THEN 1 ELSE 0 END), 0)::int
              AS request_count_last_minute
@@ -684,6 +715,189 @@ export class PolicyStore implements InferenceExecutionStore {
     );
   }
 
+  async listReconciliationCases(organizationId: string): Promise<ReconciliationCase[]> {
+    if (!organizationId.trim()) throw new Error("RECONCILIATION_ORGANIZATION_REQUIRED");
+    await this.ensureSchema();
+    const result = await this.pool.query<{
+      request_id: string;
+      mandate_id: string;
+      agent_id: string;
+      provider: string;
+      model: string;
+      failure_code: string | null;
+      reserved_cost_atomic: string;
+      actual_cost_atomic: string | null;
+      response_json: ProviderResult | null;
+      updated_at: Date;
+    }>(
+      `SELECT execution.request_id, execution.mandate_id, execution.agent_id,
+              execution.provider, execution.model, execution.failure_code,
+              execution.reserved_cost_atomic::text, execution.actual_cost_atomic::text,
+              execution.response_json, execution.updated_at
+       FROM inference_executions AS execution
+       LEFT JOIN reconciliation_resolutions AS resolution
+         ON resolution.organization_id = execution.organization_id
+        AND resolution.request_id = execution.request_id
+       WHERE execution.organization_id = $1
+         AND execution.status = 'reconciliation_hold'
+         AND resolution.request_id IS NULL
+       ORDER BY execution.updated_at ASC, execution.request_id ASC`,
+      [organizationId],
+    );
+    return result.rows.map((row) => ({
+      requestId: row.request_id,
+      mandateId: row.mandate_id,
+      agentId: row.agent_id,
+      provider: row.provider,
+      model: row.model,
+      reasonCode: row.failure_code ?? "COST_OVERRUN",
+      reservedCostAtomic: BigInt(row.reserved_cost_atomic),
+      reportedCostAtomic: row.actual_cost_atomic === null ? null : BigInt(row.actual_cost_atomic),
+      hasProviderResponse: row.response_json !== null,
+      heldAt: row.updated_at.toISOString(),
+    }));
+  }
+
+  async resolveReconciliation(input: ResolveReconciliationInput): Promise<void> {
+    input = { ...input };
+    this.validateContext(input);
+    if (!input.organizationId.trim()) throw new Error("RECONCILIATION_ORGANIZATION_REQUIRED");
+    if (!input.requestId.trim()) throw new Error("RECONCILIATION_REQUEST_REQUIRED");
+    if (!input.note.trim() || input.note.length > 2_000) throw new Error("RECONCILIATION_NOTE_INVALID");
+    if (!input.externalReference.trim() || input.externalReference.length > 512) {
+      throw new Error("RECONCILIATION_REFERENCE_INVALID");
+    }
+    if (input.resolution === "settle") {
+      if (input.actualCostAtomic === undefined || input.actualCostAtomic < 0n) {
+        throw new Error("RECONCILIATION_ACTUAL_COST_REQUIRED");
+      }
+    } else if (input.resolution === "confirm_not_billed") {
+      if (input.actualCostAtomic !== undefined) throw new Error("RECONCILIATION_ACTUAL_COST_FORBIDDEN");
+    } else {
+      throw new Error("RECONCILIATION_RESOLUTION_INVALID");
+    }
+    await this.ensureSchema();
+    await this.transaction(async (client) => {
+      const execution = await client.query<InferenceExecutionRow>(
+        `SELECT * FROM inference_executions
+         WHERE organization_id = $1 AND request_id = $2 FOR UPDATE`,
+        [input.organizationId, input.requestId],
+      );
+      const row = execution.rows[0];
+      if (!row) throw new Error("INFERENCE_EXECUTION_NOT_FOUND");
+      const actualCostAtomic = input.resolution === "settle" ? input.actualCostAtomic! : 0n;
+      const prior = await client.query<{
+        resolution: ReconciliationResolution;
+        actual_cost_atomic: string;
+        note: string;
+        external_reference: string;
+        resolved_by: string;
+      }>(
+        `SELECT resolution, actual_cost_atomic::text, note, external_reference, resolved_by
+         FROM reconciliation_resolutions
+         WHERE organization_id = $1 AND request_id = $2`,
+        [input.organizationId, input.requestId],
+      );
+      const existing = prior.rows[0];
+      if (existing) {
+        const exactReplay = existing.resolution === input.resolution
+          && BigInt(existing.actual_cost_atomic) === actualCostAtomic
+          && existing.note === input.note
+          && existing.external_reference === input.externalReference
+          && existing.resolved_by === input.actorId;
+        if (!exactReplay) throw new Error("RECONCILIATION_RESOLUTION_CONFLICT");
+        return;
+      }
+      if (row.status !== "reconciliation_hold") throw new Error("RECONCILIATION_CASE_NOT_OPEN");
+      await client.query(
+        `INSERT INTO reconciliation_resolutions
+         (organization_id, request_id, resolution, actual_cost_atomic, note,
+          external_reference, resolved_by, resolved_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [input.organizationId, input.requestId, input.resolution, actualCostAtomic.toString(),
+          input.note, input.externalReference, input.actorId, input.occurredAt],
+      );
+      await client.query(
+        input.resolution === "settle" && row.response_json !== null
+          ? `UPDATE inference_executions
+             SET status = 'completed', actual_cost_atomic = $3, failure_code = NULL, updated_at = $4
+             WHERE organization_id = $1 AND request_id = $2`
+          : input.resolution === "settle"
+            ? `UPDATE inference_executions
+               SET status = 'failed', actual_cost_atomic = $3,
+                   failure_code = 'RECONCILED_BILLED_NO_RESPONSE', updated_at = $4
+               WHERE organization_id = $1 AND request_id = $2`
+            : `UPDATE inference_executions
+               SET status = 'failed', actual_cost_atomic = $3,
+                   failure_code = 'RECONCILED_NOT_BILLED', updated_at = $4
+               WHERE organization_id = $1 AND request_id = $2`,
+        [input.organizationId, input.requestId, actualCostAtomic.toString(), input.occurredAt],
+      );
+      await this.appendAudit(client, {
+        organizationId: input.organizationId,
+        entityType: "inference_execution",
+        entityId: input.requestId,
+        action: `reconciliation.${input.resolution}`,
+        payload: {
+          resolution: input.resolution,
+          actualCostAtomic: actualCostAtomic.toString(),
+          externalReference: input.externalReference,
+        },
+        actorId: input.actorId,
+        causationId: input.causationId,
+        occurredAt: input.occurredAt,
+      });
+      const mandate = await client.query<{ state: MandateState }>(
+        `SELECT state FROM control_mandates
+         WHERE organization_id = $1 AND id = $2
+         FOR UPDATE`,
+        [input.organizationId, row.mandate_id],
+      );
+      const state = mandate.rows[0]?.state;
+      if (!state) throw new Error("CONTROL_MANDATE_NOT_FOUND");
+      const hold = await client.query<{ prior_state: MandateState }>(
+        `SELECT prior_state FROM mandate_reconciliation_holds
+         WHERE organization_id = $1 AND mandate_id = $2`,
+        [input.organizationId, row.mandate_id],
+      );
+      const lifecycle = { state, prior_state: hold.rows[0]?.prior_state ?? null };
+      const openCases = await client.query(
+        `SELECT 1 FROM inference_executions AS execution
+         LEFT JOIN reconciliation_resolutions AS resolution
+           ON resolution.organization_id = execution.organization_id
+          AND resolution.request_id = execution.request_id
+         WHERE execution.organization_id = $1 AND execution.mandate_id = $2
+           AND execution.status = 'reconciliation_hold'
+           AND resolution.request_id IS NULL
+         LIMIT 1`,
+        [input.organizationId, row.mandate_id],
+      );
+      if (openCases.rowCount === 0) {
+        if (!lifecycle.prior_state) {
+          if (lifecycle.state !== "closed" && lifecycle.state !== "expired") {
+            throw new Error("RECONCILIATION_MANDATE_STATE_MISSING");
+          }
+        } else {
+          if (lifecycle.state === "reconciliation_hold") {
+            const restoredState = lifecycle.prior_state === "active" ? "paused" : lifecycle.prior_state;
+            await client.query(
+              `UPDATE control_mandates SET state = $3
+               WHERE organization_id = $1 AND id = $2 AND state = 'reconciliation_hold'`,
+              [input.organizationId, row.mandate_id, restoredState],
+            );
+          } else if (lifecycle.state !== "closing") {
+            throw new Error(`RECONCILIATION_MANDATE_STATE_CONFLICT:${lifecycle.state}`);
+          }
+          await client.query(
+            `DELETE FROM mandate_reconciliation_holds
+             WHERE organization_id = $1 AND mandate_id = $2`,
+            [input.organizationId, row.mandate_id],
+          );
+        }
+      }
+    });
+  }
+
   async listDecisions(organizationId: string, mandateId: string): Promise<StoredPolicyDecision[]> {
     await this.ensureSchema();
     const result = await this.pool.query<DecisionRow>(
@@ -724,6 +938,13 @@ export class PolicyStore implements InferenceExecutionStore {
     if (!state) throw new Error("CONTROL_MANDATE_NOT_FOUND");
     if (!["active", "paused", "closing", "exhausted", "tripped"].includes(state)) return;
     await client.query(
+      `INSERT INTO mandate_reconciliation_holds
+       (organization_id, mandate_id, prior_state, held_at)
+       VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
+       ON CONFLICT (organization_id, mandate_id) DO NOTHING`,
+      [organizationId, mandateId, state],
+    );
+    await client.query(
       `UPDATE control_mandates SET state = 'reconciliation_hold'
        WHERE organization_id = $1 AND id = $2`,
       [organizationId, mandateId],
@@ -731,12 +952,27 @@ export class PolicyStore implements InferenceExecutionStore {
   }
 
   private async createSchema(): Promise<void> {
-    await this.pool.query(`
-      CREATE TABLE IF NOT EXISTS policy_schema_migrations (
-        version INTEGER PRIMARY KEY,
-        applied_at TIMESTAMPTZ NOT NULL
-      )
-    `);
+    await withSchemaBootstrapLock(
+      this.pool,
+      "policy_schema_migrations",
+      7_341_120_001n,
+      async (client) => {
+        await client.query(`
+          CREATE TABLE IF NOT EXISTS policy_schema_migrations (
+            version INTEGER PRIMARY KEY,
+            applied_at TIMESTAMPTZ NOT NULL
+          )
+        `);
+      },
+    );
+    const initialized = await this.pool.query(
+      "SELECT 1 FROM policy_schema_migrations WHERE version = 1",
+    );
+    if (initialized.rowCount !== 0) {
+      await this.migrateReconciliationSchema();
+      await this.migrateMandateReconciliationHoldSchema();
+      return;
+    }
     await this.transaction(async (client) => {
       const claimed = await client.query(
         `INSERT INTO policy_schema_migrations (version, applied_at)
@@ -881,6 +1117,82 @@ export class PolicyStore implements InferenceExecutionStore {
       );
       CREATE INDEX IF NOT EXISTS inference_executions_budget_idx
         ON inference_executions (organization_id, mandate_id, created_at, status);
+      `);
+    });
+    await this.migrateReconciliationSchema();
+    await this.migrateMandateReconciliationHoldSchema();
+  }
+
+  private async migrateReconciliationSchema(): Promise<void> {
+    await this.transaction(async (client) => {
+      const migrated = await client.query(
+        "SELECT 1 FROM policy_schema_migrations WHERE version = 2",
+      );
+      if (migrated.rowCount !== 0) return;
+      const claimed = await client.query(
+        `INSERT INTO policy_schema_migrations (version, applied_at)
+         VALUES (2, CURRENT_TIMESTAMP)
+         ON CONFLICT (version) DO NOTHING
+         RETURNING version`,
+      );
+      if (claimed.rowCount === 0) return;
+      const existing = await client.query<{ table_name: string }>(
+        `SELECT table_name FROM information_schema.tables
+         WHERE table_schema = current_schema() AND table_name = 'reconciliation_resolutions'`,
+      );
+      if (existing.rowCount !== 0) {
+        throw new Error("UNVERSIONED_RECONCILIATION_SCHEMA_UNSUPPORTED");
+      }
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS reconciliation_resolutions (
+          organization_id TEXT NOT NULL,
+          request_id TEXT NOT NULL,
+          resolution TEXT NOT NULL CHECK (resolution IN ('settle', 'confirm_not_billed')),
+          actual_cost_atomic NUMERIC(78, 0) NOT NULL CHECK (actual_cost_atomic >= 0),
+          note TEXT NOT NULL,
+          external_reference TEXT NOT NULL,
+          resolved_by TEXT NOT NULL,
+          resolved_at TIMESTAMPTZ NOT NULL,
+          PRIMARY KEY (organization_id, request_id),
+          FOREIGN KEY (organization_id, request_id)
+            REFERENCES inference_executions(organization_id, request_id)
+        );
+      `);
+    });
+  }
+
+  private async migrateMandateReconciliationHoldSchema(): Promise<void> {
+    await this.transaction(async (client) => {
+      const migrated = await client.query(
+        "SELECT 1 FROM policy_schema_migrations WHERE version = 3",
+      );
+      if (migrated.rowCount !== 0) return;
+      const claimed = await client.query(
+        `INSERT INTO policy_schema_migrations (version, applied_at)
+         VALUES (3, CURRENT_TIMESTAMP)
+         ON CONFLICT (version) DO NOTHING
+         RETURNING version`,
+      );
+      if (claimed.rowCount === 0) return;
+      const existing = await client.query(
+        `SELECT 1 FROM information_schema.tables
+         WHERE table_schema = current_schema()
+           AND table_name = 'mandate_reconciliation_holds'`,
+      );
+      if (existing.rowCount !== 0) {
+        throw new Error("UNVERSIONED_MANDATE_RECONCILIATION_SCHEMA_UNSUPPORTED");
+      }
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS mandate_reconciliation_holds (
+          organization_id TEXT NOT NULL,
+          mandate_id TEXT NOT NULL,
+          prior_state TEXT NOT NULL
+            CHECK (prior_state IN ('active', 'paused', 'closing', 'exhausted', 'tripped')),
+          held_at TIMESTAMPTZ NOT NULL,
+          PRIMARY KEY (organization_id, mandate_id),
+          FOREIGN KEY (organization_id, mandate_id)
+            REFERENCES control_mandates(organization_id, id)
+        )
       `);
     });
   }

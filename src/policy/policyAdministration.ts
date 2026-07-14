@@ -2,7 +2,12 @@ import type { AdministrativePrincipal } from "../identity/credentialAdministrati
 import type { ApiCapability } from "../identity/apiCredentials.js";
 import type { PolicyLimits, PolicyMode, PolicyVersion } from "../domain/policy.js";
 import type { MandateState } from "../domain/lifecycles.js";
-import type { PolicyStore, StoredPolicyDecision } from "../persistence/policyStore.js";
+import type {
+  PolicyStore,
+  ReconciliationCase,
+  ReconciliationResolution,
+  StoredPolicyDecision,
+} from "../persistence/policyStore.js";
 
 export interface PublishPolicyInput {
   policyId: string;
@@ -45,6 +50,15 @@ export interface SetMandatePolicyInput {
   requestId: string;
 }
 
+export interface ResolveReconciliationCommand {
+  executionRequestId: string;
+  resolution: ReconciliationResolution;
+  actualCostAtomic?: bigint;
+  note: string;
+  externalReference: string;
+  requestId: string;
+}
+
 export interface PolicyAdministrationPort {
   publishPolicy(principal: AdministrativePrincipal, input: PublishPolicyInput): Promise<void>;
   createMandate(principal: AdministrativePrincipal, input: CreateMandateInput): Promise<void>;
@@ -62,6 +76,11 @@ export interface PolicyAdministrationPort {
     policyId: string,
     version: number,
   ): Promise<PolicyVersion | null>;
+  listReconciliationCases(principal: AdministrativePrincipal): Promise<ReconciliationCase[]>;
+  resolveReconciliation(
+    principal: AdministrativePrincipal,
+    input: ResolveReconciliationCommand,
+  ): Promise<void>;
   listDecisions(
     principal: AdministrativePrincipal,
     mandateId: string,
@@ -170,6 +189,31 @@ export class PolicyAdministration implements PolicyAdministrationPort {
     if (!policyId.trim()) throw new Error("POLICY_ID_REQUIRED");
     if (!Number.isInteger(version) || version < 1) throw new Error("POLICY_VERSION_INVALID");
     return this.store.getPolicy(principal.organizationId, policyId, version);
+  }
+
+  async listReconciliationCases(
+    principal: AdministrativePrincipal,
+  ): Promise<ReconciliationCase[]> {
+    this.requireServiceCapability(principal, "policies:read", "POLICY_CAPABILITY_REQUIRED");
+    return this.store.listReconciliationCases(principal.organizationId);
+  }
+
+  async resolveReconciliation(
+    principal: AdministrativePrincipal,
+    input: ResolveReconciliationCommand,
+  ): Promise<void> {
+    this.requireAdmin(principal, "mandates:admin", "MANDATE_CAPABILITY_REQUIRED");
+    this.requireRequestId(input.requestId);
+    const occurredAt = this.now();
+    await this.store.resolveReconciliation({
+      organizationId: principal.organizationId,
+      requestId: input.executionRequestId,
+      resolution: input.resolution,
+      ...(input.actualCostAtomic === undefined ? {} : { actualCostAtomic: input.actualCostAtomic }),
+      note: input.note,
+      externalReference: input.externalReference,
+      ...this.context(principal, input.requestId, occurredAt),
+    });
   }
 
   async listDecisions(
