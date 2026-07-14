@@ -16,6 +16,12 @@ export interface AdministrativePrincipal {
   role?: ServiceAccountRole;
 }
 
+export interface RegisterAgentInput {
+  agentId: string;
+  name: string;
+  requestId: string;
+}
+
 export interface IssueAgentCredentialInput {
   credentialId: string;
   agentId: string;
@@ -42,6 +48,10 @@ const agentCapabilities = new Set<ApiCapability>([
 ]);
 
 export interface CredentialAdministrationPort {
+  registerAgent(
+    principal: AdministrativePrincipal,
+    input: RegisterAgentInput,
+  ): Promise<void>;
   issueAgentCredential(
     principal: AdministrativePrincipal,
     input: IssueAgentCredentialInput,
@@ -80,6 +90,23 @@ export class CredentialAdministration implements CredentialAdministrationPort {
     private readonly now: () => string = () => new Date().toISOString(),
     private readonly entropy: (size: number) => Buffer = randomBytes,
   ) {}
+
+  async registerAgent(
+    principal: AdministrativePrincipal,
+    input: RegisterAgentInput,
+  ): Promise<void> {
+    this.requireServiceAccount(principal, "agents:write");
+    if (!input.requestId.trim()) throw new Error("REQUEST_ID_REQUIRED");
+    const occurredAt = this.now();
+    await this.store.registerAgent({
+      id: input.agentId,
+      organizationId: principal.organizationId,
+      name: input.name,
+      actorId: `service_account:${principal.principalId}`,
+      causationId: input.requestId,
+      occurredAt,
+    });
+  }
 
   async issueAgentCredential(
     principal: AdministrativePrincipal,

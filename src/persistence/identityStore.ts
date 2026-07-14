@@ -73,7 +73,21 @@ export class IdentityStore {
   }
 
   private async createSchema(): Promise<void> {
+    const existingTables = await this.pool.query<{ table_name: string }>(
+      `SELECT table_name FROM information_schema.tables
+       WHERE table_schema = current_schema()
+         AND table_name IN (
+         'service_accounts', 'agent_identities', 'service_account_credentials', 'api_credentials'
+       )`,
+    );
+    const legacyTables = new Set(existingTables.rows.map((row) => row.table_name));
     await this.pool.query(`
+      CREATE TABLE IF NOT EXISTS identity_schema_migrations (
+        version INTEGER PRIMARY KEY,
+        applied_at TIMESTAMPTZ NOT NULL
+      )
+    `);
+    const schemaSql = `
       CREATE TABLE IF NOT EXISTS audit_events (
         id TEXT PRIMARY KEY,
         organization_id TEXT NOT NULL,
@@ -109,25 +123,25 @@ export class IdentityStore {
         PRIMARY KEY (organization_id, user_id)
       );
       CREATE TABLE IF NOT EXISTS service_accounts (
-        id TEXT PRIMARY KEY,
+        id TEXT NOT NULL,
         organization_id TEXT NOT NULL REFERENCES organizations(id),
         name TEXT NOT NULL,
         role TEXT NOT NULL CHECK (role IN ('admin', 'operator', 'viewer')),
         created_at TIMESTAMPTZ NOT NULL,
         revoked_at TIMESTAMPTZ,
-        UNIQUE (organization_id, id)
+        PRIMARY KEY (organization_id, id)
       );
       CREATE TABLE IF NOT EXISTS agent_identities (
-        id TEXT PRIMARY KEY,
+        id TEXT NOT NULL,
         organization_id TEXT NOT NULL REFERENCES organizations(id),
         name TEXT NOT NULL,
         status TEXT NOT NULL CHECK (status IN ('active', 'revoked')),
         created_at TIMESTAMPTZ NOT NULL,
         revoked_at TIMESTAMPTZ,
-        UNIQUE (organization_id, id)
+        PRIMARY KEY (organization_id, id)
       );
       CREATE TABLE IF NOT EXISTS service_account_credentials (
-        id TEXT PRIMARY KEY,
+        id TEXT NOT NULL,
         organization_id TEXT NOT NULL,
         service_account_id TEXT NOT NULL,
         name TEXT NOT NULL,
@@ -137,11 +151,12 @@ export class IdentityStore {
         created_at TIMESTAMPTZ NOT NULL,
         expires_at TIMESTAMPTZ,
         revoked_at TIMESTAMPTZ,
+        PRIMARY KEY (organization_id, id),
         FOREIGN KEY (organization_id, service_account_id)
           REFERENCES service_accounts(organization_id, id)
       );
       CREATE TABLE IF NOT EXISTS api_credentials (
-        id TEXT PRIMARY KEY,
+        id TEXT NOT NULL,
         organization_id TEXT NOT NULL,
         agent_id TEXT NOT NULL,
         name TEXT NOT NULL,
@@ -151,10 +166,39 @@ export class IdentityStore {
         created_at TIMESTAMPTZ NOT NULL,
         expires_at TIMESTAMPTZ,
         revoked_at TIMESTAMPTZ,
+        PRIMARY KEY (organization_id, id),
         FOREIGN KEY (organization_id, agent_id)
           REFERENCES agent_identities(organization_id, id)
       );
-    `);
+    `;
+    await this.migrateTenantLocalKeys(legacyTables, schemaSql);
+  }
+
+  private async migrateTenantLocalKeys(
+    legacyTables: ReadonlySet<string>,
+    schemaSql: string,
+  ): Promise<void> {
+    const tables = [
+      "service_accounts",
+      "agent_identities",
+      "service_account_credentials",
+      "api_credentials",
+    ] as const;
+    await this.transaction(async (client) => {
+      const claimed = await client.query(
+        `INSERT INTO identity_schema_migrations (version, applied_at)
+         VALUES (1, CURRENT_TIMESTAMP)
+         ON CONFLICT (version) DO NOTHING
+         RETURNING version`,
+      );
+      if (claimed.rowCount === 0) return;
+      await client.query(schemaSql);
+      for (const table of tables) {
+        if (!legacyTables.has(table)) continue;
+        await client.query(`ALTER TABLE ${table} DROP CONSTRAINT ${table}_pkey`);
+        await client.query(`ALTER TABLE ${table} ADD PRIMARY KEY (organization_id, id)`);
+      }
+    });
   }
 
   async createOrganization(input: CreateOrganizationInput): Promise<void> {

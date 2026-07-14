@@ -79,7 +79,16 @@ The OpenAI-compatible `POST /v1/chat/completions` route is implemented and teste
 6. Reuses the cached inference on the paid retry.
 7. Reconciles the reservation and returns an OpenAI-compatible response with a Fuse receipt.
 
-The production runtime targets Anthropic's official Messages API at `https://api.anthropic.com/v1/messages` with `x-api-key` authentication and provider-reported `input_tokens` / `output_tokens`. The gateway-facing route remains OpenAI-compatible so calling agents do not need to speak Anthropic's wire format.
+The runtime supports two explicitly selected provider adapters through `FUSE_PROVIDER`:
+
+- `anthropic` (default) targets Anthropic's official Messages API with `ANTHROPIC_API_KEY`, the Anthropic wire format, and provider-reported `input_tokens` / `output_tokens`.
+- `openrouter` targets OpenRouter's OpenAI-compatible `/api/v1/chat/completions` endpoint with `OPENROUTER_API_KEY`, an organization-prefixed `OPENROUTER_MODEL`, and provider-reported `prompt_tokens` / `completion_tokens`.
+
+Both adapters feed the same internal `InferenceProvider` contract. OpenRouter-mediated Claude traffic must be described as Claude inference through OpenRouter, not as direct official Anthropic API traffic. The gateway-facing route remains OpenAI-compatible so calling agents do not need to speak either upstream wire format.
+
+When PostgreSQL-backed controlled inference is configured, `/v1/chat/completions` requires an authenticated agent credential, `inference:invoke`, a tenant-scoped mandate, and an idempotency key. Admission and maximum-cost reservation commit before the provider call. A denial records decision evidence with a zero reservation and does not call the provider or payment guard. In `dry_run`, hard authorization failures still deny; policy-limit violations are recorded as `wouldOutcome: DENY` but the real provider request proceeds, so it is reserved and reconciled like any other billable execution. Completed requests replay from stored output; changed payloads under the same key are rejected.
+
+Fuse does not claim exactly-once upstream execution across the provider-success/database-commit crash boundary. An `executing` request is never automatically dispatched again: retries receive `REQUEST_IN_PROGRESS` during a five-minute lease, then move the execution and non-terminal mandate into reconciliation hold for operator review. This is an at-most-once retry posture, not proof that the upstream provider cannot bill a request whose local completion commit was lost.
 
 ### Historical metered inference evidence
 
@@ -93,7 +102,7 @@ The committed July 12 evidence below was produced before the official-Anthropic 
 - The paid retry returned HTTP `200` with `FUSE LIVE PAID OK`.
 - The receipt identifies the real parent payer, logical child `scout`, exact token usage, exact charge, and Gateway settlement reference.
 
-The `3.00` input / `15.00` output USDC-per-million values are Fuse's configurable demo tariff for `claude-sonnet-4-6`; they should be reviewed against the official Anthropic pricing page before production billing changes.
+Direct Anthropic defaults to a `3.00` input / `15.00` output USDC-per-million reservation tariff for `claude-sonnet-4-6`. OpenRouter Claude Sonnet 4.6 defaults to a conservative `3.30` / `16.50` reservation ceiling based on the reviewed endpoint set; provider-reported cost remains authoritative for reconciliation, and missing, mismatched-model, or over-reservation results enter reconciliation hold.
 
 ```bash
 npm run dev
@@ -221,3 +230,30 @@ A service account with the required capability can then call:
 - `POST /api/v1/admin/service-account-credentials/:credentialId/revoke` with `credentials:revoke` to invalidate the prior credential after rotation.
 
 Administrative routes require an `admin` service-account role in addition to the route capability. Operators and viewers are limited to role-compatible runtime/read capabilities at credential issuance and authentication. All endpoints derive the organization from the authenticated service account, require `X-Request-Id` for audit causation, return no-store responses, and never accept an organization identifier from the request body.
+
+### Versioned policy control plane
+
+The next custody-agnostic slice adds a tenant-scoped policy substrate beside the unchanged public hackathon flow:
+
+- Append-only policy-version APIs with deterministic `ALLOW`/`DENY` results and stable reason codes.
+- `dry_run`, `enforce`, and `paused` policy modes.
+- Provider, model, capability, per-call, hourly, daily, rate, and token controls.
+- Control mandates that must be created in `draft` and explicitly activated through the mandate lifecycle.
+- Tenant-scoped agent assignments and immutable decision records with unique request identifiers.
+- Transactional audit events for policy publication, mandate creation, assignment, state transitions, and policy-version changes.
+- Mandate-row locking during evaluation and state/policy mutations.
+- Policy changes only while a mandate is `draft` or `paused`; switching modes requires publishing a new version and binding it before reactivation.
+
+Administrative policy routes are:
+
+- `POST /api/v1/admin/policies` with `policies:write`.
+- `GET /api/v1/admin/policies/:policyId/versions/:version` with `policies:read`.
+- `POST /api/v1/admin/mandates` with `mandates:admin`; mandates always start in `draft`.
+- `POST /api/v1/admin/mandates/:mandateId/agents` with `mandates:admin`.
+- `POST /api/v1/admin/mandates/:mandateId/transitions` with `mandates:admin`.
+- `POST /api/v1/admin/mandates/:mandateId/policy` with `mandates:admin`.
+- `GET /api/v1/admin/mandates/:mandateId/decisions` with `policies:read`.
+
+`policies:write` and `mandates:admin` are admin-only service-account capabilities. `policies:read` is available to admin, operator, and viewer service accounts. Policy versions and decisions are append-only through the application API; database-role or trigger enforcement against direct `UPDATE`/`DELETE` remains pending.
+
+With `DATABASE_URL` configured, authenticated `/v1/chat/completions` requests use policy admission, transactional reservation, provider invocation, and usage reconciliation. OpenRouter cannot start without that controlled path. The no-database direct-Anthropic route remains a legacy compatibility mode and is not part of the policy-control evidence. Real-money settlement remains gated by the custody decision.

@@ -6,6 +6,7 @@ import type { InferenceProvider } from "../src/core/service.js";
 import { MemoryStateStore } from "../src/persistence/store.js";
 import type { CredentialAuthenticator } from "../src/http/auth.js";
 import type { CredentialAdministrationPort } from "../src/identity/credentialAdministration.js";
+import type { PolicyAdministrationPort } from "../src/policy/policyAdministration.js";
 
 class FakeProvider implements InferenceProvider {
   calls = 0;
@@ -129,6 +130,109 @@ describe("POST /v1/chat/completions", () => {
     expect(run.headers["cache-control"]).toContain("no-store");
   });
 
+  it("denies authenticated controlled inference before provider or payment side effects", async () => {
+    const provider = new FakeProvider();
+    let paymentAttempts = 0;
+    let executionCalls = 0;
+    const credentialAuthenticator: CredentialAuthenticator = {
+      authenticateToken: async () => ({
+        principalType: "agent",
+        principalId: "mans-primary",
+        organizationId: "org-shaly",
+        credentialId: "cred-shaly",
+        capabilities: ["inference:invoke"],
+      }),
+    };
+    const app = createFuseApp({
+      provider,
+      paymentGuard: () => {
+        paymentAttempts += 1;
+        return (_request, response) => response.status(500).end();
+      },
+      estimateInputTokens: () => 100,
+      credentialAuthenticator,
+      inferenceExecution: {
+        execute: async () => {
+          executionCalls += 1;
+          return {
+            status: "denied",
+            decision: {
+              id: "decision-denied",
+              result: {
+                outcome: "DENY",
+                wouldOutcome: "DENY",
+                enforced: true,
+                reasonCodes: ["MODEL_NOT_ALLOWED"],
+              },
+            },
+          };
+        },
+      },
+    } as Parameters<typeof createFuseApp>[0]);
+
+    const response = await request(app)
+      .post("/v1/chat/completions")
+      .set("Authorization", "Bearer fuse_sk_shaly")
+      .set("Idempotency-Key", "req-denied")
+      .set("X-Fuse-Mandate", "shaly-main")
+      .send({
+        model: "client-hint",
+        max_tokens: 100,
+        messages: [{ role: "user", content: "Hello" }],
+      });
+
+    expect(response.status).toBe(403);
+    expect(response.body).toEqual({
+      error: {
+        code: "POLICY_DENIED",
+        decisionId: "decision-denied",
+        reasonCodes: ["MODEL_NOT_ALLOWED"],
+      },
+    });
+    expect(executionCalls).toBe(1);
+    expect(provider.calls).toBe(0);
+    expect(paymentAttempts).toBe(0);
+  });
+
+  it("sanitizes controlled inference failures instead of exposing database details", async () => {
+    const credentialAuthenticator: CredentialAuthenticator = {
+      authenticateToken: async () => ({
+        principalType: "agent",
+        principalId: "mans-primary",
+        organizationId: "org-shaly",
+        credentialId: "cred-shaly",
+        capabilities: ["inference:invoke"],
+      }),
+    };
+    const app = createFuseApp({
+      provider: new FakeProvider(),
+      paymentGuard: () => (_request, response) => response.status(500).end(),
+      estimateInputTokens: () => 100,
+      credentialAuthenticator,
+      inferenceExecution: {
+        execute: async () => {
+          throw new Error("password authentication failed for secret-host");
+        },
+      },
+    });
+
+    const response = await request(app)
+      .post("/v1/chat/completions")
+      .set("Authorization", "Bearer fuse_sk_shaly")
+      .set("Idempotency-Key", "req-internal")
+      .set("X-Fuse-Mandate", "shaly-main")
+      .send({
+        model: "client-hint",
+        max_tokens: 100,
+        messages: [{ role: "user", content: "Hello" }],
+      });
+
+    expect(response.status).toBe(500);
+    expect(response.body).toEqual({ error: { code: "INTERNAL_ERROR" } });
+    expect(response.text).not.toContain("secret-host");
+    expect(response.text).not.toContain("password");
+  });
+
   it("serves a proof-forward landing page with direct verification links", async () => {
     const app = createFuseApp({
       provider: new FakeProvider(),
@@ -211,11 +315,14 @@ describe("POST /v1/chat/completions", () => {
         principalId: "service-1",
         organizationId: "org-1",
         credentialId: "service-cred-1",
-        capabilities: ["credentials:issue", "credentials:revoke"],
+        capabilities: ["credentials:issue", "credentials:revoke", "agents:write"],
       }),
     };
     const calls: unknown[] = [];
     const credentialAdministration: CredentialAdministrationPort = {
+      registerAgent: async (principal, input) => {
+        calls.push({ action: "register-agent", principal, input });
+      },
       issueAgentCredential: async (principal, input) => {
         calls.push({ action: "issue", principal, input });
         return {
@@ -247,6 +354,15 @@ describe("POST /v1/chat/completions", () => {
       provider: new FakeProvider(), paymentGuard: fakePaymentGuard,
       estimateInputTokens: () => 1000, credentialAuthenticator, credentialAdministration,
     });
+
+    const registerAgent = await request(app)
+      .post("/api/v1/admin/agents")
+      .set("Authorization", "Bearer service-key")
+      .set("X-Request-Id", "request:register-agent-1")
+      .send({ agentId: "agent-1", name: "Scout" });
+    expect(registerAgent.status).toBe(201);
+    expect(registerAgent.body).toEqual({ agentId: "agent-1" });
+    expect(registerAgent.headers["cache-control"]).toContain("no-store");
 
     const issue = await request(app)
       .post("/api/v1/admin/agent-credentials")
@@ -287,7 +403,107 @@ describe("POST /v1/chat/completions", () => {
       .set("Authorization", "Bearer service-key")
       .set("X-Request-Id", "request:revoke-service-1");
     expect(revokeService.status).toBe(204);
-    expect(calls).toHaveLength(4);
+    expect(calls).toHaveLength(5);
+  });
+
+  it("provides tenant-scoped policy and mandate administration routes", async () => {
+    const credentialAuthenticator: CredentialAuthenticator = {
+      authenticateToken: async () => ({
+        principalType: "service_account",
+        role: "admin",
+        principalId: "admin-1",
+        organizationId: "org-1",
+        credentialId: "admin-cred-1",
+        capabilities: ["policies:write", "policies:read", "mandates:admin"],
+      }),
+    };
+    const calls: string[] = [];
+    const policyAdministration: PolicyAdministrationPort = {
+      publishPolicy: async (_principal, input) => { calls.push(`policy:${input.policyId}`); },
+      createMandate: async (_principal, input) => { calls.push(`mandate:${input.mandateId}`); },
+      assignAgent: async (_principal, input) => { calls.push(`assign:${input.agentId}`); },
+      transitionMandate: async (_principal, input) => { calls.push(`transition:${input.to}`); },
+      setMandatePolicy: async (_principal, input) => { calls.push(`policy-bind:${input.policyVersion}`); },
+      getPolicy: async (principal, policyId, version) => ({
+        id: policyId,
+        organizationId: principal.organizationId,
+        version,
+        mode: "dry_run",
+        allowedProviders: ["anthropic"],
+        allowedModels: ["claude-sonnet-4-6"],
+        requiredCapability: "inference:invoke",
+        limits: {
+          maxPerCallAtomic: 10_000n, maxHourlyAtomic: 50_000n, maxDailyAtomic: 250_000n,
+          maxRequestsPerMinute: 10, maxInputTokens: 20_000, maxOutputTokens: 4_000,
+        },
+        createdAt: "2026-07-13T21:00:00.000Z",
+      }),
+      listDecisions: async (principal, mandateId) => [{
+        id: "decision-1",
+        requestId: "request:inference-1",
+        organizationId: principal.organizationId,
+        mandateId,
+        agentId: "agent-1",
+        policyId: "policy-1",
+        policyVersion: 1,
+        result: { outcome: "ALLOW", wouldOutcome: "ALLOW", enforced: true, reasonCodes: [] },
+        input: {
+          id: "decision-1", requestId: "request:inference-1",
+          organizationId: principal.organizationId, mandateId, agentId: "agent-1",
+          agentCapabilities: ["inference:invoke"], provider: "openrouter",
+          model: "anthropic/claude-sonnet-4.6", estimatedCostAtomic: 1800n,
+          inputTokens: 100, maxOutputTokens: 100, spentHourAtomic: 0n,
+          spentDayAtomic: 0n, mandateSpentAtomic: 0n, mandateMaximumAtomic: 250000n,
+          requestCountLastMinute: 0, decidedAt: "2026-07-13T21:00:00.000Z",
+        },
+      }],
+    };
+    const app = createFuseApp({
+      provider: new FakeProvider(), paymentGuard: fakePaymentGuard,
+      estimateInputTokens: () => 1000, credentialAuthenticator, policyAdministration,
+    });
+    const auth = { Authorization: "Bearer policy-admin", "X-Request-Id": "request:policy" };
+    const publish = await request(app).post("/api/v1/admin/policies").set(auth).send({
+      policyId: "policy-1", version: 1, mode: "dry_run",
+      allowedProviders: ["anthropic"], allowedModels: ["claude-sonnet-4-6"],
+      requiredCapability: "inference:invoke",
+      limits: {
+        maxPerCallAtomic: "10000", maxHourlyAtomic: "50000", maxDailyAtomic: "250000",
+        maxRequestsPerMinute: 10, maxInputTokens: 20000, maxOutputTokens: 4000,
+      },
+    });
+    expect(publish.status).toBe(201);
+    expect(publish.headers["cache-control"]).toContain("no-store");
+    const mandate = await request(app).post("/api/v1/admin/mandates").set(auth).send({
+      mandateId: "mandate-1", name: "Inference allowance", assetId: "arc-testnet/usdc",
+      maximumSpendAtomic: "250000", policyId: "policy-1", policyVersion: 1,
+      expiresAt: "2026-08-13T21:00:00.000Z",
+    });
+    expect(mandate.status).toBe(201);
+    expect((await request(app).post("/api/v1/admin/mandates/mandate-1/agents").set(auth)
+      .send({ agentId: "agent-1" })).status).toBe(204);
+    expect((await request(app).post("/api/v1/admin/mandates/mandate-1/transitions").set(auth)
+      .send({ to: "active" })).status).toBe(204);
+    expect((await request(app).post("/api/v1/admin/mandates/mandate-1/transitions").set(auth)
+      .send({ to: "paused" })).status).toBe(204);
+    expect((await request(app).post("/api/v1/admin/mandates/mandate-1/policy").set(auth)
+      .send({ policyId: "policy-1", policyVersion: 2 })).status).toBe(204);
+    const readPolicy = await request(app).get("/api/v1/admin/policies/policy-1/versions/1").set(auth);
+    expect(readPolicy.status).toBe(200);
+    expect(readPolicy.body.limits.maxPerCallAtomic).toBe("10000");
+    const decisions = await request(app).get("/api/v1/admin/mandates/mandate-1/decisions").set(auth);
+    expect(decisions.status).toBe(200);
+    expect(decisions.body.decisions).toHaveLength(1);
+    expect(decisions.body.decisions[0].input).toMatchObject({
+      estimatedCostAtomic: "1800",
+      mandateSpentAtomic: "0",
+      mandateMaximumAtomic: "250000",
+    });
+    expect(calls).toEqual([
+      "policy:policy-1", "mandate:mandate-1", "assign:agent-1", "transition:active",
+      "transition:paused",
+      "policy-bind:2",
+    ]);
   });
 
   it("requires idempotency and child capability headers", async () => {

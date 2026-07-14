@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { createPostgresPool } from "../src/persistence/postgres.js";
 import { IdentityStore } from "../src/persistence/identityStore.js";
-import { createServiceAccountCredential } from "../src/identity/apiCredentials.js";
+import { API_CAPABILITIES, createServiceAccountCredential } from "../src/identity/apiCredentials.js";
 
 const env = process.env;
 
@@ -28,7 +28,7 @@ try {
     organizationId,
     serviceAccountId,
     name: "bootstrap administration",
-    capabilities: ["credentials:issue", "credentials:revoke", "agents:write"],
+    capabilities: API_CAPABILITIES,
     createdAt: now,
     expiresAt: env["FUSE_BOOTSTRAP_EXPIRES_AT"]?.trim() || defaultExpiry,
   });

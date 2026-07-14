@@ -51,6 +51,31 @@ it("calls the official Anthropic Messages API and uses provider-reported usage",
   );
 });
 
+it.each([
+  { input_tokens: -1, output_tokens: 1 },
+  { input_tokens: 1.5, output_tokens: 1 },
+  { input_tokens: 1, output_tokens: Number.NaN },
+])("rejects malformed successful Anthropic usage: $input_tokens/$output_tokens", async (usage) => {
+  const provider = new AnthropicProvider({
+    apiKey: "official-anthropic-key",
+    model: "claude-sonnet-4-6",
+    fetch: vi.fn(async () => new Response(JSON.stringify({
+      id: "msg_invalid_usage",
+      content: [{ type: "text", text: "response" }],
+      usage,
+    }), { status: 200, headers: { "content-type": "application/json" } })),
+  });
+
+  await expect(provider.complete({
+    requestId: "req-invalid-usage",
+    childId: "scout",
+    model: "ignored",
+    inputTokens: 1,
+    maxOutputTokens: 8,
+    messages: [{ role: "user", content: "Hello" }],
+  })).rejects.toThrow("ANTHROPIC_INVALID_RESPONSE");
+});
+
 it("returns a sanitized error when Anthropic sends a non-JSON response", async () => {
   const provider = new AnthropicProvider({
     apiKey: "official-anthropic-key",

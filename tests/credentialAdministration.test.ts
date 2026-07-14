@@ -26,10 +26,26 @@ const principal = {
   principalId: "service-1",
   organizationId: "org-1",
   credentialId: "service-cred-1",
-  capabilities: ["credentials:issue", "credentials:revoke"] as const,
+  capabilities: ["credentials:issue", "credentials:revoke", "agents:write"] as const,
 };
 
 describe("CredentialAdministration", () => {
+  it("registers an agent inside the authenticated administrator's organization", async () => {
+    const { pool, store } = await setup();
+    const administration = new CredentialAdministration(store, () => now);
+
+    await administration.registerAgent(principal, {
+      agentId: "agent-2",
+      name: "Research minion",
+      requestId: "request:register-agent-2",
+    });
+
+    expect((await pool.query(
+      "SELECT organization_id, id, name FROM agent_identities WHERE id = 'agent-2'",
+    )).rows).toEqual([{ organization_id: "org-1", id: "agent-2", name: "Research minion" }]);
+    await pool.end();
+  });
+
   it("issues an agent credential once within the caller's organization", async () => {
     const { pool, store } = await setup();
     const administration = new CredentialAdministration(store, () => now, () => Buffer.alloc(32, 13));

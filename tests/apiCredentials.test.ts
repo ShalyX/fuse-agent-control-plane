@@ -3,6 +3,9 @@ import {
   createApiCredential,
   hashApiToken,
   tokenMatchesHash,
+  createServiceAccountCredential,
+  serviceAccountRoleAllowsCapabilities,
+  type ApiCapability,
 } from "../src/identity/apiCredentials.js";
 
 const input = {
@@ -30,6 +33,24 @@ describe("API credentials", () => {
     expect(issued.record).not.toHaveProperty("token");
     expect(tokenMatchesHash(issued.token, issued.record.tokenHash)).toBe(true);
     expect(tokenMatchesHash(`${issued.token}x`, issued.record.tokenHash)).toBe(false);
+  });
+
+  it("supports policy administration capabilities while preserving role ceilings", () => {
+    const policiesRead = "policies:read" as ApiCapability;
+    const policiesWrite = "policies:write" as ApiCapability;
+    const mandateAdmin = "mandates:admin" as ApiCapability;
+    expect(() => createServiceAccountCredential({
+      id: "service-cred-1",
+      organizationId: "org-1",
+      serviceAccountId: "service-1",
+      name: "policy administration",
+      capabilities: [policiesRead, policiesWrite, mandateAdmin],
+      createdAt: input.createdAt,
+      expiresAt: input.expiresAt,
+    })).not.toThrow();
+    expect(serviceAccountRoleAllowsCapabilities("viewer", [policiesRead])).toBe(true);
+    expect(serviceAccountRoleAllowsCapabilities("viewer", [policiesWrite])).toBe(false);
+    expect(serviceAccountRoleAllowsCapabilities("operator", [mandateAdmin])).toBe(false);
   });
 
   it("rejects unknown capabilities and invalid expiry windows", () => {

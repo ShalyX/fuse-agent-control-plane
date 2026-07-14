@@ -60,7 +60,9 @@ export class AnthropicProvider implements InferenceProvider {
       .join("\n");
     const inputTokens = body?.usage?.input_tokens;
     const outputTokens = body?.usage?.output_tokens;
-    if (!body?.id || content === undefined || inputTokens === undefined || outputTokens === undefined) {
+    if (!body?.id || content === undefined
+      || typeof inputTokens !== "number" || !Number.isSafeInteger(inputTokens) || inputTokens < 0
+      || typeof outputTokens !== "number" || !Number.isSafeInteger(outputTokens) || outputTokens < 0) {
       throw new Error("ANTHROPIC_INVALID_RESPONSE");
     }
     return {

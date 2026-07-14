@@ -11,11 +11,13 @@ export type CompletionRequest = {
   messages: Array<{ role: string; content: string }>;
 };
 
-export type ProviderResult = {
+export interface ProviderResult {
   id: string;
   content: string;
   usage: { inputTokens: number; outputTokens: number };
-};
+  providerCostUsd?: string;
+  providerModel?: string;
+}
 
 export interface InferenceProvider {
   complete(request: CompletionRequest): Promise<ProviderResult>;

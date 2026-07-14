@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { IdentityStore } from "../src/persistence/identityStore.js";
 import { createApiCredential, createServiceAccountCredential } from "../src/identity/apiCredentials.js";
 import { ProductionFoundationStore } from "../src/persistence/productionFoundation.js";
+import { PolicyStore } from "../src/persistence/policyStore.js";
 
 async function createStores() {
   const db = newDb();
@@ -33,6 +34,152 @@ describe("IdentityStore", () => {
     expect((await pool.query("SELECT id FROM organizations")).rows).toEqual([{ id: "org-clean" }]);
     expect((await audit.listAuditEvents("org-clean", "organization", "org-clean"))[0]?.action)
       .toBe("organization.created");
+    await pool.end();
+  });
+
+  it("serializes concurrent identity schema initialization", async () => {
+    const db = newDb({ noAstCoverageCheck: true });
+    const adapter = db.adapters.createPg();
+    const pool = new adapter.Pool();
+    await Promise.all([
+      new IdentityStore(pool).ensureSchema(),
+      new IdentityStore(pool).ensureSchema(),
+    ]);
+    expect((await pool.query("SELECT version FROM identity_schema_migrations")).rows)
+      .toEqual([{ version: 1 }]);
+    await pool.end();
+  });
+
+  it("migrates legacy global identity keys before policy initialization", async () => {
+    const db = newDb({ noAstCoverageCheck: true });
+    const adapter = db.adapters.createPg();
+    const pool = new adapter.Pool();
+    await pool.query(`
+      CREATE TABLE organizations (
+        id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL
+      );
+      CREATE TABLE service_accounts (
+        id TEXT PRIMARY KEY,
+        organization_id TEXT NOT NULL REFERENCES organizations(id),
+        name TEXT NOT NULL,
+        role TEXT NOT NULL CHECK (role IN ('admin', 'operator', 'viewer')),
+        created_at TIMESTAMPTZ NOT NULL,
+        revoked_at TIMESTAMPTZ,
+        UNIQUE (organization_id, id)
+      );
+      CREATE TABLE agent_identities (
+        id TEXT PRIMARY KEY,
+        organization_id TEXT NOT NULL REFERENCES organizations(id),
+        name TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('active', 'revoked')),
+        created_at TIMESTAMPTZ NOT NULL,
+        revoked_at TIMESTAMPTZ,
+        UNIQUE (organization_id, id)
+      );
+      CREATE TABLE service_account_credentials (
+        id TEXT PRIMARY KEY,
+        organization_id TEXT NOT NULL,
+        service_account_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        token_prefix TEXT NOT NULL,
+        token_hash TEXT NOT NULL UNIQUE,
+        capabilities JSONB NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL,
+        expires_at TIMESTAMPTZ,
+        revoked_at TIMESTAMPTZ,
+        FOREIGN KEY (organization_id, service_account_id)
+          REFERENCES service_accounts(organization_id, id)
+      );
+      CREATE TABLE api_credentials (
+        id TEXT PRIMARY KEY,
+        organization_id TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        token_prefix TEXT NOT NULL,
+        token_hash TEXT NOT NULL UNIQUE,
+        capabilities JSONB NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL,
+        expires_at TIMESTAMPTZ,
+        revoked_at TIMESTAMPTZ,
+        FOREIGN KEY (organization_id, agent_id)
+          REFERENCES agent_identities(organization_id, id)
+      );
+      INSERT INTO organizations VALUES ('org-1', 'One', '2026-07-13T17:00:00.000Z');
+      INSERT INTO service_accounts VALUES (
+        'shared-service', 'org-1', 'First service', 'admin', '2026-07-13T17:00:00.000Z', NULL
+      );
+      INSERT INTO agent_identities VALUES (
+        'shared-agent', 'org-1', 'First agent', 'active', '2026-07-13T17:00:00.000Z', NULL
+      );
+      INSERT INTO service_account_credentials VALUES (
+        'shared-service-credential', 'org-1', 'shared-service', 'First service credential',
+        'fsa_old', 'old-service-hash', '["credentials:issue"]',
+        '2026-07-13T17:00:00.000Z', NULL, NULL
+      );
+      INSERT INTO api_credentials VALUES (
+        'shared-agent-credential', 'org-1', 'shared-agent', 'First agent credential',
+        'fag_old', 'old-agent-hash', '["inference:invoke"]',
+        '2026-07-13T17:00:00.000Z', NULL, NULL
+      );
+    `);
+
+    const identity = new IdentityStore(pool);
+    await identity.ensureSchema();
+    await new PolicyStore(pool).ensureSchema();
+    await identity.createOrganization({ id: "org-2", name: "Two", ...context });
+    await identity.createServiceAccount({
+      id: "shared-service", organizationId: "org-2", name: "Second service", role: "admin", ...context,
+    });
+    await identity.registerAgent({
+      id: "shared-agent", organizationId: "org-2", name: "Second agent", ...context,
+    });
+    const serviceCredential = createServiceAccountCredential({
+      id: "shared-service-credential",
+      organizationId: "org-2",
+      serviceAccountId: "shared-service",
+      name: "Second service credential",
+      capabilities: ["credentials:issue"],
+      createdAt: context.occurredAt,
+    }, () => Buffer.alloc(32, 21));
+    await identity.issueServiceAccountCredential(serviceCredential.record, context);
+    const agentCredential = createApiCredential({
+      id: "shared-agent-credential",
+      organizationId: "org-2",
+      agentId: "shared-agent",
+      name: "Second agent credential",
+      capabilities: ["inference:invoke"],
+      createdAt: context.occurredAt,
+    }, () => Buffer.alloc(32, 22));
+    await identity.issueCredential(agentCredential.record, context);
+
+    expect((await pool.query(
+      "SELECT organization_id, id FROM agent_identities WHERE id = 'shared-agent' ORDER BY organization_id",
+    )).rows).toEqual([
+      { organization_id: "org-1", id: "shared-agent" },
+      { organization_id: "org-2", id: "shared-agent" },
+    ]);
+    expect((await pool.query(
+      "SELECT organization_id, id FROM service_accounts WHERE id = 'shared-service' ORDER BY organization_id",
+    )).rows).toEqual([
+      { organization_id: "org-1", id: "shared-service" },
+      { organization_id: "org-2", id: "shared-service" },
+    ]);
+    expect((await pool.query(
+      `SELECT organization_id, id FROM service_account_credentials
+       WHERE id = 'shared-service-credential' ORDER BY organization_id`,
+    )).rows).toEqual([
+      { organization_id: "org-1", id: "shared-service-credential" },
+      { organization_id: "org-2", id: "shared-service-credential" },
+    ]);
+    expect((await pool.query(
+      `SELECT organization_id, id FROM api_credentials
+       WHERE id = 'shared-agent-credential' ORDER BY organization_id`,
+    )).rows).toEqual([
+      { organization_id: "org-1", id: "shared-agent-credential" },
+      { organization_id: "org-2", id: "shared-agent-credential" },
+    ]);
+    expect((await pool.query("SELECT version FROM identity_schema_migrations")).rows)
+      .toEqual([{ version: 1 }]);
     await pool.end();
   });
 
