@@ -3,6 +3,23 @@ import { createRuntimeApp } from "../src/runtime.js";
 
 const databaseUrl = "postgres://localhost:5432/fuse";
 
+it("creates a tenant-provider runtime without a deployment-wide provider credential", () => {
+  expect(() => createRuntimeApp({
+    DATABASE_URL: databaseUrl,
+    FUSE_PROVIDER_MODE: "tenant",
+    FUSE_PROVIDER_CREDENTIAL_ACTIVE_KEY_ID: "v1",
+    FUSE_PROVIDER_CREDENTIAL_KEY_V1: Buffer.alloc(32, 8).toString("base64"),
+  })).not.toThrow();
+});
+
+it("fails closed in production when tenant provider mode is not configured", () => {
+  expect(() => createRuntimeApp({
+    NODE_ENV: "production",
+    DATABASE_URL: databaseUrl,
+    ANTHROPIC_API_KEY: "legacy-key",
+  })).toThrow("PROVIDER_CREDENTIAL_ACTIVE_KEY_ID_INVALID");
+});
+
 it("creates the runtime with OpenRouter without requiring an Anthropic key", () => {
   expect(() => createRuntimeApp({
     FUSE_PROVIDER: "openrouter",

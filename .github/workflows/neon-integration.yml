@@ -1,0 +1,37 @@
+name: Neon provider concurrency
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: neon-provider-concurrency-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  provider-configuration-races:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      DATABASE_URL: ${{ secrets.NEON_INTEGRATION_DATABASE_URL }}
+      FUSE_PROVIDER_CREDENTIAL_ACTIVE_KEY_ID: ${{ secrets.NEON_INTEGRATION_PROVIDER_KEY_ID }}
+      FUSE_PROVIDER_CREDENTIAL_KEY_V1: ${{ secrets.NEON_INTEGRATION_PROVIDER_KEY_V1 }}
+      RUN_NEON_INTEGRATION: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Require protected integration credentials
+        run: |
+          test -n "$DATABASE_URL"
+          test -n "$FUSE_PROVIDER_CREDENTIAL_ACTIVE_KEY_ID"
+          test -n "$FUSE_PROVIDER_CREDENTIAL_KEY_V1"
+      - name: Install dependencies
+        run: npm ci
+      - name: Verify cross-instance provider races on Neon
+        run: npx vitest run tests/providerConfigStore.neon.test.ts

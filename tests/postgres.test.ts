@@ -11,11 +11,17 @@ class NoopProvider implements InferenceProvider {
 }
 
 describe("PostgresStateStore", () => {
-  it("creates a serverless-safe shared pool configuration", async () => {
-    const pool = createPostgresPool("postgres://user:pass@localhost:5432/fuse");
-    expect(pool.options.max).toBe(5);
-    expect(pool.options.ssl).toBe(false);
-    await pool.end();
+  it("creates a bounded serverless pool with certificate verification", async () => {
+    const local = createPostgresPool("postgres://user:password@localhost:5432/fuse");
+    expect(local.options.max).toBe(1);
+    expect(local.options.ssl).toBe(false);
+    await local.end();
+
+    const remote = createPostgresPool("postgres://user:password@example.neon.tech:5432/fuse?sslmode=require");
+    expect(remote.options.max).toBe(1);
+    expect(remote.options.ssl).toEqual({ rejectUnauthorized: true });
+    expect(remote.options.connectionString).toContain("sslmode=verify-full");
+    await remote.end();
   });
 
   it("persists bigint service state across store instances", async () => {

@@ -8,10 +8,15 @@ import {
 } from "./store.js";
 
 export function createPostgresPool(connectionString: string): Pool {
+  const parsed = new URL(connectionString);
+  const isLocal = ["localhost", "127.0.0.1", "::1"].includes(parsed.hostname);
+  if (!isLocal) parsed.searchParams.set("sslmode", "verify-full");
   const config: PoolConfig = {
-    connectionString,
-    max: 5,
-    ssl: connectionString.includes("localhost") ? false : { rejectUnauthorized: false },
+    connectionString: parsed.toString(),
+    max: 1,
+    connectionTimeoutMillis: 10_000,
+    idleTimeoutMillis: 30_000,
+    ssl: isLocal ? false : { rejectUnauthorized: true },
   };
   return new Pool(config);
 }

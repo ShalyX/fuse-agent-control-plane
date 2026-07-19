@@ -15,6 +15,8 @@
     "ops:check": "tsx scripts/check-operations.ts",
     "ops:reconcile": "tsx scripts/reconcile-inference.ts",
     "mainnet:readiness": "tsx scripts/check-mainnet-readiness.ts",
+    "smoke:production": "tsx scripts/smoke-production.ts",
+    "migrate:provider-config": "tsx scripts/migrate-provider-config.ts",
     "check": "npm test && npm run build"
   },
   "dependencies": {
