@@ -93,6 +93,108 @@ async function setup(options: {
   return { pool, policies };
 }
 
+it("resolves provider execution settings from the authenticated organization", async () => {
+  const calls: string[] = [];
+  const provider = new CountingProvider(undefined);
+  const store: InferenceExecutionStore = {
+    async admitInference(input) {
+      calls.push(`${input.organizationId}:${input.provider}:${input.model}:${input.estimatedCostAtomic}`);
+      return {
+        status: "execute",
+        decision: {
+          id: "decision-1", requestId: input.requestId, organizationId: input.organizationId,
+          mandateId: input.mandateId, agentId: input.agentId, policyId: "policy-1", policyVersion: 1,
+          result: { outcome: "ALLOW", wouldOutcome: "ALLOW", enforced: true, reasonCodes: [] },
+          input: {
+            id: "decision-1", requestId: input.requestId, organizationId: input.organizationId,
+            mandateId: input.mandateId, agentId: input.agentId, agentCapabilities: input.agentCapabilities,
+            provider: input.provider, model: input.model, estimatedCostAtomic: input.estimatedCostAtomic,
+            inputTokens: input.inputTokens, maxOutputTokens: input.maxOutputTokens,
+            spentHourAtomic: 0n, spentDayAtomic: 0n, mandateSpentAtomic: 0n,
+            mandateMaximumAtomic: 10_000n, requestCountLastMinute: 0, decidedAt: input.decidedAt,
+          },
+        },
+        reservedCostAtomic: input.estimatedCostAtomic,
+      };
+    },
+    async completeInference(input) {
+      return {
+        status: "completed", reservedCostAtomic: 1800n,
+        actualCostAtomic: input.actualCostAtomic, response: input.response,
+      };
+    },
+    async holdInference() { throw new Error("unexpected hold"); },
+  };
+  const service = new InferenceExecutionService({
+    store,
+    resolveProvider: async (organizationId) => {
+      expect(organizationId).toBe("org-customer-zero");
+      return {
+        provider,
+        providerName: "anthropic",
+        model: "claude-sonnet-4-6",
+        price: { inputUsdPerMillion: "3.00", outputUsdPerMillion: "15.00" },
+      };
+    },
+    now: () => "2026-07-19T16:00:00.000Z",
+  });
+
+  const result = await service.execute({
+    requestId: "req-tenant-provider", organizationId: "org-customer-zero",
+    mandateId: "mandate-1", agentId: "agent-1", agentCapabilities: ["inference:invoke"],
+    inputTokens: 100, maxOutputTokens: 100, messages: [{ role: "user", content: "Hello" }],
+  });
+
+  expect(result.status).toBe("completed");
+  expect(calls).toEqual(["org-customer-zero:anthropic:claude-sonnet-4-6:1800"]);
+  expect(provider.calls).toBe(1);
+});
+
+it("fails before admission or reservation when the tenant has no provider configuration", async () => {
+  let admissions = 0;
+  const store: InferenceExecutionStore = {
+    async admitInference() { admissions += 1; throw new Error("unexpected admission"); },
+    async completeInference() { throw new Error("unexpected completion"); },
+    async holdInference() { throw new Error("unexpected hold"); },
+  };
+  const service = new InferenceExecutionService({
+    store,
+    resolveProvider: async () => { throw new Error("PROVIDER_CONFIGURATION_NOT_FOUND"); },
+  });
+  await expect(service.execute({
+    requestId: "req-missing-config", organizationId: "org-without-provider",
+    mandateId: "mandate-1", agentId: "agent-1", agentCapabilities: ["inference:invoke"],
+    inputTokens: 10, maxOutputTokens: 10, messages: [{ role: "user", content: "Hello" }],
+  })).rejects.toThrow("PROVIDER_CONFIGURATION_NOT_FOUND");
+  expect(admissions).toBe(0);
+});
+
+it("rejects a requested model that differs from the tenant provider before admission", async () => {
+  const provider = new CountingProvider();
+  let admissions = 0;
+  const store: InferenceExecutionStore = {
+    async admitInference() { admissions += 1; throw new Error("unexpected admission"); },
+    async completeInference() { throw new Error("unexpected completion"); },
+    async holdInference() { throw new Error("unexpected hold"); },
+  };
+  const service = new InferenceExecutionService({
+    store,
+    provider,
+    providerName: "openrouter",
+    model: "approved/model",
+    price: { inputUsdPerMillion: "3.00", outputUsdPerMillion: "15.00" },
+  });
+
+  await expect(service.execute({
+    requestId: "req-model-mismatch", organizationId: "org-shaly", mandateId: "shaly-main",
+    agentId: "mans-primary", agentCapabilities: ["inference:invoke"],
+    requestedModel: "different/model", inputTokens: 10, maxOutputTokens: 10,
+    messages: [{ role: "user", content: "Hello" }],
+  })).rejects.toThrow("REQUESTED_MODEL_MISMATCH");
+  expect(admissions).toBe(0);
+  expect(provider.calls).toBe(0);
+});
+
 it("reserves before invoking an allowed provider and reconciles provider-reported cost", async () => {
   const { pool, policies } = await setup();
   const provider = new CountingProvider();
@@ -129,6 +231,40 @@ it("reserves before invoking an allowed provider and reconciles provider-reporte
     reserved_cost_atomic: 1800,
     actual_cost_atomic: 500,
   });
+  await pool.end();
+});
+
+it("replays a completed request after provider credential rotation without another provider call", async () => {
+  const { pool, policies } = await setup();
+  const firstProvider = new CountingProvider();
+  const rotatedProvider = new CountingProvider();
+  let credentialVersion = 1;
+  const service = new InferenceExecutionService({
+    store: policies,
+    resolveProvider: async () => ({
+      provider: credentialVersion === 1 ? firstProvider : rotatedProvider,
+      providerName: "openrouter",
+      model: "anthropic/claude-sonnet-4.6",
+      price: { inputUsdPerMillion: "3.00", outputUsdPerMillion: "15.00" },
+      requireProviderCost: true,
+    }),
+    now: () => "2026-07-13T23:01:00.000Z",
+  });
+  const input = {
+    requestId: "req-rotation-replay", organizationId: "org-shaly", mandateId: "shaly-main",
+    agentId: "mans-primary", agentCapabilities: ["inference:invoke" as const],
+    inputTokens: 100, maxOutputTokens: 100,
+    messages: [{ role: "user" as const, content: "Hello" }],
+  };
+
+  const first = await service.execute(input);
+  credentialVersion = 2;
+  const replay = await service.execute(input);
+
+  expect(first.status).toBe("completed");
+  expect(replay).toEqual(first);
+  expect(firstProvider.calls).toBe(1);
+  expect(rotatedProvider.calls).toBe(0);
   await pool.end();
 });
 

@@ -1,13 +1,16 @@
+import { randomUUID } from "node:crypto";
 import express, { type RequestHandler } from "express";
 import { z } from "zod";
 import { FuseService, type InferenceProvider } from "../core/service.js";
 import { MemoryStateStore, type ServiceStateStore } from "../persistence/store.js";
 import { renderControlDesk } from "./desk.js";
+import { renderOperatorConsole } from "./console.js";
 import { renderLandingPage } from "./landing.js";
-import { createCapabilityGuard, type CredentialAuthenticator } from "./auth.js";
+import { createAuthenticationGuard, createCapabilityGuard, type CredentialAuthenticator } from "./auth.js";
 import type { CredentialAdministrationPort } from "../identity/credentialAdministration.js";
 import { API_CAPABILITIES } from "../identity/apiCredentials.js";
 import type { PolicyAdministrationPort } from "../policy/policyAdministration.js";
+import type { ProviderAdministrationPort } from "../providers/providerAdministration.js";
 import type {
   AdmissionResult,
   ControlledInferenceInput,
@@ -48,6 +51,17 @@ const serviceCredentialIssueSchema = z.object({
   name: z.string().min(1).max(128),
   capabilities: z.array(z.enum(API_CAPABILITIES)).min(1),
   expiresAt: z.string().datetime().nullable().optional(),
+}).strict();
+
+const providerPriceSchema = z.string().regex(/^\d+(?:\.\d{1,12})?$/).max(64)
+  .refine((value) => Number(value) > 0);
+const providerConfigurationSchema = z.object({
+  configId: z.string().min(1).max(128),
+  provider: z.enum(["anthropic", "openrouter"]),
+  model: z.string().min(1).max(256),
+  apiKey: z.string().min(8).max(4096),
+  inputUsdPerMillion: providerPriceSchema,
+  outputUsdPerMillion: providerPriceSchema,
 }).strict();
 
 const atomicAmountSchema = z.string().regex(/^\d+$/).max(78);
@@ -116,9 +130,23 @@ type AppDependencies = {
   credentialAuthenticator?: CredentialAuthenticator;
   credentialAdministration?: CredentialAdministrationPort;
   policyAdministration?: PolicyAdministrationPort;
+  providerAdministration?: ProviderAdministrationPort;
   inferenceExecution?: {
     execute(input: ControlledInferenceInput): Promise<AdmissionResult>;
   };
+  readiness?: () => Promise<Record<string, boolean>>;
+  adminRateLimit?: {
+    maxPerMinute: number;
+    now?: () => number;
+  };
+  requestLogger?: (event: {
+    requestId: string;
+    method: string;
+    path: string;
+    status: number;
+    durationMs: number;
+  }) => void;
+  nowMs?: () => number;
 };
 
 function microsToUsdc(micros: bigint): string {
@@ -182,6 +210,7 @@ export function createFuseApp(dependencies: AppDependencies) {
     if ([
       "SERVICE_ACCOUNT_REQUIRED", "SERVICE_ACCOUNT_ADMIN_REQUIRED",
       "POLICY_CAPABILITY_REQUIRED", "MANDATE_CAPABILITY_REQUIRED",
+      "PROVIDER_CAPABILITY_REQUIRED",
     ].includes(message)) {
       response.status(403).json({ error: { code: message } });
     } else if (databaseCode === "23505") {
@@ -204,18 +233,114 @@ export function createFuseApp(dependencies: AppDependencies) {
       response.status(503).json({ error: { code: "POLICY_ADMINISTRATION_UNAVAILABLE" } });
     }
   };
+  const handleProviderError = (error: unknown, response: express.Response) => {
+    const message = error instanceof Error ? error.message : "";
+    if (["SERVICE_ACCOUNT_REQUIRED", "SERVICE_ACCOUNT_ADMIN_REQUIRED", "PROVIDER_CAPABILITY_REQUIRED"]
+      .includes(message)) {
+      response.status(403).json({ error: { code: message } });
+    } else if (message === "PROVIDER_CONFIGURATION_ID_CONFLICT") {
+      response.status(409).json({ error: { code: message } });
+    } else if (message.endsWith("_REQUIRED") || message.endsWith("_INVALID")) {
+      response.status(400).json({ error: { code: message } });
+    } else {
+      response.status(503).json({ error: { code: "PROVIDER_ADMINISTRATION_UNAVAILABLE" } });
+    }
+  };
+  app.use((request, response, next) => {
+    const supplied = request.header("X-Request-Id")?.trim();
+    const requestId = supplied && /^[A-Za-z0-9._:-]{1,128}$/.test(supplied) ? supplied : randomUUID();
+    const startedAt = dependencies.nowMs?.() ?? Date.now();
+    response.set("X-Request-Id", requestId);
+    response.on("finish", () => {
+      if (!dependencies.requestLogger) return;
+      try {
+        dependencies.requestLogger({
+          requestId,
+          method: request.method,
+          path: request.path,
+          status: response.statusCode,
+          durationMs: Math.max(0, (dependencies.nowMs?.() ?? Date.now()) - startedAt),
+        });
+      } catch {
+        // Logging must never change request behavior.
+      }
+    });
+    next();
+  });
+  app.use((_request, response, next) => {
+    response.set({
+      "X-Content-Type-Options": "nosniff",
+      "X-Frame-Options": "DENY",
+      "Referrer-Policy": "no-referrer",
+      "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=()",
+      "Content-Security-Policy": [
+        "default-src 'self'", "base-uri 'self'", "frame-ancestors 'none'",
+        "form-action 'self'", "img-src 'self' data:", "connect-src 'self'",
+        "style-src 'self' 'unsafe-inline'", "script-src 'self' 'unsafe-inline'",
+      ].join("; "),
+    });
+    next();
+  });
   app.use(express.json({ limit: "1mb" }));
+
+  const adminRateLimit = dependencies.adminRateLimit ?? { maxPerMinute: 120 };
+  if (!Number.isSafeInteger(adminRateLimit.maxPerMinute) || adminRateLimit.maxPerMinute < 1) {
+    throw new Error("ADMIN_RATE_LIMIT_INVALID");
+  }
+  if (dependencies.credentialAuthenticator) {
+    let adminRateWindows = new Map<string, { startedAt: number; count: number }>();
+    let adminRateGenerationStartedAt = 0;
+    app.use(
+      "/api/v1/admin",
+      createAuthenticationGuard(dependencies.credentialAuthenticator),
+      (_request, response, next) => {
+        const now = adminRateLimit.now?.() ?? Date.now();
+        if (adminRateGenerationStartedAt === 0 || now - adminRateGenerationStartedAt >= 60_000) {
+          adminRateGenerationStartedAt = now;
+          adminRateWindows = new Map();
+        }
+        const principal = response.locals.fusePrincipal;
+        const key = `${principal.organizationId}:${principal.principalType}:${principal.principalId}`;
+        const window = adminRateWindows.get(key) ?? { startedAt: now, count: 0 };
+        window.count += 1;
+        adminRateWindows.set(key, window);
+        if (window.count > adminRateLimit.maxPerMinute) {
+          disableCaching(response);
+          response.set("Retry-After", String(Math.max(1, Math.ceil((window.startedAt + 60_000 - now) / 1_000))));
+          response.status(429).json({ error: { code: "RATE_LIMIT_EXCEEDED" } });
+          return;
+        }
+        next();
+      },
+    );
+  }
 
   app.get("/", (_request, response) => {
     response.type("html").send(renderLandingPage());
   });
 
   app.get("/health", (_request, response) => {
+    disableCaching(response);
     response.json({ ok: true, service: "fuse" });
+  });
+
+  app.get("/ready", async (_request, response) => {
+    disableCaching(response);
+    try {
+      const checks = dependencies.readiness ? await dependencies.readiness() : {};
+      const ready = Object.values(checks).every(Boolean);
+      response.status(ready ? 200 : 503).json({ ok: ready, service: "fuse", checks });
+    } catch {
+      response.status(503).json({ ok: false, service: "fuse", error: "DEPENDENCY_UNAVAILABLE" });
+    }
   });
 
   app.get("/desk", (_request, response) => {
     response.type("html").send(renderControlDesk());
+  });
+
+  app.get("/console", (_request, response) => {
+    response.type("html").send(renderOperatorConsole());
   });
 
   if (dependencies.credentialAuthenticator) {
@@ -421,6 +546,50 @@ export function createFuseApp(dependencies: AppDependencies) {
           } else {
             response.status(503).json({ error: { code: "IDENTITY_ADMINISTRATION_UNAVAILABLE" } });
           }
+        }
+      },
+    );
+  }
+
+  if (dependencies.credentialAuthenticator && dependencies.providerAdministration) {
+    app.post(
+      "/api/v1/admin/providers",
+      createCapabilityGuard(dependencies.credentialAuthenticator, "providers:write"),
+      async (request, response) => {
+        disableCaching(response);
+        const requestId = request.header("X-Request-Id")?.trim();
+        if (!requestId) {
+          response.status(400).json({ error: { code: "REQUEST_ID_REQUIRED" } });
+          return;
+        }
+        const parsed = providerConfigurationSchema.safeParse(request.body);
+        if (!parsed.success) {
+          response.status(400).json({ error: { code: "INVALID_PROVIDER_CONFIGURATION" } });
+          return;
+        }
+        try {
+          const provider = await dependencies.providerAdministration!.configure(
+            response.locals.fusePrincipal,
+            { ...parsed.data, requestId },
+          );
+          response.status(201).json({ provider });
+        } catch (error) {
+          handleProviderError(error, response);
+        }
+      },
+    );
+    app.get(
+      "/api/v1/admin/providers",
+      createCapabilityGuard(dependencies.credentialAuthenticator, "providers:read"),
+      async (_request, response) => {
+        disableCaching(response);
+        try {
+          const providers = await dependencies.providerAdministration!.list(
+            response.locals.fusePrincipal,
+          );
+          response.json({ providers });
+        } catch (error) {
+          handleProviderError(error, response);
         }
       },
     );
@@ -781,6 +950,7 @@ export function createFuseApp(dependencies: AppDependencies) {
             mandateId,
             agentId: principal.principalId,
             agentCapabilities: [...principal.capabilities],
+            requestedModel: parsed.data.model,
             inputTokens: dependencies.estimateInputTokens(parsed.data.messages),
             maxOutputTokens: parsed.data.max_tokens,
             messages: parsed.data.messages,
@@ -916,6 +1086,10 @@ export function createFuseApp(dependencies: AppDependencies) {
       return;
     }
     if (message === "IDEMPOTENCY_CONFLICT") {
+      response.status(409).json({ error: { code: message } });
+      return;
+    }
+    if (message === "REQUESTED_MODEL_MISMATCH") {
       response.status(409).json({ error: { code: message } });
       return;
     }

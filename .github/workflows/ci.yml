@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Test and build
+        run: npm run check
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+      - name: Scan for high-confidence credential material
+        shell: bash
+        run: |
+          pattern='sk-(ant-api03-|or-v1-)|-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----'
+          if ! printf '%s%s\n' 'sk-ant-' 'api03-scan-self-test' | grep -Eq "$pattern"; then
+            echo "Credential scanner self-test failed"
+            exit 1
+          fi
+          set +e
+          git grep -nEI -- "$pattern" -- . ':(exclude).github/workflows/ci.yml'
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
+            echo "Potential credential material detected"
+            exit 1
+          fi
+          if [ "$status" -ne 1 ]; then
+            echo "Credential scanner failed with status $status"
+            exit "$status"
+          fi

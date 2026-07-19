@@ -15,6 +15,7 @@ export interface ControlledInferenceInput {
   mandateId: string;
   agentId: string;
   agentCapabilities: ApiCapability[];
+  requestedModel?: string;
   inputTokens: number;
   maxOutputTokens: number;
   messages: CompletionRequest["messages"];
@@ -71,39 +72,51 @@ export interface InferenceExecutionStore {
   }): Promise<void>;
 }
 
+export interface ProviderExecutionBinding {
+  provider: InferenceProvider;
+  providerName: string;
+  model: string;
+  price: TokenPrice;
+  requireProviderCost?: boolean;
+  requireProviderModelMatch?: boolean;
+}
+
+type InferenceExecutionConfig = {
+  store: InferenceExecutionStore;
+  now?: () => string;
+} & (
+  | ProviderExecutionBinding
+  | { resolveProvider: (organizationId: string) => Promise<ProviderExecutionBinding> }
+);
+
 export class InferenceExecutionService {
-  constructor(private readonly config: {
-    provider: InferenceProvider;
-    store: InferenceExecutionStore;
-    providerName: string;
-    model: string;
-    price: TokenPrice;
-    requireProviderCost?: boolean;
-    requireProviderModelMatch?: boolean;
-    now?: () => string;
-  }) {}
+  constructor(private readonly config: InferenceExecutionConfig) {}
 
   async execute(input: ControlledInferenceInput): Promise<AdmissionResult> {
+    const binding = await this.providerBinding(input.organizationId);
+    if (input.requestedModel !== undefined && input.requestedModel !== binding.model) {
+      throw new Error("REQUESTED_MODEL_MISMATCH");
+    }
     const estimatedCostAtomic = calculateMaximumCostMicros({
       inputTokens: input.inputTokens,
       maxOutputTokens: input.maxOutputTokens,
-    }, this.config.price);
+    }, binding.price);
     const admission = await this.config.store.admitInference({
       ...input,
-      provider: this.config.providerName,
-      model: this.config.model,
+      provider: binding.providerName,
+      model: binding.model,
       estimatedCostAtomic,
-      requestFingerprint: this.requestFingerprint(input),
+      requestFingerprint: this.requestFingerprint(input, binding),
       decidedAt: this.now(),
     });
     if (admission.status !== "execute") return admission;
 
     let response: ProviderResult;
     try {
-      response = await this.config.provider.complete({
+      response = await binding.provider.complete({
         requestId: input.requestId,
         childId: input.agentId,
-        model: this.config.model,
+        model: binding.model,
         inputTokens: input.inputTokens,
         maxOutputTokens: input.maxOutputTokens,
         messages: input.messages,
@@ -120,14 +133,14 @@ export class InferenceExecutionService {
 
     let completed: CompletionPersistenceResult;
     try {
-      if (this.config.requireProviderModelMatch && response.providerModel !== this.config.model) {
+      if (binding.requireProviderModelMatch && response.providerModel !== binding.model) {
         throw new Error("PROVIDER_MODEL_MISMATCH");
       }
-      if (this.config.requireProviderCost && response.providerCostUsd === undefined) {
+      if (binding.requireProviderCost && response.providerCostUsd === undefined) {
         throw new Error("PROVIDER_COST_MISSING");
       }
       const actualCostAtomic = response.providerCostUsd === undefined
-        ? calculateCostMicros(response.usage, this.config.price)
+        ? calculateCostMicros(response.usage, binding.price)
         : usdToMicros(response.providerCostUsd);
       completed = await this.config.store.completeInference({
         requestId: input.requestId,
@@ -157,17 +170,26 @@ export class InferenceExecutionService {
     return { status: "completed", decision: admission.decision, ...persisted };
   }
 
-  private requestFingerprint(input: ControlledInferenceInput): string {
+  private requestFingerprint(
+    input: ControlledInferenceInput,
+    binding: ProviderExecutionBinding,
+  ): string {
     return createHash("sha256").update(JSON.stringify({
       organizationId: input.organizationId,
       mandateId: input.mandateId,
       agentId: input.agentId,
-      provider: this.config.providerName,
-      model: this.config.model,
+      provider: binding.providerName,
+      model: binding.model,
+      requestedModel: input.requestedModel ?? binding.model,
       inputTokens: input.inputTokens,
       maxOutputTokens: input.maxOutputTokens,
       messages: input.messages,
     })).digest("hex");
+  }
+
+  private providerBinding(organizationId: string): Promise<ProviderExecutionBinding> {
+    if ("resolveProvider" in this.config) return this.config.resolveProvider(organizationId);
+    return Promise.resolve(this.config);
   }
 
   private now(): string {

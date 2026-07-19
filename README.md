@@ -86,7 +86,7 @@ The runtime supports two explicitly selected provider adapters through `FUSE_PRO
 
 Both adapters feed the same internal `InferenceProvider` contract. OpenRouter-mediated Claude traffic must be described as Claude inference through OpenRouter, not as direct official Anthropic API traffic. The gateway-facing route remains OpenAI-compatible so calling agents do not need to speak either upstream wire format.
 
-When PostgreSQL-backed controlled inference is configured, `/v1/chat/completions` requires an authenticated agent credential, `inference:invoke`, a tenant-scoped mandate, and an idempotency key. Admission and maximum-cost reservation commit before the provider call. A denial records decision evidence with a zero reservation and does not call the provider or payment guard. In `dry_run`, hard authorization failures still deny; policy-limit violations are recorded as `wouldOutcome: DENY` but the real provider request proceeds, so it is reserved and reconciled like any other billable execution. Completed requests replay from stored output; changed payloads under the same key are rejected.
+When PostgreSQL-backed controlled inference is configured, `/v1/chat/completions` requires an authenticated agent credential, `inference:invoke`, a tenant-scoped mandate, and an idempotency key. The requested model must exactly match the tenant's active provider configuration; mismatches are rejected before admission or provider dispatch. Admission and maximum-cost reservation commit before the provider call. A denial records decision evidence with a zero reservation and does not call the provider or payment guard. In `dry_run`, hard authorization failures still deny; policy-limit violations are recorded as `wouldOutcome: DENY` but the real provider request proceeds, so it is reserved and reconciled like any other billable execution. Completed requests replay from stored output; changed payloads under the same key are rejected.
 
 Fuse does not claim exactly-once upstream execution across the provider-success/database-commit crash boundary. An `executing` request is never automatically dispatched again: retries receive `REQUEST_IN_PROGRESS` during a five-minute lease, then move the execution and non-terminal mandate into reconciliation hold for operator review. This is an at-most-once retry posture, not proof that the upstream provider cannot bill a request whose local completion commit was lost.
 
@@ -231,6 +231,20 @@ A service account with the required capability can then call:
 
 Administrative routes require an `admin` service-account role in addition to the route capability. Operators and viewers are limited to role-compatible runtime/read capabilities at credential issuance and authentication. All endpoints derive the organization from the authenticated service account, require `X-Request-Id` for audit causation, return no-store responses, and never accept an organization identifier from the request body.
 
+### Customer Zero control mode
+
+The hosted control plane now supports organization-scoped provider configuration instead of requiring one deployment-wide provider credential:
+
+- `FUSE_PROVIDER_MODE=tenant` selects organization-scoped execution explicitly. Production defaults to tenant mode and fails startup when `DATABASE_URL`, the active key ID, or its key is missing; legacy mode requires an explicit production opt-in.
+- Provider credentials use AES-256-GCM with organization, provider, credential version, and key identity bound as authenticated context.
+- Credential rotation atomically replaces the prior ciphertext and increments its version; a key ring allows controlled KEK rotation.
+- `POST /api/v1/admin/providers` requires an admin service account with `providers:write`.
+- `GET /api/v1/admin/providers` returns configuration metadata only and never returns provider secrets.
+- Controlled inference resolves the provider, model, tariff, and credential from the authenticated agent's organization before policy admission.
+- [`/console`](https://fuse-agent-control-plane.vercel.app/console) is the authenticated operator surface for provider setup, agent credentials, policies, mandates, decisions, and reconciliation.
+
+The console keeps the service credential only in page memory and clears it on reload or sign-out. Provider API keys are submitted once to the protected configuration endpoint, cleared from the form after success, and are never returned to the browser.
+
 ### Versioned policy control plane
 
 The next custody-agnostic slice adds a tenant-scoped policy substrate beside the unchanged public hackathon flow:
@@ -259,6 +273,16 @@ Administrative policy routes are:
 `policies:write` and `mandates:admin` are admin-only service-account capabilities. `policies:read` is available to admin, operator, and viewer service accounts. Policy versions and decisions are append-only through the application API; database-role or trigger enforcement against direct `UPDATE`/`DELETE` remains pending.
 
 With `DATABASE_URL` configured, authenticated `/v1/chat/completions` requests use policy admission, transactional reservation, provider invocation, and usage reconciliation. OpenRouter cannot start without that controlled path. The no-database direct-Anthropic route remains a legacy compatibility mode and is not part of the policy-control evidence.
+
+The control-plane operating contract is:
+
+- `/health` is process liveness; `/ready` verifies the configured PostgreSQL dependency and returns `503` without database error details when unavailable.
+- `FUSE_ADMIN_RATE_LIMIT_PER_MINUTE` defaults to 120 administrative requests per authenticated organization/principal per warm instance. Authentication runs before the bucket is consumed, so anonymous callers and unrelated tenants cannot exhaust an operator's allowance; forwarding headers are not trusted. Policy-controlled inference has a separate durable per-mandate request limit. A platform/WAF or shared durable limiter remains required for global abuse control across serverless instances.
+- Run `npm run migrate:provider-config` with production `DATABASE_URL` and the provider credential key ring before activating tenant-provider mode. Runtime bootstrap remains an idempotent fallback, not the preferred deployment migration path.
+- Keep every previous `FUSE_PROVIDER_CREDENTIAL_KEY_<ID>` available until affected rows have been rewritten under the current active key. Provider keys are write-only through the API and are never returned.
+- Neon backup operations must use the provider's point-in-time restore or branch restore. Verify a restore into an isolated branch before each release that changes persistence, record the restored schema version, then destroy the isolated branch. A backup is not treated as verified until that restore completes.
+- Application rollback uses Vercel promotion of the last known-good deployment or a Git revert. Provider schema v1 is additive; do not delete its table or retire old KEKs during application rollback. After rollback, smoke `/health`, `/ready`, authenticated identity, public persisted state, and reconciliation visibility.
+- `npm run smoke:production` performs the non-destructive public and auth-boundary smoke suite. CI runs tests, TypeScript build, production dependency audit, and a high-confidence credential-material scan. The separate `Neon provider concurrency` pull-request gate uses two independent one-connection pools against an isolated schema-only Neon branch to verify cross-instance rotation and conflicting-ID races.
 
 The repository also contains an independently deployable signer boundary and operator tools:
 

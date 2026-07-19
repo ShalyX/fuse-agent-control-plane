@@ -7,6 +7,7 @@ import { MemoryStateStore } from "../src/persistence/store.js";
 import type { CredentialAuthenticator } from "../src/http/auth.js";
 import type { CredentialAdministrationPort } from "../src/identity/credentialAdministration.js";
 import type { PolicyAdministrationPort } from "../src/policy/policyAdministration.js";
+import type { ProviderAdministrationPort } from "../src/providers/providerAdministration.js";
 
 class FakeProvider implements InferenceProvider {
   calls = 0;
@@ -241,10 +242,13 @@ describe("POST /v1/chat/completions", () => {
     });
     const landing = await request(app).get("/");
     expect(landing.status).toBe(200);
-    expect(landing.text).toContain("Programmable spend control for autonomous agents");
+    expect(landing.text).toContain("Fuse admits or denies agent inference");
     expect(landing.text).toContain("/api/runs/demo-mandate");
     expect(landing.text).toContain("testnet.arcscan.app/address/0xf736609aa15b255322df4d5dfe6ea66b59b7c663");
     expect(landing.text).toContain("Historical paid run");
+    expect(landing.text).toContain('href="/console"');
+    expect(landing.text).toContain("Settlement signer remains closed");
+    expect(landing.text).not.toContain("awaiting API access");
     expect(landing.text).not.toContain("fake");
   });
 
@@ -539,6 +543,202 @@ describe("POST /v1/chat/completions", () => {
       "policy-bind:2",
       "reconcile:held-request:settle",
     ]);
+  });
+
+  it("configures and lists tenant provider metadata without returning the API key", async () => {
+    const calls: string[] = [];
+    const credentialAuthenticator: CredentialAuthenticator = {
+      authenticateToken: async () => ({
+        principalType: "service_account", principalId: "admin-1", organizationId: "org-customer-zero",
+        credentialId: "credential-1", capabilities: ["providers:read", "providers:write"], role: "admin",
+      }),
+    };
+    const summary = {
+      id: "primary", organizationId: "org-customer-zero", provider: "anthropic" as const,
+      model: "claude-sonnet-4-6", inputUsdPerMillion: "3.00",
+      outputUsdPerMillion: "15.00", credentialVersion: 1, status: "active" as const,
+      updatedAt: "2026-07-19T16:00:00.000Z",
+    };
+    const providerAdministration: ProviderAdministrationPort = {
+      async configure(principal, input) {
+        calls.push(`${principal.organizationId}:${input.configId}:${input.apiKey}:${input.requestId}`);
+        return summary;
+      },
+      async list(principal) {
+        calls.push(`list:${principal.organizationId}`);
+        return [summary];
+      },
+    };
+    const app = createFuseApp({
+      provider: new FakeProvider(), paymentGuard: fakePaymentGuard, estimateInputTokens: () => 1000,
+      credentialAuthenticator, providerAdministration,
+    });
+    const headers = { Authorization: "Bearer provider-admin", "X-Request-Id": "request:provider" };
+
+    const created = await request(app).post("/api/v1/admin/providers").set(headers).send({
+      configId: "primary", provider: "anthropic", model: "claude-sonnet-4-6",
+      apiKey: "sk-ant-customer-zero",
+      inputUsdPerMillion: "3.00", outputUsdPerMillion: "15.00",
+    });
+    expect(created.status).toBe(201);
+    expect(created.body).toEqual({ provider: summary });
+    expect(created.text).not.toContain("sk-ant-customer-zero");
+    const customEndpoint = await request(app).post("/api/v1/admin/providers").set(headers).send({
+      configId: "primary", provider: "anthropic", model: "claude-sonnet-4-6",
+      apiKey: "sk-ant-customer-zero", baseUrl: "https://attacker.example",
+      inputUsdPerMillion: "3.00", outputUsdPerMillion: "15.00",
+    });
+    expect(customEndpoint.status).toBe(400);
+    expect(customEndpoint.body).toEqual({ error: { code: "INVALID_PROVIDER_CONFIGURATION" } });
+    const listed = await request(app).get("/api/v1/admin/providers").set("Authorization", "Bearer provider-admin");
+    expect(listed.status).toBe(200);
+    expect(listed.body).toEqual({ providers: [summary] });
+    expect(calls).toEqual([
+      "org-customer-zero:primary:sk-ant-customer-zero:request:provider",
+      "list:org-customer-zero",
+    ]);
+  });
+
+  it("sanitizes provider administration storage failures", async () => {
+    const credentialAuthenticator: CredentialAuthenticator = {
+      authenticateToken: async () => ({
+        credentialId: "credential-provider-admin", principalType: "service_account",
+        principalId: "provider-admin", organizationId: "org-customer-zero",
+        capabilities: ["providers:read", "providers:write"], role: "admin",
+      }),
+    };
+    const providerAdministration: ProviderAdministrationPort = {
+      async configure() { throw new Error("postgres://user:password@private-host/fuse"); },
+      async list() { throw new Error("postgres://user:password@private-host/fuse"); },
+    };
+    const app = createFuseApp({
+      provider: new FakeProvider(), paymentGuard: fakePaymentGuard, estimateInputTokens: () => 1,
+      credentialAuthenticator, providerAdministration,
+    });
+    const failed = await request(app).post("/api/v1/admin/providers")
+      .set("Authorization", "Bearer provider-admin")
+      .set("X-Request-Id", "request-provider-failure")
+      .send({
+        configId: "primary", provider: "anthropic", model: "claude-sonnet-4-6",
+        apiKey: "sk-ant-customer-zero", inputUsdPerMillion: "3.00", outputUsdPerMillion: "15.00",
+      });
+    expect(failed.status).toBe(503);
+    expect(failed.body).toEqual({ error: { code: "PROVIDER_ADMINISTRATION_UNAVAILABLE" } });
+    expect(failed.text).not.toContain("postgres");
+    expect(failed.text).not.toContain("password");
+  });
+
+  it("serves an authenticated operator console without demo metrics or fake actions", async () => {
+    const app = createFuseApp({
+      provider: new FakeProvider(), paymentGuard: fakePaymentGuard, estimateInputTokens: () => 1000,
+    });
+    const consolePage = await request(app).get("/console");
+    expect(consolePage.status).toBe(200);
+    expect(consolePage.text).toContain("Fuse Operator Console");
+    expect(consolePage.text).toContain("Provider boundary");
+    expect(consolePage.text).toContain("stays only in this page's memory");
+    expect(consolePage.text).not.toContain("sessionStorage");
+    expect(consolePage.text).toContain("/api/v1/admin/providers");
+    expect(consolePage.text).toContain("/api/v1/admin/policies");
+    expect(consolePage.text).toContain('id="createMandate"');
+    expect(consolePage.text).toContain('id="assignMandateAgent"');
+    expect(consolePage.text).toContain('id="activateMandate"');
+    expect(consolePage.text).not.toContain("Create and activate");
+    expect(consolePage.text).not.toContain("Simulate");
+    expect(consolePage.text).not.toContain("fake");
+  });
+
+  it("sets defensive browser headers on public and operator surfaces", async () => {
+    const app = createFuseApp({
+      provider: new FakeProvider(), paymentGuard: fakePaymentGuard, estimateInputTokens: () => 1000,
+    });
+    for (const path of ["/", "/desk", "/console", "/health"]) {
+      const response = await request(app).get(path);
+      expect(response.headers["x-content-type-options"]).toBe("nosniff");
+      expect(response.headers["x-frame-options"]).toBe("DENY");
+      expect(response.headers["referrer-policy"]).toBe("no-referrer");
+      expect(response.headers["permissions-policy"]).toContain("camera=()");
+    }
+    const health = await request(app).get("/health");
+    expect(health.headers["cache-control"]).toContain("no-store");
+  });
+
+  it("emits structured request metadata without logging credentials or query values", async () => {
+    const events: Array<Record<string, unknown>> = [];
+    const app = createFuseApp({
+      provider: new FakeProvider(), paymentGuard: fakePaymentGuard, estimateInputTokens: () => 1,
+      requestLogger: (event) => events.push(event),
+      nowMs: () => 10_000,
+    });
+    const response = await request(app).get("/health?token=sensitive-query")
+      .set("Authorization", "Bearer sensitive-credential")
+      .set("X-Request-Id", "request-log-test");
+    expect(response.status).toBe(200);
+    expect(response.headers["x-request-id"]).toBe("request-log-test");
+    expect(events).toEqual([{
+      requestId: "request-log-test", method: "GET", path: "/health", status: 200, durationMs: 0,
+    }]);
+    expect(JSON.stringify(events)).not.toContain("sensitive");
+    expect(JSON.stringify(events)).not.toContain("Authorization");
+  });
+
+  it("reports dependency readiness without exposing database errors", async () => {
+    const readyApp = createFuseApp({
+      provider: new FakeProvider(), paymentGuard: fakePaymentGuard,
+      estimateInputTokens: () => 1, readiness: async () => ({ database: true }),
+    });
+    const ready = await request(readyApp).get("/ready");
+    expect(ready.status).toBe(200);
+    expect(ready.body).toEqual({ ok: true, service: "fuse", checks: { database: true } });
+    expect(ready.headers["cache-control"]).toContain("no-store");
+
+    const incompleteApp = createFuseApp({
+      provider: new FakeProvider(), paymentGuard: fakePaymentGuard,
+      estimateInputTokens: () => 1, readiness: async () => ({ database: false }),
+    });
+    const incomplete = await request(incompleteApp).get("/ready");
+    expect(incomplete.status).toBe(503);
+    expect(incomplete.body).toEqual({ ok: false, service: "fuse", checks: { database: false } });
+
+    const unavailableApp = createFuseApp({
+      provider: new FakeProvider(), paymentGuard: fakePaymentGuard,
+      estimateInputTokens: () => 1, readiness: async () => { throw new Error("postgres://secret"); },
+    });
+    const unavailable = await request(unavailableApp).get("/ready");
+    expect(unavailable.status).toBe(503);
+    expect(unavailable.body).toEqual({ ok: false, service: "fuse", error: "DEPENDENCY_UNAVAILABLE" });
+    expect(unavailable.text).not.toContain("postgres");
+  });
+
+  it("rate limits administrative traffic per authenticated principal without cross-tenant denial", async () => {
+    const credentialAuthenticator: CredentialAuthenticator = {
+      authenticateToken: async (token) => token === "tenant-a" || token === "tenant-b" ? ({
+        principalType: "service_account",
+        principalId: `admin-${token}`,
+        organizationId: `org-${token}`,
+        credentialId: `credential-${token}`,
+        capabilities: ["providers:read"],
+        role: "admin",
+      }) : null,
+    };
+    const app = createFuseApp({
+      provider: new FakeProvider(), paymentGuard: fakePaymentGuard,
+      estimateInputTokens: () => 1,
+      credentialAuthenticator,
+      adminRateLimit: { maxPerMinute: 2, now: () => 1_000 },
+    });
+    expect((await request(app).get("/api/v1/admin/providers")).status).toBe(401);
+    expect((await request(app).get("/api/v1/admin/providers")).status).toBe(401);
+    expect((await request(app).get("/api/v1/admin/providers").set("Authorization", "Bearer tenant-a")).status).toBe(404);
+    expect((await request(app).get("/api/v1/admin/providers").set("Authorization", "Bearer tenant-a")).status).toBe(404);
+    const limited = await request(app).get("/api/v1/admin/providers")
+      .set("Authorization", "Bearer tenant-a");
+    expect(limited.status).toBe(429);
+    expect(limited.body).toEqual({ error: { code: "RATE_LIMIT_EXCEEDED" } });
+    expect(limited.text).not.toContain("tenant-a");
+    expect(limited.headers["retry-after"]).toBe("60");
+    expect((await request(app).get("/api/v1/admin/providers")
+      .set("Authorization", "Bearer tenant-b")).status).toBe(404);
   });
 
   it("requires idempotency and child capability headers", async () => {
