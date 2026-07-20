@@ -12,6 +12,25 @@ export interface PolicyLimits {
   maxOutputTokens: number;
 }
 
+export interface WorkloadClassShadowPolicy {
+  classPriorWindowSpendAtomic: bigint;
+  windowSeconds: number;
+  targetMinimumObservations: number;
+  siblingMinimumForScoring: number;
+  siblingMinimumForIntervention: number;
+  confidenceConstant: number;
+  divergenceThresholdBps: number;
+}
+
+export interface WorkloadClassPolicy {
+  id: string;
+  maxCostPerCallAtomic: bigint;
+  maxInvocationsPerBranch: number;
+  aggregateBudgetAtomic: bigint;
+  minimumInputTokens: number;
+  shadow: WorkloadClassShadowPolicy | null;
+}
+
 export interface PolicyVersion {
   id: string;
   organizationId: string;
@@ -21,6 +40,7 @@ export interface PolicyVersion {
   allowedModels: string[];
   requiredCapability: ApiCapability;
   limits: PolicyLimits;
+  workloadClasses?: WorkloadClassPolicy[];
   createdAt: string;
 }
 
@@ -38,7 +58,28 @@ export type PolicyReasonCode =
   | "MANDATE_BUDGET_EXCEEDED"
   | "RATE_LIMIT_EXCEEDED"
   | "INPUT_TOKEN_LIMIT_EXCEEDED"
-  | "OUTPUT_TOKEN_LIMIT_EXCEEDED";
+  | "OUTPUT_TOKEN_LIMIT_EXCEEDED"
+  | "WORKLOAD_CLASS_REQUIRED"
+  | "BRANCH_NOT_AUTHORIZED"
+  | "BRANCH_EXPIRED"
+  | "BRANCH_BUDGET_EXCEEDED"
+  | "WORKLOAD_CLASS_NOT_ALLOWED"
+  | "WORKLOAD_CLASS_PER_CALL_LIMIT_EXCEEDED"
+  | "WORKLOAD_CLASS_INVOCATION_LIMIT_EXCEEDED"
+  | "WORKLOAD_CLASS_BUDGET_EXCEEDED"
+  | "WORKLOAD_CLASS_SHAPE_MISMATCH";
+
+export interface WorkloadEvaluationInput {
+  branchId: string;
+  workloadClass: string;
+  branchAuthorized: boolean;
+  branchMaximumAtomic: bigint;
+  branchSpentAtomic: bigint;
+  branchExpiresAt: string | null;
+  classAuthorized: boolean;
+  classInvocationCount: number;
+  classSpentAtomic: bigint;
+}
 
 export interface PolicyEvaluationInput {
   now: string;
@@ -56,6 +97,7 @@ export interface PolicyEvaluationInput {
   mandateSpentAtomic: bigint;
   mandateMaximumAtomic: bigint;
   requestCountLastMinute: number;
+  workload?: WorkloadEvaluationInput;
 }
 
 export interface PolicyDecisionResult {
@@ -80,6 +122,7 @@ export function validatePolicy(candidate: PolicyVersion): void {
   }
   validateUniqueList(candidate.allowedProviders, "POLICY_PROVIDER");
   validateUniqueList(candidate.allowedModels, "POLICY_MODEL");
+  validateWorkloadClasses(candidate.workloadClasses ?? []);
   const atomicLimits: Array<[keyof PolicyLimits, bigint]> = [
     ["maxPerCallAtomic", candidate.limits.maxPerCallAtomic],
     ["maxHourlyAtomic", candidate.limits.maxHourlyAtomic],
@@ -142,6 +185,42 @@ export function evaluatePolicy(
   if (input.maxOutputTokens > policy.limits.maxOutputTokens) {
     reasons.push("OUTPUT_TOKEN_LIMIT_EXCEEDED");
   }
+  if ((policy.workloadClasses?.length ?? 0) > 0) {
+    if (!input.workload) {
+      reasons.push("WORKLOAD_CLASS_REQUIRED");
+    } else if (!input.workload.branchAuthorized) {
+      reasons.push("BRANCH_NOT_AUTHORIZED");
+    } else {
+      if (input.workload.branchExpiresAt !== null
+        && Date.parse(input.now) >= Date.parse(input.workload.branchExpiresAt)) {
+        reasons.push("BRANCH_EXPIRED");
+      }
+      if (input.workload.branchSpentAtomic + input.estimatedCostAtomic
+        > input.workload.branchMaximumAtomic) {
+        reasons.push("BRANCH_BUDGET_EXCEEDED");
+      }
+      if (!input.workload.classAuthorized
+        || !policy.workloadClasses!.some(({ id }) => id === input.workload!.workloadClass)) {
+        reasons.push("WORKLOAD_CLASS_NOT_ALLOWED");
+      } else {
+      const workloadClass = policy.workloadClasses!
+        .find(({ id }) => id === input.workload!.workloadClass)!;
+      if (input.estimatedCostAtomic > workloadClass.maxCostPerCallAtomic) {
+        reasons.push("WORKLOAD_CLASS_PER_CALL_LIMIT_EXCEEDED");
+      }
+      if (input.workload.classInvocationCount >= workloadClass.maxInvocationsPerBranch) {
+        reasons.push("WORKLOAD_CLASS_INVOCATION_LIMIT_EXCEEDED");
+      }
+      if (input.workload.classSpentAtomic + input.estimatedCostAtomic
+        > workloadClass.aggregateBudgetAtomic) {
+        reasons.push("WORKLOAD_CLASS_BUDGET_EXCEEDED");
+      }
+      if (input.inputTokens < workloadClass.minimumInputTokens) {
+        reasons.push("WORKLOAD_CLASS_SHAPE_MISMATCH");
+      }
+      }
+    }
+  }
 
   const wouldOutcome: PolicyOutcome = reasons.length === 0 ? "ALLOW" : "DENY";
   const hardDenial = reasons.some((reason) => [
@@ -150,6 +229,15 @@ export function evaluatePolicy(
     "AGENT_NOT_AUTHORIZED",
     "CAPABILITY_MISSING",
     "MANDATE_BUDGET_EXCEEDED",
+    "WORKLOAD_CLASS_REQUIRED",
+    "BRANCH_NOT_AUTHORIZED",
+    "BRANCH_EXPIRED",
+    "BRANCH_BUDGET_EXCEEDED",
+    "WORKLOAD_CLASS_NOT_ALLOWED",
+    "WORKLOAD_CLASS_PER_CALL_LIMIT_EXCEEDED",
+    "WORKLOAD_CLASS_INVOCATION_LIMIT_EXCEEDED",
+    "WORKLOAD_CLASS_BUDGET_EXCEEDED",
+    "WORKLOAD_CLASS_SHAPE_MISMATCH",
   ].includes(reason));
   if (hardDenial) {
     return { outcome: "DENY", wouldOutcome, enforced: true, reasonCodes: reasons };
@@ -165,6 +253,40 @@ function validateUniqueList(values: readonly string[], prefix: string): void {
     throw new Error(`${prefix}_REQUIRED`);
   }
   if (new Set(values).size !== values.length) throw new Error(`${prefix}_DUPLICATE`);
+}
+
+function validateWorkloadClasses(workloadClasses: readonly WorkloadClassPolicy[]): void {
+  const ids = workloadClasses.map(({ id }) => id);
+  if (ids.some((id) => !/^[a-z][a-z0-9_.-]{0,63}$/.test(id))) {
+    throw new Error("WORKLOAD_CLASS_ID_INVALID");
+  }
+  if (new Set(ids).size !== ids.length) throw new Error("WORKLOAD_CLASS_DUPLICATE");
+  for (const workloadClass of workloadClasses) {
+    if (workloadClass.maxCostPerCallAtomic <= 0n
+      || workloadClass.aggregateBudgetAtomic <= 0n
+      || workloadClass.aggregateBudgetAtomic < workloadClass.maxCostPerCallAtomic
+      || !Number.isSafeInteger(workloadClass.maxInvocationsPerBranch)
+      || workloadClass.maxInvocationsPerBranch < 1
+      || !Number.isSafeInteger(workloadClass.minimumInputTokens)
+      || workloadClass.minimumInputTokens < 0) {
+      throw new Error("WORKLOAD_CLASS_LIMIT_INVALID");
+    }
+    const shadow = workloadClass.shadow;
+    if (!shadow) continue;
+    const counts = [
+      shadow.windowSeconds,
+      shadow.targetMinimumObservations,
+      shadow.siblingMinimumForScoring,
+      shadow.siblingMinimumForIntervention,
+      shadow.confidenceConstant,
+      shadow.divergenceThresholdBps,
+    ];
+    if (shadow.classPriorWindowSpendAtomic <= 0n
+      || counts.some((value) => !Number.isSafeInteger(value) || value < 1)
+      || shadow.siblingMinimumForIntervention < shadow.siblingMinimumForScoring) {
+      throw new Error("WORKLOAD_CLASS_SHADOW_INVALID");
+    }
+  }
 }
 
 function validateEvaluation(input: PolicyEvaluationInput): void {

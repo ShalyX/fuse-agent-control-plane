@@ -19,6 +19,7 @@ import type {
 const completionSchema = z.object({
   model: z.string().min(1),
   max_tokens: z.number().int().positive().max(32_000),
+  workload_class: z.string().regex(/^[a-z][a-z0-9_.-]{0,63}$/).optional(),
   messages: z.array(z.object({
     role: z.enum(["system", "user", "assistant"]),
     content: z.string(),
@@ -74,6 +75,23 @@ const policyLimitsSchema = z.object({
   maxInputTokens: z.number().int().nonnegative().max(10_000_000),
   maxOutputTokens: z.number().int().nonnegative().max(10_000_000),
 }).strict();
+const workloadShadowSchema = z.object({
+  classPriorWindowSpendAtomic: positiveAtomicAmountSchema,
+  windowSeconds: z.number().int().positive().max(86_400),
+  targetMinimumObservations: z.number().int().positive().max(10_000),
+  siblingMinimumForScoring: z.number().int().positive().max(10_000),
+  siblingMinimumForIntervention: z.number().int().positive().max(10_000),
+  confidenceConstant: z.number().int().positive().max(10_000),
+  divergenceThresholdBps: z.number().int().positive().max(10_000_000),
+}).strict();
+const workloadClassSchema = z.object({
+  id: z.string().regex(/^[a-z][a-z0-9_.-]{0,63}$/),
+  maxCostPerCallAtomic: positiveAtomicAmountSchema,
+  maxInvocationsPerBranch: z.number().int().positive().max(1_000_000),
+  aggregateBudgetAtomic: positiveAtomicAmountSchema,
+  minimumInputTokens: z.number().int().nonnegative().max(10_000_000),
+  shadow: workloadShadowSchema.nullable(),
+}).strict();
 const policyPublishSchema = z.object({
   policyId: z.string().min(1).max(128),
   version: z.number().int().positive().max(1_000_000),
@@ -82,6 +100,7 @@ const policyPublishSchema = z.object({
   allowedModels: z.array(z.string().min(1).max(256)).min(1).max(1_000),
   requiredCapability: z.enum(API_CAPABILITIES),
   limits: policyLimitsSchema,
+  workloadClasses: z.array(workloadClassSchema).max(100).optional(),
 }).strict();
 const mandateCreateSchema = z.object({
   mandateId: z.string().min(1).max(128),
@@ -94,6 +113,14 @@ const mandateCreateSchema = z.object({
 }).strict();
 const mandateAssignmentSchema = z.object({
   agentId: z.string().min(1).max(128),
+}).strict();
+const mandateBranchSchema = z.object({
+  branchId: z.string().min(1).max(128),
+  parentBranchId: z.string().min(1).max(128).nullable(),
+  agentId: z.string().min(1).max(128),
+  allowedWorkloadClasses: z.array(z.string().regex(/^[a-z][a-z0-9_.-]{0,63}$/)).min(1).max(100),
+  maximumSpendAtomic: positiveAtomicAmountSchema,
+  expiresAt: z.string().datetime().nullable(),
 }).strict();
 const mandatePolicySchema = z.object({
   policyId: z.string().min(1).max(128),
@@ -135,6 +162,7 @@ type AppDependencies = {
     execute(input: ControlledInferenceInput): Promise<AdmissionResult>;
   };
   readiness?: () => Promise<Record<string, boolean>>;
+  workloadShadowEnabled?: boolean;
   adminRateLimit?: {
     maxPerMinute: number;
     now?: () => number;
@@ -216,15 +244,27 @@ export function createFuseApp(dependencies: AppDependencies) {
     } else if (databaseCode === "23505") {
       response.status(409).json({ error: { code: "POLICY_RESOURCE_CONFLICT" } });
     } else if (databaseCode === "23503" || message === "CONTROL_MANDATE_NOT_FOUND"
-      || message === "INFERENCE_EXECUTION_NOT_FOUND") {
+      || message === "INFERENCE_EXECUTION_NOT_FOUND" || message === "MANDATE_PARENT_BRANCH_NOT_FOUND") {
       response.status(404).json({ error: { code: message === "INFERENCE_EXECUTION_NOT_FOUND"
         ? "RECONCILIATION_CASE_NOT_FOUND" : "POLICY_RESOURCE_NOT_FOUND" } });
     } else if (message === "RECONCILIATION_CASE_NOT_OPEN"
       || message === "RECONCILIATION_RESOLUTION_CONFLICT") {
       response.status(409).json({ error: { code: message } });
     } else if (message.startsWith("CONTROL_MANDATE_TRANSITION_INVALID")
-      || message === "CONTROL_MANDATE_POLICY_CHANGE_REQUIRES_PAUSE") {
+      || [
+        "CONTROL_MANDATE_POLICY_CHANGE_REQUIRES_PAUSE",
+        "MANDATE_BRANCH_CHANGE_REQUIRES_PAUSE",
+        "MANDATE_BRANCH_WORKLOAD_CLASS_NOT_IN_POLICY",
+        "MANDATE_BRANCH_AGENT_NOT_ASSIGNED",
+        "MANDATE_PARENT_BRANCH_POLICY_MISMATCH",
+        "MANDATE_BRANCH_PARENT_AUTHORITY_EXCEEDED",
+        "MANDATE_BRANCH_BUDGET_EXCEEDS_MANDATE",
+        "MANDATE_BRANCH_PARENT_BUDGET_EXCEEDED",
+        "MANDATE_BRANCH_EXPIRY_EXCEEDS_MANDATE",
+        "MANDATE_BRANCH_PARENT_EXPIRY_EXCEEDED",
+      ].includes(message)) {
       response.status(409).json({ error: { code: message === "CONTROL_MANDATE_POLICY_CHANGE_REQUIRES_PAUSE"
+        || !message.startsWith("CONTROL_MANDATE_TRANSITION_INVALID")
         ? message : "MANDATE_TRANSITION_INVALID" } });
     } else if (message.endsWith("_REQUIRED") || message.endsWith("_INVALID")
       || message.endsWith("_DUPLICATE")) {
@@ -611,17 +651,47 @@ export function createFuseApp(dependencies: AppDependencies) {
           response.status(400).json({ error: { code: "INVALID_POLICY_REQUEST" } });
           return;
         }
+        if ((parsed.data.workloadClasses?.length ?? 0) > 0 && !dependencies.workloadShadowEnabled) {
+          response.status(409).json({ error: { code: "WORKLOAD_SHADOW_ROLLOUT_DISABLED" } });
+          return;
+        }
         try {
           await dependencies.policyAdministration!.publishPolicy(
             response.locals.fusePrincipal,
             {
-              ...parsed.data,
+              policyId: parsed.data.policyId,
+              version: parsed.data.version,
+              mode: parsed.data.mode,
+              allowedProviders: parsed.data.allowedProviders,
+              allowedModels: parsed.data.allowedModels,
+              requiredCapability: parsed.data.requiredCapability,
               limits: {
                 ...parsed.data.limits,
                 maxPerCallAtomic: BigInt(parsed.data.limits.maxPerCallAtomic),
                 maxHourlyAtomic: BigInt(parsed.data.limits.maxHourlyAtomic),
                 maxDailyAtomic: BigInt(parsed.data.limits.maxDailyAtomic),
               },
+              ...(parsed.data.workloadClasses ? {
+                workloadClasses: parsed.data.workloadClasses.map((workloadClass) => ({
+                  id: workloadClass.id,
+                  maxCostPerCallAtomic: BigInt(workloadClass.maxCostPerCallAtomic),
+                  maxInvocationsPerBranch: workloadClass.maxInvocationsPerBranch,
+                  aggregateBudgetAtomic: BigInt(workloadClass.aggregateBudgetAtomic),
+                  minimumInputTokens: workloadClass.minimumInputTokens,
+                  shadow: workloadClass.shadow ? {
+                    classPriorWindowSpendAtomic: BigInt(
+                      workloadClass.shadow.classPriorWindowSpendAtomic,
+                    ),
+                    windowSeconds: workloadClass.shadow.windowSeconds,
+                    targetMinimumObservations: workloadClass.shadow.targetMinimumObservations,
+                    siblingMinimumForScoring: workloadClass.shadow.siblingMinimumForScoring,
+                    siblingMinimumForIntervention:
+                      workloadClass.shadow.siblingMinimumForIntervention,
+                    confidenceConstant: workloadClass.shadow.confidenceConstant,
+                    divergenceThresholdBps: workloadClass.shadow.divergenceThresholdBps,
+                  } : null,
+                })),
+              } : {}),
               requestId,
             },
           );
@@ -686,6 +756,50 @@ export function createFuseApp(dependencies: AppDependencies) {
             { mandateId, agentId: parsed.data.agentId, requestId },
           );
           response.status(204).send();
+        } catch (error) {
+          handlePolicyError(error, response);
+        }
+      },
+    );
+
+    app.post(
+      "/api/v1/admin/mandates/:mandateId/branches",
+      createCapabilityGuard(dependencies.credentialAuthenticator, "mandates:admin"),
+      async (request, response) => {
+        disableCaching(response);
+        const requestId = request.header("X-Request-Id")?.trim();
+        const mandateIdParam = request.params["mandateId"];
+        const mandateId = typeof mandateIdParam === "string" ? mandateIdParam : mandateIdParam?.[0] ?? "";
+        const parsed = mandateBranchSchema.safeParse(request.body);
+        if (!requestId) {
+          response.status(400).json({ error: { code: "REQUEST_ID_REQUIRED" } });
+          return;
+        }
+        if (!mandateId || !parsed.success) {
+          response.status(400).json({ error: { code: "INVALID_MANDATE_BRANCH" } });
+          return;
+        }
+        if (!dependencies.workloadShadowEnabled) {
+          response.status(409).json({ error: { code: "WORKLOAD_SHADOW_ROLLOUT_DISABLED" } });
+          return;
+        }
+        try {
+          const branch = await dependencies.policyAdministration!.createBranch(
+            response.locals.fusePrincipal,
+            {
+              mandateId,
+              branchId: parsed.data.branchId,
+              parentBranchId: parsed.data.parentBranchId,
+              agentId: parsed.data.agentId,
+              allowedWorkloadClasses: parsed.data.allowedWorkloadClasses,
+              maximumSpendAtomic: BigInt(parsed.data.maximumSpendAtomic),
+              expiresAt: parsed.data.expiresAt,
+              requestId,
+            },
+          );
+          response.status(201).json({
+            branch: { ...branch, maximumSpendAtomic: branch.maximumSpendAtomic.toString() },
+          });
         } catch (error) {
           handlePolicyError(error, response);
         }
@@ -838,6 +952,18 @@ export function createFuseApp(dependencies: AppDependencies) {
               maxHourlyAtomic: policy.limits.maxHourlyAtomic.toString(),
               maxDailyAtomic: policy.limits.maxDailyAtomic.toString(),
             },
+            ...(policy.workloadClasses ? {
+              workloadClasses: policy.workloadClasses.map((workloadClass) => ({
+                ...workloadClass,
+                maxCostPerCallAtomic: workloadClass.maxCostPerCallAtomic.toString(),
+                aggregateBudgetAtomic: workloadClass.aggregateBudgetAtomic.toString(),
+                shadow: workloadClass.shadow ? {
+                  ...workloadClass.shadow,
+                  classPriorWindowSpendAtomic:
+                    workloadClass.shadow.classPriorWindowSpendAtomic.toString(),
+                } : null,
+              })),
+            } : {}),
           });
         } catch (error) {
           handlePolicyError(error, response);
@@ -871,7 +997,48 @@ export function createFuseApp(dependencies: AppDependencies) {
                 spentDayAtomic: decision.input.spentDayAtomic.toString(),
                 mandateSpentAtomic: decision.input.mandateSpentAtomic.toString(),
                 mandateMaximumAtomic: decision.input.mandateMaximumAtomic.toString(),
+                ...(decision.input.workload ? {
+                  workload: {
+                    ...decision.input.workload,
+                    branchMaximumAtomic: decision.input.workload.branchMaximumAtomic.toString(),
+                    branchSpentAtomic: decision.input.workload.branchSpentAtomic.toString(),
+                    classSpentAtomic: decision.input.workload.classSpentAtomic.toString(),
+                  },
+                } : {}),
+                ...(decision.input.exposure ? {
+                  exposure: Object.fromEntries(Object.entries(decision.input.exposure)
+                    .map(([key, value]) => [key, value.toString()])),
+                } : {}),
               },
+            })),
+          });
+        } catch (error) {
+          handlePolicyError(error, response);
+        }
+      },
+    );
+    app.get(
+      "/api/v1/admin/mandates/:mandateId/shadow-evaluations",
+      createCapabilityGuard(dependencies.credentialAuthenticator, "policies:read"),
+      async (request, response) => {
+        disableCaching(response);
+        const mandateIdParam = request.params["mandateId"];
+        const mandateId = typeof mandateIdParam === "string" ? mandateIdParam : mandateIdParam?.[0] ?? "";
+        if (!mandateId) {
+          response.status(400).json({ error: { code: "INVALID_MANDATE_REFERENCE" } });
+          return;
+        }
+        try {
+          const evaluations = await dependencies.policyAdministration!.listShadowEvaluations(
+            response.locals.fusePrincipal,
+            mandateId,
+          );
+          response.json({
+            evaluations: evaluations.map((evaluation) => ({
+              ...evaluation,
+              cohortOrdinal: evaluation.cohortOrdinal.toString(),
+              siblingAggregateAtomic: evaluation.siblingAggregateAtomic.toString(),
+              effectiveBaselineAtomic: evaluation.effectiveBaselineAtomic.toString(),
             })),
           });
         } catch (error) {
@@ -935,7 +1102,7 @@ export function createFuseApp(dependencies: AppDependencies) {
             return;
           }
           const mandateId = request.header("X-Fuse-Mandate")?.trim();
-          if (!mandateId) {
+          if (!mandateId || mandateId.length > 128) {
             response.status(400).json({ error: { code: "MISSING_MANDATE" } });
             return;
           }
@@ -944,12 +1111,27 @@ export function createFuseApp(dependencies: AppDependencies) {
             response.status(400).json({ error: { code: "INVALID_COMPLETION_REQUEST" } });
             return;
           }
+          const branchId = request.header("X-Fuse-Branch")?.trim();
+          const workloadClass = parsed.data.workload_class;
+          if (branchId && branchId.length > 128) {
+            response.status(400).json({ error: { code: "INVALID_WORKLOAD_SCOPE" } });
+            return;
+          }
+          if (Boolean(branchId) !== Boolean(workloadClass)) {
+            response.status(400).json({ error: { code: "INCOMPLETE_WORKLOAD_SCOPE" } });
+            return;
+          }
+          if (branchId && workloadClass && !dependencies.workloadShadowEnabled) {
+            response.status(409).json({ error: { code: "WORKLOAD_SHADOW_ROLLOUT_DISABLED" } });
+            return;
+          }
           const execution = await dependencies.inferenceExecution!.execute({
             requestId,
             organizationId: principal.organizationId,
             mandateId,
             agentId: principal.principalId,
             agentCapabilities: [...principal.capabilities],
+            ...(branchId && workloadClass ? { branchId, workloadClass } : {}),
             requestedModel: parsed.data.model,
             inputTokens: dependencies.estimateInputTokens(parsed.data.messages),
             maxOutputTokens: parsed.data.max_tokens,
@@ -961,6 +1143,10 @@ export function createFuseApp(dependencies: AppDependencies) {
                 code: "POLICY_DENIED",
                 decisionId: execution.decision.id,
                 reasonCodes: execution.decision.result.reasonCodes,
+                ...(execution.decision.input?.exposure ? {
+                  exposure: Object.fromEntries(Object.entries(execution.decision.input.exposure)
+                    .map(([key, value]) => [key, value.toString()])),
+                } : {}),
               },
             });
             return;
@@ -1002,6 +1188,26 @@ export function createFuseApp(dependencies: AppDependencies) {
               },
               reservationAtomic: execution.reservedCostAtomic.toString(),
               actualCostAtomic: execution.actualCostAtomic.toString(),
+              ...(execution.decision.input.branchId && execution.decision.input.workloadClass ? {
+                workloadScope: {
+                  branchId: execution.decision.input.branchId,
+                  workloadClass: execution.decision.input.workloadClass,
+                },
+              } : {}),
+              ...(execution.decision.input.exposure ? {
+                exposure: Object.fromEntries(Object.entries(execution.decision.input.exposure)
+                  .map(([key, value]) => [key, value.toString()])),
+              } : {}),
+              ...(execution.shadowEvaluation ? {
+                shadowEvaluation: {
+                  ...execution.shadowEvaluation,
+                  cohortOrdinal: execution.shadowEvaluation.cohortOrdinal.toString(),
+                  siblingAggregateAtomic:
+                    execution.shadowEvaluation.siblingAggregateAtomic.toString(),
+                  effectiveBaselineAtomic:
+                    execution.shadowEvaluation.effectiveBaselineAtomic.toString(),
+                },
+              } : {}),
             },
           });
         } catch (error) {

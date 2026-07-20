@@ -7,7 +7,7 @@ import {
   usdToMicros,
   type TokenPrice,
 } from "../core/pricing.js";
-import type { StoredPolicyDecision } from "../persistence/policyStore.js";
+import type { ShadowEvaluationRecord, StoredPolicyDecision } from "../persistence/policyStore.js";
 
 export interface ControlledInferenceInput {
   requestId: string;
@@ -15,6 +15,8 @@ export interface ControlledInferenceInput {
   mandateId: string;
   agentId: string;
   agentCapabilities: ApiCapability[];
+  branchId?: string;
+  workloadClass?: string;
   requestedModel?: string;
   inputTokens: number;
   maxOutputTokens: number;
@@ -32,6 +34,7 @@ export type AdmissionResult =
       reservedCostAtomic: bigint;
       actualCostAtomic: bigint;
       response: ProviderResult;
+      shadowEvaluation?: ShadowEvaluationRecord;
     };
 
 export type CompletionPersistenceResult = {
@@ -39,6 +42,7 @@ export type CompletionPersistenceResult = {
   reservedCostAtomic: bigint;
   actualCostAtomic: bigint;
   response: ProviderResult;
+  shadowEvaluation?: ShadowEvaluationRecord;
 };
 
 export interface InferenceExecutionStore {
@@ -50,6 +54,8 @@ export interface InferenceExecutionStore {
     agentCapabilities: ApiCapability[];
     provider: string;
     model: string;
+    branchId?: string;
+    workloadClass?: string;
     estimatedCostAtomic: bigint;
     inputTokens: number;
     maxOutputTokens: number;
@@ -178,6 +184,8 @@ export class InferenceExecutionService {
       organizationId: input.organizationId,
       mandateId: input.mandateId,
       agentId: input.agentId,
+      branchId: input.branchId ?? null,
+      workloadClass: input.workloadClass ?? null,
       provider: binding.providerName,
       model: binding.model,
       requestedModel: input.requestedModel ?? binding.model,

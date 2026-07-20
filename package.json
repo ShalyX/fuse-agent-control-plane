@@ -17,6 +17,7 @@
     "mainnet:readiness": "tsx scripts/check-mainnet-readiness.ts",
     "smoke:production": "tsx scripts/smoke-production.ts",
     "migrate:provider-config": "tsx scripts/migrate-provider-config.ts",
+    "shadow:retry": "tsx scripts/process-shadow-queue.ts",
     "check": "npm test && npm run build"
   },
   "dependencies": {
