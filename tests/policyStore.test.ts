@@ -55,7 +55,40 @@ describe("PolicyStore", () => {
       new PolicyStore(pool).ensureSchema(),
     ]);
     expect((await pool.query("SELECT version FROM policy_schema_migrations ORDER BY version")).rows)
-      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }]);
+      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }]);
+    await pool.end();
+  });
+
+  it("upgrades an empty workload-shadow v4 schema to branch-authority v5", async () => {
+    const db = newDb({ noAstCoverageCheck: true });
+    const adapter = db.adapters.createPg();
+    const pool = new adapter.Pool();
+    await new IdentityStore(pool).ensureSchema();
+    await new PolicyStore(pool).ensureSchema();
+    await pool.query(`
+      DELETE FROM policy_schema_migrations WHERE version = 5;
+      ALTER TABLE inference_executions
+        DROP COLUMN shadow_cohort_key,
+        DROP COLUMN shadow_cohort_ordinal,
+        DROP COLUMN shadow_completed_at,
+        DROP COLUMN shadow_order_state;
+      ALTER TABLE mandate_branches
+        DROP COLUMN maximum_spend_atomic,
+        DROP COLUMN expires_at;
+    `);
+
+    await new PolicyStore(pool).ensureSchema();
+    expect((await pool.query(
+      "SELECT version FROM policy_schema_migrations WHERE version = 5",
+    )).rows).toEqual([{ version: 5 }]);
+    const columns = await pool.query(
+      `SELECT column_name FROM information_schema.columns
+       WHERE table_name = 'inference_executions' AND column_name LIKE 'shadow_%'
+       ORDER BY column_name`,
+    );
+    expect(columns.rows.map((row: { column_name: string }) => row.column_name)).toEqual([
+      "shadow_cohort_key", "shadow_cohort_ordinal", "shadow_completed_at", "shadow_order_state",
+    ]);
     await pool.end();
   });
 

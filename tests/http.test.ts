@@ -8,6 +8,7 @@ import type { CredentialAuthenticator } from "../src/http/auth.js";
 import type { CredentialAdministrationPort } from "../src/identity/credentialAdministration.js";
 import type { PolicyAdministrationPort } from "../src/policy/policyAdministration.js";
 import type { ProviderAdministrationPort } from "../src/providers/providerAdministration.js";
+import type { ControlledInferenceInput } from "../src/inference/inferenceExecution.js";
 
 class FakeProvider implements InferenceProvider {
   calls = 0;
@@ -193,6 +194,138 @@ describe("POST /v1/chat/completions", () => {
     expect(executionCalls).toBe(1);
     expect(provider.calls).toBe(0);
     expect(paymentAttempts).toBe(0);
+  });
+
+  it("binds workload scope to controlled inference and surfaces exposure plus shadow evidence", async () => {
+    let observed: ControlledInferenceInput | undefined;
+    const credentialAuthenticator: CredentialAuthenticator = {
+      authenticateToken: async () => ({
+        principalType: "agent", principalId: "scout", organizationId: "org-1",
+        credentialId: "cred-scout", capabilities: ["inference:invoke"],
+      }),
+    };
+    const app = createFuseApp({
+      provider: new FakeProvider(), paymentGuard: fakePaymentGuard,
+      estimateInputTokens: () => 20, credentialAuthenticator,
+      workloadShadowEnabled: true,
+      inferenceExecution: {
+        execute: async (input) => {
+          observed = input;
+          return {
+            status: "completed",
+            decision: {
+              id: "decision-shadow", requestId: input.requestId,
+              organizationId: input.organizationId, mandateId: input.mandateId,
+              agentId: input.agentId, policyId: "policy-shadow", policyVersion: 1,
+              result: { outcome: "ALLOW", wouldOutcome: "ALLOW", enforced: true, reasonCodes: [] },
+              input: {
+                id: "decision-shadow", requestId: input.requestId,
+                organizationId: input.organizationId, mandateId: input.mandateId,
+                agentId: input.agentId, agentCapabilities: input.agentCapabilities,
+                provider: "anthropic", model: "claude-sonnet-4-6",
+                branchId: input.branchId, workloadClass: input.workloadClass,
+                estimatedCostAtomic: 1_000n, inputTokens: input.inputTokens,
+                maxOutputTokens: input.maxOutputTokens, spentHourAtomic: 0n,
+                spentDayAtomic: 0n, mandateSpentAtomic: 0n, mandateMaximumAtomic: 100_000n,
+                requestCountLastMinute: 0,
+                exposure: {
+                  branchLimitAtomic: 10_000n, branchCommittedBeforeAtomic: 300n,
+                  requestReservationAtomic: 1_000n, maximumExposureAtomic: 9_700n,
+                  remainingAuthorityAtomic: 8_700n,
+                },
+                decidedAt: "2026-07-20T00:12:00.000Z",
+              },
+            },
+            reservedCostAtomic: 1_000n, actualCostAtomic: 400n,
+            response: {
+              id: "response-shadow", content: "ok",
+              usage: { inputTokens: 20, outputTokens: 10 },
+            },
+            shadowEvaluation: {
+              requestId: input.requestId, organizationId: input.organizationId,
+              mandateId: input.mandateId, branchId: input.branchId!,
+              workloadClass: input.workloadClass!, provider: "anthropic",
+              model: "claude-sonnet-4-6", cohortKey: "c".repeat(64), cohortOrdinal: 15n,
+              status: "scored",
+              targetObservationCount: 3, comparableSiblingCount: 3,
+              siblingAggregate: "mean", siblingAggregateAtomic: 300n,
+              siblingWeightBps: 3_750, effectiveBaselineAtomic: 300n,
+              divergenceRatioBps: 40_000, targetPriorRatioBps: 40_000,
+              cohortPriorRatioBps: 10_000, eligibleForIntervention: true,
+              signals: ["SIBLING_DIVERGENCE", "CLASS_PRIOR_EXCEEDED"],
+              wouldEmitAnySignal: true, wouldSignalTarget: true, cohortShift: false,
+              wouldSignal: true, evaluatedAt: "2026-07-20T00:12:00.000Z",
+            },
+          };
+        },
+      },
+    });
+    const response = await request(app)
+      .post("/v1/chat/completions")
+      .set("Authorization", "Bearer agent")
+      .set("Idempotency-Key", "request-shadow")
+      .set("X-Fuse-Mandate", "mandate-shadow")
+      .set("X-Fuse-Branch", "branch-scout")
+      .send({
+        model: "claude-sonnet-4-6", max_tokens: 10, workload_class: "lookup",
+        messages: [{ role: "user", content: "Find the source" }],
+      });
+    expect(response.status).toBe(200);
+    expect(observed).toMatchObject({ branchId: "branch-scout", workloadClass: "lookup" });
+    expect(response.body.fuse).toMatchObject({
+      workloadScope: { branchId: "branch-scout", workloadClass: "lookup" },
+      exposure: { maximumExposureAtomic: "9700", remainingAuthorityAtomic: "8700" },
+      shadowEvaluation: {
+        status: "scored", cohortOrdinal: "15", siblingAggregateAtomic: "300",
+        effectiveBaselineAtomic: "300", wouldSignal: true,
+      },
+    });
+    const incomplete = await request(app)
+      .post("/v1/chat/completions")
+      .set("Authorization", "Bearer agent")
+      .set("Idempotency-Key", "request-incomplete")
+      .set("X-Fuse-Mandate", "mandate-shadow")
+      .set("X-Fuse-Branch", "branch-scout")
+      .send({
+        model: "claude-sonnet-4-6", max_tokens: 10,
+        messages: [{ role: "user", content: "Find the source" }],
+      });
+    expect(incomplete.status).toBe(400);
+    expect(incomplete.body).toEqual({ error: { code: "INCOMPLETE_WORKLOAD_SCOPE" } });
+
+    const rolloutDisabled = createFuseApp({
+      provider: new FakeProvider(), paymentGuard: fakePaymentGuard,
+      estimateInputTokens: () => 20, credentialAuthenticator,
+      workloadShadowEnabled: false,
+      inferenceExecution: {
+        execute: async (input) => ({
+          status: "completed" as const, decision: {
+            id: "decision-legacy",
+            requestId: input.requestId, organizationId: input.organizationId,
+            mandateId: input.mandateId, agentId: input.agentId,
+            policyId: "policy-1", policyVersion: 1,
+            result: { outcome: "ALLOW" as const, wouldOutcome: "ALLOW" as const,
+              enforced: true, reasonCodes: [] },
+            input: { branchId: input.branchId, workloadClass: input.workloadClass },
+          },
+          reservedCostAtomic: 1n, actualCostAtomic: 1n,
+          response: { id: "legacy", content: "ok", usage: { inputTokens: 1, outputTokens: 1 } },
+        }),
+      },
+    });
+    const disabledScope = await request(rolloutDisabled).post("/v1/chat/completions")
+      .set("Authorization", "Bearer agent").set("Idempotency-Key", "disabled-scope")
+      .set("X-Fuse-Mandate", "mandate-shadow").set("X-Fuse-Branch", "branch-scout")
+      .send({ model: "claude-sonnet-4-6", max_tokens: 10, workload_class: "lookup",
+        messages: [{ role: "user", content: "Find the source" }] });
+    expect(disabledScope.status).toBe(409);
+    expect(disabledScope.body).toEqual({ error: { code: "WORKLOAD_SHADOW_ROLLOUT_DISABLED" } });
+    const legacyUnscoped = await request(rolloutDisabled).post("/v1/chat/completions")
+      .set("Authorization", "Bearer agent").set("Idempotency-Key", "legacy-unscoped")
+      .set("X-Fuse-Mandate", "mandate-shadow")
+      .send({ model: "claude-sonnet-4-6", max_tokens: 10,
+        messages: [{ role: "user", content: "Find the source" }] });
+    expect(legacyUnscoped.status).toBe(200);
   });
 
   it("sanitizes controlled inference failures instead of exposing database details", async () => {
@@ -423,9 +556,29 @@ describe("POST /v1/chat/completions", () => {
     };
     const calls: string[] = [];
     const policyAdministration: PolicyAdministrationPort = {
-      publishPolicy: async (_principal, input) => { calls.push(`policy:${input.policyId}`); },
+      publishPolicy: async (_principal, input) => {
+        calls.push(`policy:${input.policyId}:${input.workloadClasses?.[0]?.maxCostPerCallAtomic}`);
+      },
       createMandate: async (_principal, input) => { calls.push(`mandate:${input.mandateId}`); },
       assignAgent: async (_principal, input) => { calls.push(`assign:${input.agentId}`); },
+      createBranch: async (principal, input) => {
+        if (input.branchId === "active-conflict") {
+          throw new Error("MANDATE_BRANCH_CHANGE_REQUIRES_PAUSE");
+        }
+        if (input.branchId === "missing-parent") {
+          throw new Error("MANDATE_PARENT_BRANCH_NOT_FOUND");
+        }
+        calls.push(`branch:${input.branchId}:${input.allowedWorkloadClasses.join(",")}`);
+        return {
+          id: input.branchId, organizationId: principal.organizationId,
+          mandateId: input.mandateId, parentBranchId: input.parentBranchId,
+          agentId: input.agentId, policyId: "policy-1", policyVersion: 1,
+          allowedWorkloadClasses: input.allowedWorkloadClasses,
+          maximumSpendAtomic: input.maximumSpendAtomic, expiresAt: input.expiresAt,
+          delegationHash: "a".repeat(64), authoritySource: "fuse_control_plane",
+          createdAt: "2026-07-13T21:00:00.000Z", createdBy: "service_account:admin-1",
+        };
+      },
       transitionMandate: async (_principal, input) => { calls.push(`transition:${input.to}`); },
       setMandatePolicy: async (_principal, input) => { calls.push(`policy-bind:${input.policyVersion}`); },
       getPolicy: async (principal, policyId, version) => ({
@@ -440,6 +593,16 @@ describe("POST /v1/chat/completions", () => {
           maxPerCallAtomic: 10_000n, maxHourlyAtomic: 50_000n, maxDailyAtomic: 250_000n,
           maxRequestsPerMinute: 10, maxInputTokens: 20_000, maxOutputTokens: 4_000,
         },
+        workloadClasses: [{
+          id: "lookup", maxCostPerCallAtomic: 2_000n, maxInvocationsPerBranch: 10,
+          aggregateBudgetAtomic: 10_000n, minimumInputTokens: 1,
+          shadow: {
+            classPriorWindowSpendAtomic: 300n, windowSeconds: 900,
+            targetMinimumObservations: 3, siblingMinimumForScoring: 2,
+            siblingMinimumForIntervention: 3, confidenceConstant: 5,
+            divergenceThresholdBps: 30_000,
+          },
+        }],
         createdAt: "2026-07-13T21:00:00.000Z",
       }),
       listReconciliationCases: async () => [{
@@ -472,10 +635,25 @@ describe("POST /v1/chat/completions", () => {
           requestCountLastMinute: 0, decidedAt: "2026-07-13T21:00:00.000Z",
         },
       }],
+      listShadowEvaluations: async (principal, mandateId) => [{
+        requestId: "request:inference-1", organizationId: principal.organizationId,
+        mandateId, branchId: "branch-scout", workloadClass: "lookup",
+        provider: "anthropic", model: "claude-sonnet-4-6",
+        cohortKey: "c".repeat(64), cohortOrdinal: 15n, status: "scored",
+        targetObservationCount: 3, comparableSiblingCount: 3, siblingAggregate: "mean",
+        siblingAggregateAtomic: 300n, siblingWeightBps: 3750,
+        effectiveBaselineAtomic: 300n, divergenceRatioBps: 40_000,
+        targetPriorRatioBps: 40_000, cohortPriorRatioBps: 10_000,
+        eligibleForIntervention: true,
+        signals: ["SIBLING_DIVERGENCE", "CLASS_PRIOR_EXCEEDED"],
+        wouldEmitAnySignal: true, wouldSignalTarget: true, cohortShift: false,
+        wouldSignal: true, evaluatedAt: "2026-07-13T21:02:00.000Z",
+      }],
     };
     const app = createFuseApp({
       provider: new FakeProvider(), paymentGuard: fakePaymentGuard,
       estimateInputTokens: () => 1000, credentialAuthenticator, policyAdministration,
+      workloadShadowEnabled: true,
     });
     const auth = { Authorization: "Bearer policy-admin", "X-Request-Id": "request:policy" };
     const publish = await request(app).post("/api/v1/admin/policies").set(auth).send({
@@ -486,6 +664,16 @@ describe("POST /v1/chat/completions", () => {
         maxPerCallAtomic: "10000", maxHourlyAtomic: "50000", maxDailyAtomic: "250000",
         maxRequestsPerMinute: 10, maxInputTokens: 20000, maxOutputTokens: 4000,
       },
+      workloadClasses: [{
+        id: "lookup", maxCostPerCallAtomic: "2000", maxInvocationsPerBranch: 10,
+        aggregateBudgetAtomic: "10000", minimumInputTokens: 1,
+        shadow: {
+          classPriorWindowSpendAtomic: "300", windowSeconds: 900,
+          targetMinimumObservations: 3, siblingMinimumForScoring: 2,
+          siblingMinimumForIntervention: 3, confidenceConstant: 5,
+          divergenceThresholdBps: 30000,
+        },
+      }],
     });
     expect(publish.status).toBe(201);
     expect(publish.headers["cache-control"]).toContain("no-store");
@@ -497,6 +685,31 @@ describe("POST /v1/chat/completions", () => {
     expect(mandate.status).toBe(201);
     expect((await request(app).post("/api/v1/admin/mandates/mandate-1/agents").set(auth)
       .send({ agentId: "agent-1" })).status).toBe(204);
+    const branch = await request(app)
+      .post("/api/v1/admin/mandates/mandate-1/branches")
+      .set(auth)
+      .send({
+        branchId: "branch-scout", parentBranchId: null, agentId: "agent-1",
+        allowedWorkloadClasses: ["lookup"], maximumSpendAtomic: "10000", expiresAt: null,
+      });
+    expect(branch.status).toBe(201);
+    expect(branch.body.branch).toMatchObject({
+      id: "branch-scout", authoritySource: "fuse_control_plane",
+      delegationHash: "a".repeat(64), maximumSpendAtomic: "10000", expiresAt: null,
+    });
+    const branchBody = {
+      parentBranchId: null, agentId: "agent-1", allowedWorkloadClasses: ["lookup"],
+      maximumSpendAtomic: "10000", expiresAt: null,
+    };
+    const stateConflict = await request(app)
+      .post("/api/v1/admin/mandates/mandate-1/branches").set(auth)
+      .send({ ...branchBody, branchId: "active-conflict" });
+    expect(stateConflict.status).toBe(409);
+    expect(stateConflict.body).toEqual({ error: { code: "MANDATE_BRANCH_CHANGE_REQUIRES_PAUSE" } });
+    const missingParent = await request(app)
+      .post("/api/v1/admin/mandates/mandate-1/branches").set(auth)
+      .send({ ...branchBody, branchId: "missing-parent" });
+    expect(missingParent.status).toBe(404);
     expect((await request(app).post("/api/v1/admin/mandates/mandate-1/transitions").set(auth)
       .send({ to: "active" })).status).toBe(204);
     expect((await request(app).post("/api/v1/admin/mandates/mandate-1/transitions").set(auth)
@@ -506,6 +719,10 @@ describe("POST /v1/chat/completions", () => {
     const readPolicy = await request(app).get("/api/v1/admin/policies/policy-1/versions/1").set(auth);
     expect(readPolicy.status).toBe(200);
     expect(readPolicy.body.limits.maxPerCallAtomic).toBe("10000");
+    expect(readPolicy.body.workloadClasses[0]).toMatchObject({
+      id: "lookup", maxCostPerCallAtomic: "2000", aggregateBudgetAtomic: "10000",
+      shadow: { classPriorWindowSpendAtomic: "300" },
+    });
     const decisions = await request(app).get("/api/v1/admin/mandates/mandate-1/decisions").set(auth);
     expect(decisions.status).toBe(200);
     expect(decisions.body.decisions).toHaveLength(1);
@@ -513,6 +730,14 @@ describe("POST /v1/chat/completions", () => {
       estimatedCostAtomic: "1800",
       mandateSpentAtomic: "0",
       mandateMaximumAtomic: "250000",
+    });
+    const shadow = await request(app)
+      .get("/api/v1/admin/mandates/mandate-1/shadow-evaluations")
+      .set(auth);
+    expect(shadow.status).toBe(200);
+    expect(shadow.body.evaluations[0]).toMatchObject({
+      requestId: "request:inference-1", cohortOrdinal: "15", siblingAggregateAtomic: "300",
+      effectiveBaselineAtomic: "300", wouldSignal: true,
     });
     const cases = await request(app).get("/api/v1/admin/reconciliation").set(auth);
     expect(cases.status).toBe(200);
@@ -537,9 +762,37 @@ describe("POST /v1/chat/completions", () => {
       });
     expect(conflict.status).toBe(409);
     expect(conflict.body).toEqual({ error: { code: "RECONCILIATION_RESOLUTION_CONFLICT" } });
+    const rolloutDisabledApp = createFuseApp({
+      provider: new FakeProvider(), paymentGuard: fakePaymentGuard,
+      estimateInputTokens: () => 1000, credentialAuthenticator, policyAdministration,
+      workloadShadowEnabled: false,
+    });
+    const disabledPolicy = await request(rolloutDisabledApp)
+      .post("/api/v1/admin/policies").set(auth).send({
+        policyId: "disabled-policy", version: 1, mode: "enforce",
+        allowedProviders: ["anthropic"], allowedModels: ["claude-sonnet-4-6"],
+        requiredCapability: "inference:invoke",
+        limits: {
+          maxPerCallAtomic: "10000", maxHourlyAtomic: "50000", maxDailyAtomic: "250000",
+          maxRequestsPerMinute: 10, maxInputTokens: 20000, maxOutputTokens: 4000,
+        },
+        workloadClasses: [{
+          id: "lookup", maxCostPerCallAtomic: "2000", maxInvocationsPerBranch: 10,
+          aggregateBudgetAtomic: "10000", minimumInputTokens: 1, shadow: null,
+        }],
+      });
+    expect(disabledPolicy.status).toBe(409);
+    expect(disabledPolicy.body).toEqual({ error: { code: "WORKLOAD_SHADOW_ROLLOUT_DISABLED" } });
+    const disabledBranch = await request(rolloutDisabledApp)
+      .post("/api/v1/admin/mandates/mandate-1/branches").set(auth).send({
+        branchId: "disabled", parentBranchId: null, agentId: "agent-1",
+        allowedWorkloadClasses: ["lookup"], maximumSpendAtomic: "10000", expiresAt: null,
+      });
+    expect(disabledBranch.status).toBe(409);
+    expect(disabledBranch.body).toEqual({ error: { code: "WORKLOAD_SHADOW_ROLLOUT_DISABLED" } });
     expect(calls).toEqual([
-      "policy:policy-1", "mandate:mandate-1", "assign:agent-1", "transition:active",
-      "transition:paused",
+      "policy:policy-1:2000", "mandate:mandate-1", "assign:agent-1",
+      "branch:branch-scout:lookup", "transition:active", "transition:paused",
       "policy-bind:2",
       "reconcile:held-request:settle",
     ]);
@@ -640,6 +893,9 @@ describe("POST /v1/chat/completions", () => {
     expect(consolePage.text).not.toContain("sessionStorage");
     expect(consolePage.text).toContain("/api/v1/admin/providers");
     expect(consolePage.text).toContain("/api/v1/admin/policies");
+    expect(consolePage.text).toContain("Enable workload-shadow capability");
+    expect(consolePage.text).toContain("workloadClasses:v.includeWorkload?");
+    expect(consolePage.text).not.toContain('name="includeWorkload" type="checkbox" value="yes" checked');
     expect(consolePage.text).toContain('id="createMandate"');
     expect(consolePage.text).toContain('id="assignMandateAgent"');
     expect(consolePage.text).toContain('id="activateMandate"');

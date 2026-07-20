@@ -137,6 +137,90 @@ describe("policy engine", () => {
     });
   });
 
+  it("treats policy-bound workload-class authority as a hard envelope even in dry-run", () => {
+    const controlled = policy({
+      mode: "dry_run",
+      workloadClasses: [{
+        id: "lookup",
+        maxCostPerCallAtomic: 2_000n,
+        maxInvocationsPerBranch: 3,
+        aggregateBudgetAtomic: 5_000n,
+        minimumInputTokens: 10,
+        shadow: null,
+      }],
+    });
+
+    expect(evaluatePolicy(controlled, evaluation({
+      workload: {
+        branchId: "branch-scout",
+        workloadClass: "deep_research",
+        branchAuthorized: true,
+        branchMaximumAtomic: 50_000n,
+        branchSpentAtomic: 0n,
+        branchExpiresAt: null,
+        classAuthorized: false,
+        classInvocationCount: 0,
+        classSpentAtomic: 0n,
+      },
+    }))).toEqual({
+      outcome: "DENY",
+      wouldOutcome: "DENY",
+      enforced: true,
+      reasonCodes: ["WORKLOAD_CLASS_NOT_ALLOWED"],
+    });
+  });
+
+  it("enforces per-class call, invocation, budget, and request-shape limits", () => {
+    const controlled = policy({
+      workloadClasses: [{
+        id: "lookup",
+        maxCostPerCallAtomic: 2_000n,
+        maxInvocationsPerBranch: 3,
+        aggregateBudgetAtomic: 5_000n,
+        minimumInputTokens: 10,
+        shadow: null,
+      }],
+    });
+
+    expect(evaluatePolicy(controlled, evaluation({
+      estimatedCostAtomic: 2_500n,
+      inputTokens: 5,
+      workload: {
+        branchId: "branch-scout",
+        workloadClass: "lookup",
+        branchAuthorized: true,
+        branchMaximumAtomic: 50_000n,
+        branchSpentAtomic: 0n,
+        branchExpiresAt: null,
+        classAuthorized: true,
+        classInvocationCount: 3,
+        classSpentAtomic: 4_000n,
+      },
+    }))).toEqual({
+      outcome: "DENY",
+      wouldOutcome: "DENY",
+      enforced: true,
+      reasonCodes: [
+        "WORKLOAD_CLASS_PER_CALL_LIMIT_EXCEEDED",
+        "WORKLOAD_CLASS_INVOCATION_LIMIT_EXCEEDED",
+        "WORKLOAD_CLASS_BUDGET_EXCEEDED",
+        "WORKLOAD_CLASS_SHAPE_MISMATCH",
+      ],
+    });
+    expect(evaluatePolicy(controlled, evaluation({
+      estimatedCostAtomic: 100n,
+      workload: {
+        branchId: "branch-scout", workloadClass: "lookup", branchAuthorized: true,
+        branchMaximumAtomic: 5_000n, branchSpentAtomic: 4_950n,
+        branchExpiresAt: "2026-07-13T19:00:00.000Z", classAuthorized: true,
+        classInvocationCount: 0, classSpentAtomic: 0n,
+      },
+    }))).toMatchObject({
+      outcome: "DENY", enforced: true,
+      reasonCodes: ["BRANCH_EXPIRED", "BRANCH_BUDGET_EXCEEDED"],
+    });
+  });
+
   it("denies every request when the policy is paused", () => {
     expect(evaluatePolicy(policy({ mode: "paused" }), evaluation())).toEqual({
       outcome: "DENY",
@@ -159,5 +243,32 @@ describe("policy engine", () => {
     expect(() => evaluatePolicy(policy(), evaluation({
       agentCapabilities: ["wallet:drain" as "inference:invoke"],
     }))).toThrow("POLICY_EVALUATION_CAPABILITY_INVALID");
+    const workloadClass = {
+      id: "lookup",
+      maxCostPerCallAtomic: 1_000n,
+      maxInvocationsPerBranch: 3,
+      aggregateBudgetAtomic: 5_000n,
+      minimumInputTokens: 0,
+      shadow: {
+        classPriorWindowSpendAtomic: 1_000n,
+        windowSeconds: 900,
+        targetMinimumObservations: 3,
+        siblingMinimumForScoring: 2,
+        siblingMinimumForIntervention: 3,
+        confidenceConstant: 5,
+        divergenceThresholdBps: 30_000,
+      },
+    };
+    expect(() => validatePolicy(policy({ workloadClasses: [workloadClass, workloadClass] })))
+      .toThrow("WORKLOAD_CLASS_DUPLICATE");
+    expect(() => validatePolicy(policy({
+      workloadClasses: [{ ...workloadClass, maxCostPerCallAtomic: -1n }],
+    }))).toThrow("WORKLOAD_CLASS_LIMIT_INVALID");
+    expect(() => validatePolicy(policy({
+      workloadClasses: [{
+        ...workloadClass,
+        shadow: { ...workloadClass.shadow, siblingMinimumForIntervention: 1 },
+      }],
+    }))).toThrow("WORKLOAD_CLASS_SHADOW_INVALID");
   });
 });

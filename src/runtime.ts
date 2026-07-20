@@ -28,7 +28,10 @@ export function createRuntimeApp(env: NodeJS.ProcessEnv = process.env) {
   const misplacedSecret = signerOnlySecrets.find((name) => Boolean(env[name]?.trim()));
   if (misplacedSecret) throw new Error(`CONTROL_PLANE_SIGNER_SECRET_FORBIDDEN:${misplacedSecret}`);
 
-  const databaseUrl = env["DATABASE_URL"];
+  const databaseUrl = env["DATABASE_URL_UNPOOLED"] ?? env["DATABASE_URL"];
+  if (databaseUrl && new URL(databaseUrl).hostname.includes("-pooler.")) {
+    throw new Error("DATABASE_URL_UNPOOLED_REQUIRED");
+  }
   const databasePool = databaseUrl ? createPostgresPool(databaseUrl) : undefined;
   const configuredMode = env["FUSE_PROVIDER_MODE"]?.trim().toLowerCase();
   if (configuredMode && configuredMode !== "tenant" && configuredMode !== "legacy") {
@@ -126,6 +129,11 @@ export function createRuntimeApp(env: NodeJS.ProcessEnv = process.env) {
 
   const payerWallet = env["FUSE_PAYER_ADDRESS"] ?? "0x68abdce904bd68c53b0daf43c9b83a5aa8c0b2f7";
   const sellerAddress = env["FUSE_SELLER_ADDRESS"] ?? "0xa1984d65d411bb30bfd5fb6148c61fcc3cd3332c";
+  const workloadShadowFlag = env["FUSE_WORKLOAD_SHADOW_ENABLED"]?.trim().toLowerCase();
+  if (workloadShadowFlag && workloadShadowFlag !== "true" && workloadShadowFlag !== "false") {
+    throw new Error("FUSE_WORKLOAD_SHADOW_ENABLED_INVALID");
+  }
+  const workloadShadowEnabled = workloadShadowFlag === "true";
 
   return createFuseApp({
     provider,
@@ -137,11 +145,18 @@ export function createRuntimeApp(env: NodeJS.ProcessEnv = process.env) {
     policyAdministration,
     providerAdministration,
     inferenceExecution,
+    workloadShadowEnabled,
     readiness: async () => {
-      if (!databasePool) return { database: false, providerConfiguration: false };
+      if (!databasePool || !policyStore) {
+        return { database: false, providerConfiguration: false, workloadShadowSchema: false };
+      }
       await databasePool.query("SELECT 1");
       if (tenantProviderRequested) await providerConfigStore!.readiness();
-      return { database: true, providerConfiguration: true };
+      return {
+        database: true,
+        providerConfiguration: true,
+        workloadShadowSchema: await policyStore.workloadShadowSchemaReady(),
+      };
     },
     adminRateLimit: {
       maxPerMinute: Number(env["FUSE_ADMIN_RATE_LIMIT_PER_MINUTE"] ?? "120"),

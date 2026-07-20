@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
 import {
   evaluatePolicy,
@@ -8,6 +8,7 @@ import {
   type PolicyMode,
   type PolicyReasonCode,
   type PolicyVersion,
+  type WorkloadClassPolicy,
 } from "../domain/policy.js";
 import type { ApiCapability } from "../identity/apiCredentials.js";
 import type { ProviderResult } from "../core/service.js";
@@ -18,6 +19,10 @@ import type {
 } from "../inference/inferenceExecution.js";
 import type { MandateState } from "../domain/lifecycles.js";
 import { withSchemaBootstrapLock } from "./schemaBootstrap.js";
+import {
+  evaluateSiblingDivergence,
+  type SiblingDivergenceSignal,
+} from "../anomaly/siblingDivergence.js";
 
 const mandateTransitions: Record<MandateState, readonly MandateState[]> = {
   draft: ["active", "expired"],
@@ -55,6 +60,68 @@ export interface AssignMandateAgentInput extends PolicyMutationContext {
   agentId: string;
 }
 
+export interface CreateMandateBranchInput extends PolicyMutationContext {
+  id: string;
+  organizationId: string;
+  mandateId: string;
+  parentBranchId: string | null;
+  agentId: string;
+  allowedWorkloadClasses: string[];
+  maximumSpendAtomic: bigint;
+  expiresAt: string | null;
+}
+
+export interface MandateBranch {
+  id: string;
+  organizationId: string;
+  mandateId: string;
+  parentBranchId: string | null;
+  agentId: string;
+  policyId: string;
+  policyVersion: number;
+  allowedWorkloadClasses: string[];
+  maximumSpendAtomic: bigint;
+  expiresAt: string | null;
+  delegationHash: string;
+  authoritySource: "fuse_control_plane";
+  createdAt: string;
+  createdBy: string;
+}
+
+export interface ShadowEvaluationRecord {
+  requestId: string;
+  organizationId: string;
+  mandateId: string;
+  branchId: string;
+  workloadClass: string;
+  provider: string;
+  model: string;
+  cohortKey: string;
+  cohortOrdinal: bigint;
+  status: "scored" | "insufficient_target_observations" | "insufficient_siblings";
+  targetObservationCount: number;
+  comparableSiblingCount: number;
+  siblingAggregate: "none" | "mean" | "trimmed_mean";
+  siblingAggregateAtomic: bigint;
+  siblingWeightBps: number;
+  effectiveBaselineAtomic: bigint;
+  divergenceRatioBps: number;
+  targetPriorRatioBps: number;
+  cohortPriorRatioBps: number;
+  eligibleForIntervention: boolean;
+  signals: SiblingDivergenceSignal[];
+  wouldSignal: boolean;
+  evaluatedAt: string;
+}
+
+export interface ExposureSnapshot {
+  branchLimitAtomic: bigint;
+  branchCommittedBeforeAtomic: bigint;
+  requestReservationAtomic: bigint;
+  maximumExposureAtomic: bigint;
+  remainingAuthorityAtomic: bigint;
+}
+
 export interface PolicyDecisionInput {
   id: string;
   requestId: string;
@@ -64,6 +131,8 @@ export interface PolicyDecisionInput {
   agentCapabilities: ApiCapability[];
   provider: string;
   model: string;
+  branchId?: string;
+  workloadClass?: string;
   estimatedCostAtomic: bigint;
   inputTokens: number;
   maxOutputTokens: number;
@@ -72,6 +141,8 @@ export interface PolicyDecisionInput {
   mandateSpentAtomic: bigint;
   mandateMaximumAtomic: bigint;
   requestCountLastMinute: number;
+  workload?: PolicyEvaluationInput["workload"];
+  exposure?: ExposureSnapshot;
   decidedAt: string;
 }
 
@@ -114,7 +185,10 @@ export interface ResolveReconciliationInput extends PolicyMutationContext {
 export class PolicyStore implements InferenceExecutionStore {
   private schemaReady?: Promise<void>;
 
-  constructor(private readonly pool: Pool) {}
+  constructor(
+    private readonly pool: Pool,
+    private readonly options: { supportsSavepoints?: boolean } = {},
+  ) {}
 
   ensureSchema(): Promise<void> {
     this.schemaReady ??= this.createSchema().catch((error) => {
@@ -124,6 +198,15 @@ export class PolicyStore implements InferenceExecutionStore {
     return this.schemaReady;
   }
 
+  async workloadShadowSchemaReady(): Promise<boolean> {
+    await this.ensureSchema();
+    const result = await this.pool.query<{ version: number }>(
+      "SELECT version FROM policy_schema_migrations WHERE version IN (4, 5) ORDER BY version",
+    );
+    return result.rows.length === 2
+      && result.rows[0]?.version === 4 && result.rows[1]?.version === 5;
+  }
+
   async publishPolicy(policy: PolicyVersion, context: PolicyMutationContext): Promise<void> {
     context = { ...context };
     policy = {
@@ -131,6 +214,7 @@ export class PolicyStore implements InferenceExecutionStore {
       allowedProviders: [...policy.allowedProviders],
       allowedModels: [...policy.allowedModels],
       limits: { ...policy.limits },
+      workloadClasses: this.cloneWorkloadClasses(policy.workloadClasses ?? []),
     };
     validatePolicy(policy);
     this.validateContext(context);
@@ -140,15 +224,18 @@ export class PolicyStore implements InferenceExecutionStore {
         `INSERT INTO policy_versions
          (organization_id, policy_id, version, mode, allowed_providers, allowed_models,
           required_capability, max_per_call_atomic, max_hourly_atomic, max_daily_atomic,
-          max_requests_per_minute, max_input_tokens, max_output_tokens, created_at, created_by)
-         VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
+          max_requests_per_minute, max_input_tokens, max_output_tokens, workload_classes,
+          created_at, created_by)
+         VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7, $8, $9, $10, $11, $12, $13,
+                 $14::jsonb, $15, $16)`,
         [
           policy.organizationId, policy.id, policy.version, policy.mode,
           JSON.stringify(policy.allowedProviders), JSON.stringify(policy.allowedModels),
           policy.requiredCapability, policy.limits.maxPerCallAtomic.toString(),
           policy.limits.maxHourlyAtomic.toString(), policy.limits.maxDailyAtomic.toString(),
           policy.limits.maxRequestsPerMinute, policy.limits.maxInputTokens,
-          policy.limits.maxOutputTokens, policy.createdAt, context.actorId,
+          policy.limits.maxOutputTokens, JSON.stringify(this.serializeWorkloadClasses(policy.workloadClasses ?? [])),
+          policy.createdAt, context.actorId,
         ],
       );
       await this.appendAudit(client, {
@@ -231,6 +318,200 @@ export class PolicyStore implements InferenceExecutionStore {
         causationId: input.causationId,
         occurredAt: input.occurredAt,
       });
+    });
+  }
+
+  async createBranch(input: CreateMandateBranchInput): Promise<MandateBranch> {
+    input = { ...input, allowedWorkloadClasses: [...input.allowedWorkloadClasses].sort() };
+    this.validateContext(input);
+    if (!input.id.trim()) throw new Error("MANDATE_BRANCH_ID_REQUIRED");
+    if (!input.organizationId.trim()) throw new Error("MANDATE_BRANCH_ORGANIZATION_REQUIRED");
+    if (!input.mandateId.trim()) throw new Error("MANDATE_BRANCH_MANDATE_REQUIRED");
+    if (!input.agentId.trim()) throw new Error("MANDATE_BRANCH_AGENT_REQUIRED");
+    if (input.allowedWorkloadClasses.length === 0
+      || input.allowedWorkloadClasses.some((id) => !id.trim())) {
+      throw new Error("MANDATE_BRANCH_WORKLOAD_CLASS_REQUIRED");
+    }
+    if (new Set(input.allowedWorkloadClasses).size !== input.allowedWorkloadClasses.length) {
+      throw new Error("MANDATE_BRANCH_WORKLOAD_CLASS_DUPLICATE");
+    }
+    if (input.maximumSpendAtomic <= 0n) throw new Error("MANDATE_BRANCH_BUDGET_INVALID");
+    if (input.expiresAt !== null && (Number.isNaN(Date.parse(input.expiresAt))
+      || Date.parse(input.expiresAt) <= Date.parse(input.occurredAt))) {
+      throw new Error("MANDATE_BRANCH_EXPIRY_INVALID");
+    }
+    await this.ensureSchema();
+    return this.transaction(async (client) => {
+      const mandateResult = await client.query<{
+        state: MandateState;
+        policy_id: string;
+        policy_version: number;
+        workload_classes: SerializedWorkloadClass[];
+        maximum_spend_atomic: string;
+        expires_at: Date | null;
+      }>(
+        `SELECT mandates.state, mandates.policy_id, mandates.policy_version, policies.workload_classes,
+                mandates.maximum_spend_atomic, mandates.expires_at
+         FROM control_mandates mandates
+         JOIN policy_versions policies
+           ON policies.organization_id = mandates.organization_id
+          AND policies.policy_id = mandates.policy_id
+          AND policies.version = mandates.policy_version
+         WHERE mandates.organization_id = $1 AND mandates.id = $2 FOR UPDATE`,
+        [input.organizationId, input.mandateId],
+      );
+      const mandate = mandateResult.rows[0];
+      if (!mandate) throw new Error("CONTROL_MANDATE_NOT_FOUND");
+      if (mandate.state !== "draft" && mandate.state !== "paused") {
+        throw new Error("MANDATE_BRANCH_CHANGE_REQUIRES_PAUSE");
+      }
+      if (input.maximumSpendAtomic > BigInt(mandate.maximum_spend_atomic)) {
+        throw new Error("MANDATE_BRANCH_BUDGET_EXCEEDS_MANDATE");
+      }
+      if (input.expiresAt !== null && mandate.expires_at !== null
+        && Date.parse(input.expiresAt) > mandate.expires_at.getTime()) {
+        throw new Error("MANDATE_BRANCH_EXPIRY_EXCEEDS_MANDATE");
+      }
+      const configuredClasses = new Set(mandate.workload_classes.map(({ id }) => id));
+      if (input.allowedWorkloadClasses.some((id) => !configuredClasses.has(id))) {
+        throw new Error("MANDATE_BRANCH_WORKLOAD_CLASS_NOT_IN_POLICY");
+      }
+      const assignment = await client.query(
+        `SELECT 1 FROM mandate_agent_assignments
+         WHERE organization_id = $1 AND mandate_id = $2 AND agent_id = $3`,
+        [input.organizationId, input.mandateId, input.agentId],
+      );
+      if (assignment.rowCount !== 1) throw new Error("MANDATE_BRANCH_AGENT_NOT_ASSIGNED");
+      if (input.parentBranchId !== null) {
+        const parent = await client.query<MandateBranchRow>(
+          `SELECT * FROM mandate_branches
+           WHERE organization_id = $1 AND mandate_id = $2 AND branch_id = $3
+           FOR UPDATE`,
+          [input.organizationId, input.mandateId, input.parentBranchId],
+        );
+        const parentRow = parent.rows[0];
+        if (!parentRow) throw new Error("MANDATE_PARENT_BRANCH_NOT_FOUND");
+        this.verifyBranchIntegrity(parentRow);
+        if (parentRow.policy_id !== mandate.policy_id
+          || parentRow.policy_version !== mandate.policy_version) {
+          throw new Error("MANDATE_PARENT_BRANCH_POLICY_MISMATCH");
+        }
+        if (input.allowedWorkloadClasses.some(
+          (id) => !parentRow.allowed_workload_classes.includes(id),
+        )) throw new Error("MANDATE_BRANCH_PARENT_AUTHORITY_EXCEEDED");
+        const allocated = await client.query<{ total: string }>(
+          `SELECT COALESCE(SUM(maximum_spend_atomic), 0)::text AS total
+           FROM mandate_branches
+           WHERE organization_id = $1 AND mandate_id = $2 AND parent_branch_id = $3`,
+          [input.organizationId, input.mandateId, input.parentBranchId],
+        );
+        if (input.maximumSpendAtomic + BigInt(allocated.rows[0]?.total ?? "0")
+          > BigInt(parentRow.maximum_spend_atomic)) {
+          throw new Error("MANDATE_BRANCH_PARENT_BUDGET_EXCEEDED");
+        }
+        if (parentRow.expires_at !== null && (input.expiresAt === null
+          || Date.parse(input.expiresAt) > parentRow.expires_at.getTime())) {
+          throw new Error("MANDATE_BRANCH_PARENT_EXPIRY_EXCEEDED");
+        }
+      }
+      const createdAt = new Date(input.occurredAt).toISOString();
+      const expiresAt = input.expiresAt === null ? null : new Date(input.expiresAt).toISOString();
+      const canonical = {
+        authoritySource: "fuse_control_plane",
+        organizationId: input.organizationId,
+        mandateId: input.mandateId,
+        branchId: input.id,
+        parentBranchId: input.parentBranchId,
+        agentId: input.agentId,
+        policyId: mandate.policy_id,
+        policyVersion: mandate.policy_version,
+        allowedWorkloadClasses: input.allowedWorkloadClasses,
+        maximumSpendAtomic: input.maximumSpendAtomic.toString(),
+        expiresAt,
+        createdAt,
+        createdBy: input.actorId,
+      } as const;
+      const delegationHash = createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+      await client.query(
+        `INSERT INTO mandate_branches
+         (organization_id, mandate_id, branch_id, parent_branch_id, agent_id,
+          policy_id, policy_version, allowed_workload_classes, maximum_spend_atomic, expires_at,
+          delegation_hash, authority_source, created_at, created_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12, $13, $14)`,
+        [
+          input.organizationId, input.mandateId, input.id, input.parentBranchId, input.agentId,
+          mandate.policy_id, mandate.policy_version, JSON.stringify(input.allowedWorkloadClasses),
+          input.maximumSpendAtomic.toString(), expiresAt, delegationHash, "fuse_control_plane",
+          createdAt, input.actorId,
+        ],
+      );
+      await this.appendAudit(client, {
+        organizationId: input.organizationId,
+        entityType: "mandate_branch",
+        entityId: input.id,
+        action: "mandate.branch_created",
+        payload: { ...canonical, delegationHash },
+        actorId: input.actorId,
+        causationId: input.causationId,
+        occurredAt: input.occurredAt,
+      });
+      return {
+        id: canonical.branchId,
+        organizationId: canonical.organizationId,
+        mandateId: canonical.mandateId,
+        parentBranchId: canonical.parentBranchId,
+        agentId: canonical.agentId,
+        policyId: canonical.policyId,
+        policyVersion: canonical.policyVersion,
+        allowedWorkloadClasses: [...canonical.allowedWorkloadClasses],
+        maximumSpendAtomic: input.maximumSpendAtomic,
+        expiresAt,
+        delegationHash,
+        authoritySource: canonical.authoritySource,
+        createdAt: canonical.createdAt,
+        createdBy: canonical.createdBy,
+      };
+    });
+  }
+
+  async getBranch(
+    organizationId: string,
+    mandateId: string,
+    branchId: string,
+  ): Promise<MandateBranch | null> {
+    await this.ensureSchema();
+    const result = await this.pool.query<MandateBranchRow>(
+      `SELECT * FROM mandate_branches
+       WHERE organization_id = $1 AND mandate_id = $2 AND branch_id = $3`,
+      [organizationId, mandateId, branchId],
+    );
+    return result.rows[0] ? this.branchFromRow(result.rows[0]) : null;
+  }
+
+  async listShadowEvaluations(
+    organizationId: string,
+    mandateId: string,
+  ): Promise<ShadowEvaluationRecord[]> {
+    await this.ensureSchema();
+    return this.transaction(async (client) => {
+      const branches = await client.query<MandateBranchRow>(
+        `SELECT branch.* FROM mandate_branches branch
+         JOIN shadow_evaluations evaluation
+           ON evaluation.organization_id = branch.organization_id
+          AND evaluation.mandate_id = branch.mandate_id
+          AND evaluation.branch_id = branch.branch_id
+         WHERE branch.organization_id = $1 AND branch.mandate_id = $2
+         FOR UPDATE`,
+        [organizationId, mandateId],
+      );
+      for (const branch of branches.rows) this.verifyBranchIntegrity(branch);
+      const result = await client.query<ShadowEvaluationRow>(
+        `SELECT * FROM shadow_evaluations
+         WHERE organization_id = $1 AND mandate_id = $2
+         ORDER BY evaluated_at ASC, request_id ASC`,
+        [organizationId, mandateId],
+      );
+      return result.rows.map((row) => this.shadowEvaluationFromRow(row));
     });
   }
 
@@ -351,7 +632,7 @@ export class PolicyStore implements InferenceExecutionStore {
                 policies.required_capability, policies.max_per_call_atomic,
                 policies.max_hourly_atomic, policies.max_daily_atomic,
                 policies.max_requests_per_minute, policies.max_input_tokens,
-                policies.max_output_tokens, policies.created_at
+                policies.max_output_tokens, policies.workload_classes, policies.created_at
          FROM control_mandates mandates
          JOIN policy_versions policies
            ON policies.organization_id = mandates.organization_id
@@ -384,6 +665,7 @@ export class PolicyStore implements InferenceExecutionStore {
           maxInputTokens: row.max_input_tokens,
           maxOutputTokens: row.max_output_tokens,
         },
+        workloadClasses: this.deserializeWorkloadClasses(row.workload_classes),
         createdAt: row.created_at.toISOString(),
       };
       const evaluation: PolicyEvaluationInput = {
@@ -438,6 +720,8 @@ export class PolicyStore implements InferenceExecutionStore {
     agentCapabilities: ApiCapability[];
     provider: string;
     model: string;
+    branchId?: string;
+    workloadClass?: string;
     estimatedCostAtomic: bigint;
     inputTokens: number;
     maxOutputTokens: number;
@@ -463,7 +747,7 @@ export class PolicyStore implements InferenceExecutionStore {
                 policies.required_capability, policies.max_per_call_atomic,
                 policies.max_hourly_atomic, policies.max_daily_atomic,
                 policies.max_requests_per_minute, policies.max_input_tokens,
-                policies.max_output_tokens, policies.created_at
+                policies.max_output_tokens, policies.workload_classes, policies.created_at
          FROM control_mandates mandates
          JOIN policy_versions policies
            ON policies.organization_id = mandates.organization_id
@@ -530,6 +814,63 @@ export class PolicyStore implements InferenceExecutionStore {
         spent_hour_atomic: "0", spent_day_atomic: "0", mandate_spent_atomic: "0",
         request_count_last_minute: 0,
       };
+      let workload: PolicyEvaluationInput["workload"];
+      let branch: MandateBranchRow | undefined;
+      const usageByClass = new Map<string, { invocationCount: number; spentAtomic: bigint }>();
+      if (input.branchId && input.workloadClass) {
+        const branchResult = await client.query<MandateBranchRow>(
+          `SELECT * FROM mandate_branches
+           WHERE organization_id = $1 AND mandate_id = $2 AND branch_id = $3`,
+          [input.organizationId, input.mandateId, input.branchId],
+        );
+        branch = branchResult.rows[0];
+        if (branch) this.verifyBranchIntegrity(branch);
+        const usage = await client.query<WorkloadUsageRow>(
+          `SELECT workload_class,
+                  COALESCE(SUM(CASE WHEN status <> 'denied' THEN 1 ELSE 0 END), 0)::int
+                    AS invocation_count,
+                  COALESCE(SUM(CASE
+                    WHEN status IN ('executing', 'reconciliation_hold') THEN reserved_cost_atomic
+                    WHEN status = 'completed' OR failure_code = 'RECONCILED_BILLED_NO_RESPONSE'
+                      THEN actual_cost_atomic
+                    ELSE 0 END), 0)::text AS spent_atomic
+           FROM inference_executions
+           WHERE organization_id = $1 AND mandate_id = $2 AND branch_id = $3
+             AND workload_class IS NOT NULL
+           GROUP BY workload_class`,
+          [input.organizationId, input.mandateId, input.branchId],
+        );
+        for (const row of usage.rows) {
+          usageByClass.set(row.workload_class, {
+            invocationCount: Number(row.invocation_count),
+            spentAtomic: BigInt(row.spent_atomic),
+          });
+        }
+        const classUsage = usageByClass.get(input.workloadClass);
+        const childAuthority = await client.query<{ total: string }>(
+          `SELECT COALESCE(SUM(maximum_spend_atomic), 0)::text AS total
+           FROM mandate_branches
+           WHERE organization_id = $1 AND mandate_id = $2 AND parent_branch_id = $3`,
+          [input.organizationId, input.mandateId, input.branchId],
+        );
+        const branchSpentAtomic = [...usageByClass.values()]
+          .reduce((total, current) => total + current.spentAtomic, 0n)
+          + BigInt(childAuthority.rows[0]?.total ?? "0");
+        workload = {
+          branchId: input.branchId,
+          workloadClass: input.workloadClass,
+          branchAuthorized: Boolean(branch
+            && branch.agent_id === input.agentId
+            && branch.policy_id === row.policy_id
+            && branch.policy_version === row.policy_version),
+          branchMaximumAtomic: branch ? BigInt(branch.maximum_spend_atomic) : 0n,
+          branchSpentAtomic,
+          branchExpiresAt: branch?.expires_at?.toISOString() ?? null,
+          classAuthorized: Boolean(branch?.allowed_workload_classes.includes(input.workloadClass)),
+          classInvocationCount: classUsage?.invocationCount ?? 0,
+          classSpentAtomic: classUsage?.spentAtomic ?? 0n,
+        };
+      }
       const policy: PolicyVersion = {
         id: row.policy_id,
         organizationId: input.organizationId,
@@ -546,6 +887,7 @@ export class PolicyStore implements InferenceExecutionStore {
           maxInputTokens: row.max_input_tokens,
           maxOutputTokens: row.max_output_tokens,
         },
+        workloadClasses: this.deserializeWorkloadClasses(row.workload_classes),
         createdAt: row.created_at.toISOString(),
       };
       const decisionInput: PolicyDecisionInput = {
@@ -556,6 +898,7 @@ export class PolicyStore implements InferenceExecutionStore {
         mandateSpentAtomic: BigInt(counter.mandate_spent_atomic),
         mandateMaximumAtomic: BigInt(row.mandate_maximum_spend_atomic),
         requestCountLastMinute: Number(counter.request_count_last_minute),
+        ...(workload ? { workload } : {}),
       };
       const evaluation = evaluatePolicy(policy, {
         now: input.decidedAt,
@@ -573,7 +916,41 @@ export class PolicyStore implements InferenceExecutionStore {
         mandateSpentAtomic: decisionInput.mandateSpentAtomic,
         mandateMaximumAtomic: decisionInput.mandateMaximumAtomic,
         requestCountLastMinute: decisionInput.requestCountLastMinute,
+        ...(workload ? { workload } : {}),
       });
+      if (workload?.branchAuthorized && branch) {
+        const allowedClasses = (policy.workloadClasses ?? [])
+          .filter(({ id }) => branch!.allowed_workload_classes.includes(id));
+        const branchLimitAtomic = BigInt(branch.maximum_spend_atomic);
+        const branchCommittedBeforeAtomic = allowedClasses.reduce(
+          (total, configured) => total + (usageByClass.get(configured.id)?.spentAtomic ?? 0n),
+          0n,
+        );
+        const classAuthorityRemainingAtomic = allowedClasses.reduce((total, configured) => {
+          const spent = usageByClass.get(configured.id)?.spentAtomic ?? 0n;
+          return total + (configured.aggregateBudgetAtomic > spent
+            ? configured.aggregateBudgetAtomic - spent : 0n);
+        }, 0n);
+        const lifetimeRemainingAtomic = branchLimitAtomic > branchCommittedBeforeAtomic
+          ? branchLimitAtomic - branchCommittedBeforeAtomic : 0n;
+        const branchRemainingBeforeAtomic = classAuthorityRemainingAtomic < lifetimeRemainingAtomic
+          ? classAuthorityRemainingAtomic : lifetimeRemainingAtomic;
+        const mandateRemainingBeforeAtomic = decisionInput.mandateMaximumAtomic
+          > decisionInput.mandateSpentAtomic
+          ? decisionInput.mandateMaximumAtomic - decisionInput.mandateSpentAtomic : 0n;
+        const maximumExposureAtomic = branchRemainingBeforeAtomic < mandateRemainingBeforeAtomic
+          ? branchRemainingBeforeAtomic : mandateRemainingBeforeAtomic;
+        const requestReservationAtomic = evaluation.outcome === "ALLOW"
+          ? input.estimatedCostAtomic : 0n;
+        decisionInput.exposure = {
+          branchLimitAtomic,
+          branchCommittedBeforeAtomic,
+          requestReservationAtomic,
+          maximumExposureAtomic,
+          remainingAuthorityAtomic: maximumExposureAtomic > requestReservationAtomic
+            ? maximumExposureAtomic - requestReservationAtomic : 0n,
+        };
+      }
       await client.query(
         `INSERT INTO policy_decisions
          (id, organization_id, request_id, mandate_id, agent_id, policy_id, policy_version,
@@ -602,13 +979,14 @@ export class PolicyStore implements InferenceExecutionStore {
       await client.query(
         `INSERT INTO inference_executions
          (organization_id, request_id, mandate_id, agent_id, decision_id, provider, model,
-          request_fingerprint, status, reserved_cost_atomic, input_tokens, max_output_tokens,
-          created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $13)`,
+          branch_id, workload_class, request_fingerprint, status, reserved_cost_atomic,
+          input_tokens, max_output_tokens, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $15)`,
         [
           input.organizationId, input.requestId, input.mandateId, input.agentId,
-          decision.id, input.provider, input.model, input.requestFingerprint, status,
-          reservation.toString(), input.inputTokens, input.maxOutputTokens, input.decidedAt,
+          decision.id, input.provider, input.model, input.branchId ?? null, input.workloadClass ?? null,
+          input.requestFingerprint, status, reservation.toString(), input.inputTokens,
+          input.maxOutputTokens, input.decidedAt,
         ],
       );
       return evaluation.outcome === "ALLOW"
@@ -626,7 +1004,7 @@ export class PolicyStore implements InferenceExecutionStore {
   }): Promise<CompletionPersistenceResult> {
     if (input.actualCostAtomic < 0n) throw new Error("ACTUAL_COST_INVALID");
     await this.ensureSchema();
-    return this.transaction(async (client) => {
+    const completion = await this.transaction(async (client) => {
       const execution = await client.query<InferenceExecutionRow>(
         `SELECT * FROM inference_executions
          WHERE organization_id = $1 AND request_id = $2 FOR UPDATE`,
@@ -647,10 +1025,13 @@ export class PolicyStore implements InferenceExecutionStore {
         );
         await this.holdMandateForReconciliation(client, input.organizationId, row.mandate_id);
         return {
-          status: "reconciliation_hold",
-          reservedCostAtomic,
-          actualCostAtomic: input.actualCostAtomic,
-          response: input.response,
+          result: {
+            status: "reconciliation_hold" as const,
+            reservedCostAtomic,
+            actualCostAtomic: input.actualCostAtomic,
+            response: input.response,
+          },
+          shadowQueued: false,
         };
       }
       await client.query(
@@ -661,13 +1042,32 @@ export class PolicyStore implements InferenceExecutionStore {
         [input.organizationId, input.requestId, input.actualCostAtomic.toString(),
           JSON.stringify(input.response), input.completedAt],
       );
+      const shadowQueued = await this.queueShadowBookkeepingBestEffort(
+        client,
+        { ...row, status: "completed", actual_cost_atomic: input.actualCostAtomic.toString(),
+          response_json: input.response, updated_at: new Date(input.completedAt) },
+        input.completedAt,
+      );
       return {
-        status: "completed",
-        reservedCostAtomic,
-        actualCostAtomic: input.actualCostAtomic,
-        response: input.response,
+        result: {
+          status: "completed" as const,
+          reservedCostAtomic,
+          actualCostAtomic: input.actualCostAtomic,
+          response: input.response,
+        },
+        shadowQueued,
       };
     });
+    if (!completion.shadowQueued || completion.result.status !== "completed") return completion.result;
+    const shadowEvaluation = await this.processShadowEvaluationBestEffort(
+      input.organizationId,
+      input.requestId,
+      input.completedAt,
+    );
+    return {
+      ...completion.result,
+      ...(shadowEvaluation ? { shadowEvaluation } : {}),
+    };
   }
 
   async holdInference(input: {
@@ -777,7 +1177,7 @@ export class PolicyStore implements InferenceExecutionStore {
       throw new Error("RECONCILIATION_RESOLUTION_INVALID");
     }
     await this.ensureSchema();
-    await this.transaction(async (client) => {
+    const shadowQueued = await this.transaction(async (client) => {
       const execution = await client.query<InferenceExecutionRow>(
         `SELECT * FROM inference_executions
          WHERE organization_id = $1 AND request_id = $2 FOR UPDATE`,
@@ -806,7 +1206,7 @@ export class PolicyStore implements InferenceExecutionStore {
           && existing.external_reference === input.externalReference
           && existing.resolved_by === input.actorId;
         if (!exactReplay) throw new Error("RECONCILIATION_RESOLUTION_CONFLICT");
-        return;
+        return Boolean(row.status === "completed" && row.branch_id && row.workload_class);
       }
       if (row.status !== "reconciliation_hold") throw new Error("RECONCILIATION_CASE_NOT_OPEN");
       await client.query(
@@ -833,6 +1233,16 @@ export class PolicyStore implements InferenceExecutionStore {
                WHERE organization_id = $1 AND request_id = $2`,
         [input.organizationId, input.requestId, actualCostAtomic.toString(), input.occurredAt],
       );
+      const mayCompleteWithScope = input.resolution === "settle" && row.response_json !== null
+        && Boolean(row.branch_id && row.workload_class);
+      const completedWithScope = mayCompleteWithScope
+        ? await this.queueShadowBookkeepingBestEffort(
+          client,
+          { ...row, status: "completed", actual_cost_atomic: actualCostAtomic.toString(),
+            updated_at: new Date(input.occurredAt) },
+          input.occurredAt,
+        )
+        : false;
       await this.appendAudit(client, {
         organizationId: input.organizationId,
         entityType: "inference_execution",
@@ -895,7 +1305,13 @@ export class PolicyStore implements InferenceExecutionStore {
           );
         }
       }
+      return completedWithScope;
     });
+    if (shadowQueued) {
+      await this.processShadowEvaluationBestEffort(
+        input.organizationId, input.requestId, input.occurredAt,
+      );
+    }
   }
 
   async listDecisions(organizationId: string, mandateId: string): Promise<StoredPolicyDecision[]> {
@@ -922,6 +1338,347 @@ export class PolicyStore implements InferenceExecutionStore {
       },
       input: this.deserializeDecisionInput(row.input_snapshot),
     }));
+  }
+
+  private async enqueueShadowEvaluation(
+    client: PoolClient,
+    organizationId: string,
+    requestId: string,
+    queuedAt: string,
+  ): Promise<void> {
+    await client.query(
+      `INSERT INTO shadow_evaluation_queue
+       (organization_id, request_id, state, attempts, queued_at, updated_at)
+       VALUES ($1, $2, 'pending', 0, $3, $3)
+       ON CONFLICT (organization_id, request_id) DO NOTHING`,
+      [organizationId, requestId, queuedAt],
+    );
+  }
+
+  private async queueShadowBookkeepingBestEffort(
+    client: PoolClient,
+    execution: InferenceExecutionRow,
+    queuedAt: string,
+  ): Promise<boolean> {
+    if (!execution.branch_id || !execution.workload_class) return false;
+    const supportsSavepoints = this.options.supportsSavepoints !== false;
+    if (supportsSavepoints) await client.query("SAVEPOINT shadow_bookkeeping");
+    try {
+      const scope = await this.assignShadowCohortOrdinal(client, execution);
+      if (!scope) {
+        await client.query(
+          `UPDATE inference_executions SET shadow_order_state = 'not_applicable'
+           WHERE organization_id = $1 AND request_id = $2`,
+          [execution.organization_id, execution.request_id],
+        );
+        if (supportsSavepoints) await client.query("RELEASE SAVEPOINT shadow_bookkeeping");
+        return false;
+      }
+      await this.enqueueShadowEvaluation(
+        client, execution.organization_id, execution.request_id, queuedAt,
+      );
+      await client.query(
+        `UPDATE inference_executions SET shadow_order_state = 'queued'
+         WHERE organization_id = $1 AND request_id = $2`,
+        [execution.organization_id, execution.request_id],
+      );
+      if (supportsSavepoints) await client.query("RELEASE SAVEPOINT shadow_bookkeeping");
+      return true;
+    } catch {
+      if (supportsSavepoints) await client.query("ROLLBACK TO SAVEPOINT shadow_bookkeeping");
+      await client.query(
+        `UPDATE inference_executions SET shadow_order_state = 'failed'
+         WHERE organization_id = $1 AND request_id = $2`,
+        [execution.organization_id, execution.request_id],
+      );
+      if (supportsSavepoints) await client.query("RELEASE SAVEPOINT shadow_bookkeeping");
+      return false;
+    }
+  }
+
+  private async assignShadowCohortOrdinal(
+    client: PoolClient,
+    execution: InferenceExecutionRow,
+  ): Promise<{ cohortKey: string; cohortOrdinal: bigint } | undefined> {
+    if (!execution.branch_id || !execution.workload_class) return undefined;
+    const branchResult = await client.query<MandateBranchRow>(
+      `SELECT * FROM mandate_branches
+       WHERE organization_id = $1 AND mandate_id = $2 AND branch_id = $3`,
+      [execution.organization_id, execution.mandate_id, execution.branch_id],
+    );
+    const branch = branchResult.rows[0];
+    if (!branch) throw new Error("MANDATE_BRANCH_NOT_FOUND");
+    this.verifyBranchIntegrity(branch);
+    if (!branch.parent_branch_id) return undefined;
+    const shadowPolicy = await client.query<{ workload_classes: SerializedWorkloadClass[] }>(
+      `SELECT workload_classes FROM policy_versions
+       WHERE organization_id = $1 AND policy_id = $2 AND version = $3`,
+      [execution.organization_id, branch.policy_id, branch.policy_version],
+    );
+    const shadowClass = this.deserializeWorkloadClasses(
+      shadowPolicy.rows[0]?.workload_classes ?? [],
+    ).find(({ id }) => id === execution.workload_class);
+    if (!shadowClass?.shadow) return undefined;
+    const cohortEnvelope = {
+      organizationId: execution.organization_id,
+      mandateId: execution.mandate_id,
+      parentBranchId: branch.parent_branch_id,
+      workloadClass: execution.workload_class,
+      provider: execution.provider,
+      model: execution.model,
+      policyId: branch.policy_id,
+      policyVersion: branch.policy_version,
+    } as const;
+    const cohortKey = createHash("sha256")
+      .update(JSON.stringify(cohortEnvelope))
+      .digest("hex");
+    const counter = await client.query<{ last_ordinal: string }>(
+      `INSERT INTO shadow_cohort_counters
+       (organization_id, cohort_key, last_ordinal, updated_at)
+       VALUES ($1, $2, 1, CURRENT_TIMESTAMP)
+       ON CONFLICT (organization_id, cohort_key) DO UPDATE
+       SET last_ordinal = shadow_cohort_counters.last_ordinal + 1,
+           updated_at = EXCLUDED.updated_at
+       RETURNING last_ordinal::text`,
+      [execution.organization_id, cohortKey],
+    );
+    const cohortOrdinal = BigInt(counter.rows[0]!.last_ordinal);
+    await client.query(
+      `UPDATE inference_executions
+       SET shadow_cohort_key = $3, shadow_cohort_ordinal = $4,
+           shadow_completed_at = clock_timestamp()
+       WHERE organization_id = $1 AND request_id = $2`,
+      [execution.organization_id, execution.request_id, cohortKey, cohortOrdinal.toString()],
+    );
+    return { cohortKey, cohortOrdinal };
+  }
+
+  private async processShadowEvaluationBestEffort(
+    organizationId: string,
+    requestId: string,
+    evaluatedAt: string,
+  ): Promise<ShadowEvaluationRecord | undefined> {
+    const claimToken = randomUUID();
+    const leaseExpiresAt = new Date(Date.now() + 5 * 60_000).toISOString();
+    try {
+      const claimed = await this.transaction(async (client) => {
+        const queue = await client.query<{
+          state: string; attempts: number; claim_token: string | null; lease_expires_at: Date | null;
+        }>(
+          `SELECT state, attempts, claim_token, lease_expires_at
+           FROM shadow_evaluation_queue
+           WHERE organization_id = $1 AND request_id = $2 FOR UPDATE`,
+          [organizationId, requestId],
+        );
+        const job = queue.rows[0];
+        if (!job || job.state === "completed" || job.attempts >= 3) {
+          const existing = await client.query<ShadowEvaluationRow>(
+            `SELECT * FROM shadow_evaluations
+             WHERE organization_id = $1 AND request_id = $2`,
+            [organizationId, requestId],
+          );
+          return { acquired: false as const,
+            evidence: existing.rows[0] ? this.shadowEvaluationFromRow(existing.rows[0]) : undefined };
+        }
+        if (job.claim_token && job.lease_expires_at
+          && job.lease_expires_at.getTime() > Date.now()) {
+          return { acquired: false as const, evidence: undefined };
+        }
+        await client.query(
+          `UPDATE shadow_evaluation_queue
+           SET attempts = attempts + 1, claim_token = $3, lease_expires_at = $4,
+               last_error = NULL, updated_at = $5
+           WHERE organization_id = $1 AND request_id = $2`,
+          [organizationId, requestId, claimToken, leaseExpiresAt, evaluatedAt],
+        );
+        return { acquired: true as const, evidence: undefined };
+      });
+      if (!claimed.acquired) return claimed.evidence;
+      return await this.transaction(async (client) => {
+        const ownership = await client.query<{ claim_token: string | null }>(
+          `SELECT claim_token FROM shadow_evaluation_queue
+           WHERE organization_id = $1 AND request_id = $2 FOR UPDATE`,
+          [organizationId, requestId],
+        );
+        if (ownership.rows[0]?.claim_token !== claimToken) return undefined;
+        const execution = await client.query<InferenceExecutionRow>(
+          `SELECT * FROM inference_executions
+           WHERE organization_id = $1 AND request_id = $2 AND status = 'completed'`,
+          [organizationId, requestId],
+        );
+        const row = execution.rows[0];
+        if (!row) return undefined;
+        const evidence = await this.evaluateAndPersistShadow(client, row);
+        await client.query(
+          `UPDATE shadow_evaluation_queue
+           SET state = 'completed', claim_token = NULL, lease_expires_at = NULL,
+               last_error = NULL, updated_at = $3
+           WHERE organization_id = $1 AND request_id = $2 AND claim_token = $4`,
+          [organizationId, requestId, evaluatedAt, claimToken],
+        );
+        return evidence;
+      });
+    } catch {
+      try {
+        await this.pool.query(
+          `UPDATE shadow_evaluation_queue
+           SET state = 'failed', claim_token = NULL, lease_expires_at = NULL,
+               last_error = 'SHADOW_EVALUATION_FAILED', updated_at = $3
+           WHERE organization_id = $1 AND request_id = $2
+             AND claim_token = $4
+             AND state IN ('pending', 'failed')
+             AND attempts <= 3
+             AND NOT EXISTS (
+               SELECT 1 FROM shadow_evaluations evidence
+               WHERE evidence.organization_id = $1 AND evidence.request_id = $2
+             )`,
+          [organizationId, requestId, evaluatedAt, claimToken],
+        );
+      } catch {
+        // Shadow telemetry must never alter the authoritative completion result.
+      }
+      return undefined;
+    }
+  }
+
+  async retryPendingShadowEvaluations(limit = 20): Promise<number> {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      throw new Error("SHADOW_RETRY_LIMIT_INVALID");
+    }
+    await this.ensureSchema();
+    const queued = await this.pool.query<{ organization_id: string; request_id: string; queued_at: Date }>(
+      `SELECT organization_id, request_id, queued_at FROM shadow_evaluation_queue
+       WHERE state IN ('pending', 'failed') AND attempts < 3
+         AND (claim_token IS NULL OR lease_expires_at <= clock_timestamp())
+       ORDER BY queued_at, request_id LIMIT $1`,
+      [limit],
+    );
+    let completed = 0;
+    for (const row of queued.rows) {
+      const evidence = await this.processShadowEvaluationBestEffort(
+        row.organization_id, row.request_id, row.queued_at.toISOString(),
+      );
+      if (evidence) completed += 1;
+    }
+    return completed;
+  }
+
+  async shadowQueueStatus(): Promise<{
+    pending: number; retryable: number; exhausted: number; completed: number;
+  }> {
+    await this.ensureSchema();
+    const result = await this.pool.query<{
+      pending: number; retryable: number; exhausted: number; completed: number;
+    }>(
+      `SELECT
+         COALESCE(SUM(CASE WHEN state = 'pending' THEN 1 ELSE 0 END), 0)::int AS pending,
+         COALESCE(SUM(CASE WHEN state = 'failed' AND attempts < 3 THEN 1 ELSE 0 END), 0)::int
+           AS retryable,
+         COALESCE(SUM(CASE WHEN state = 'failed' AND attempts >= 3 THEN 1 ELSE 0 END), 0)::int
+           AS exhausted,
+         COALESCE(SUM(CASE WHEN state = 'completed' THEN 1 ELSE 0 END), 0)::int AS completed
+       FROM shadow_evaluation_queue`,
+    );
+    return result.rows[0] ?? { pending: 0, retryable: 0, exhausted: 0, completed: 0 };
+  }
+
+  private async evaluateAndPersistShadow(
+    client: PoolClient,
+    execution: InferenceExecutionRow,
+  ): Promise<ShadowEvaluationRecord | undefined> {
+    if (!execution.branch_id || !execution.workload_class) return undefined;
+    if (!execution.shadow_cohort_key || execution.shadow_cohort_ordinal === null
+      || execution.shadow_completed_at === null) {
+      throw new Error("SHADOW_COHORT_ORDER_MISSING");
+    }
+    const canonicalEvaluatedAt = execution.shadow_completed_at.toISOString();
+    const branchResult = await client.query<MandateBranchRow>(
+      `SELECT * FROM mandate_branches
+       WHERE organization_id = $1 AND mandate_id = $2 AND branch_id = $3`,
+      [execution.organization_id, execution.mandate_id, execution.branch_id],
+    );
+    const branch = branchResult.rows[0];
+    if (branch) this.verifyBranchIntegrity(branch);
+    if (!branch?.parent_branch_id) return undefined;
+    const policyResult = await client.query<{ workload_classes: SerializedWorkloadClass[] }>(
+      `SELECT workload_classes FROM policy_versions
+       WHERE organization_id = $1 AND policy_id = $2 AND version = $3`,
+      [execution.organization_id, branch.policy_id, branch.policy_version],
+    );
+    const configured = this.deserializeWorkloadClasses(
+      policyResult.rows[0]?.workload_classes ?? [],
+    ).find(({ id }) => id === execution.workload_class);
+    if (!configured?.shadow) return undefined;
+    const windowStart = new Date(
+      Date.parse(canonicalEvaluatedAt) - configured.shadow.windowSeconds * 1_000,
+    ).toISOString();
+    const observations = await client.query<BranchObservationRow>(
+      `SELECT execution.branch_id,
+              COUNT(*)::int AS observation_count,
+              COALESCE(SUM(execution.actual_cost_atomic), 0)::text AS spend_atomic
+       FROM inference_executions execution
+       JOIN mandate_branches branch
+         ON branch.organization_id = execution.organization_id
+        AND branch.mandate_id = execution.mandate_id
+        AND branch.branch_id = execution.branch_id
+       WHERE execution.organization_id = $1
+         AND execution.mandate_id = $2
+         AND execution.workload_class = $3
+         AND execution.provider = $6
+         AND execution.model = $7
+         AND execution.status = 'completed'
+         AND execution.shadow_cohort_key = $10
+         AND execution.shadow_cohort_ordinal <= $11
+         AND execution.shadow_completed_at >= $4
+         AND branch.parent_branch_id = $5
+         AND branch.policy_id = $8
+         AND branch.policy_version = $9::int
+       GROUP BY execution.branch_id
+       ORDER BY execution.branch_id`,
+      [execution.organization_id, execution.mandate_id, execution.workload_class,
+        windowStart, branch.parent_branch_id, execution.provider, execution.model,
+        branch.policy_id, branch.policy_version,
+        execution.shadow_cohort_key, execution.shadow_cohort_ordinal],
+    );
+    const targetRow = observations.rows.find(({ branch_id }) => branch_id === execution.branch_id);
+    if (!targetRow) throw new Error("SHADOW_TARGET_OBSERVATION_MISSING");
+    const toObservation = (row: BranchObservationRow) => ({
+      branchId: row.branch_id,
+      parentBranchId: branch.parent_branch_id!,
+      workloadClass: execution.workload_class!,
+      spendAtomic: BigInt(row.spend_atomic),
+      observationCount: Number(row.observation_count),
+    });
+    const result = evaluateSiblingDivergence({
+      classPriorWindowSpendAtomic: configured.shadow.classPriorWindowSpendAtomic,
+      confidenceConstant: configured.shadow.confidenceConstant,
+      targetMinimumObservations: configured.shadow.targetMinimumObservations,
+      siblingMinimumForScoring: configured.shadow.siblingMinimumForScoring,
+      siblingMinimumForIntervention: configured.shadow.siblingMinimumForIntervention,
+      divergenceThresholdBps: configured.shadow.divergenceThresholdBps,
+    }, toObservation(targetRow), observations.rows.map(toObservation));
+    const record: ShadowEvaluationRecord = {
+      requestId: execution.request_id,
+      organizationId: execution.organization_id,
+      mandateId: execution.mandate_id,
+      branchId: execution.branch_id,
+      workloadClass: execution.workload_class,
+      provider: execution.provider,
+      model: execution.model,
+      cohortKey: execution.shadow_cohort_key,
+      cohortOrdinal: BigInt(execution.shadow_cohort_ordinal),
+      ...result,
+      evaluatedAt: canonicalEvaluatedAt,
+    };
+    await client.query(
+      `INSERT INTO shadow_evaluations
+       (organization_id, request_id, mandate_id, branch_id, workload_class, evidence, evaluated_at)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)
+       ON CONFLICT (organization_id, request_id) DO NOTHING`,
+      [record.organizationId, record.requestId, record.mandateId, record.branchId,
+        record.workloadClass, JSON.stringify(this.serializeShadowEvaluation(record)), canonicalEvaluatedAt],
+    );
+    return record;
   }
 
   private async holdMandateForReconciliation(
@@ -963,17 +1720,11 @@ export class PolicyStore implements InferenceExecutionStore {
             applied_at TIMESTAMPTZ NOT NULL
           )
         `);
-      },
-    );
-    const initialized = await this.pool.query(
-      "SELECT 1 FROM policy_schema_migrations WHERE version = 1",
-    );
-    if (initialized.rowCount !== 0) {
-      await this.migrateReconciliationSchema();
-      await this.migrateMandateReconciliationHoldSchema();
-      return;
-    }
-    await this.transaction(async (client) => {
+        const initialized = await client.query(
+          "SELECT 1 FROM policy_schema_migrations WHERE version = 1",
+        );
+        if (initialized.rowCount === 0) {
+          await this.transactionOnClient(client, async (transactionClient) => {
       const claimed = await client.query(
         `INSERT INTO policy_schema_migrations (version, applied_at)
          VALUES (1, CURRENT_TIMESTAMP)
@@ -1118,13 +1869,18 @@ export class PolicyStore implements InferenceExecutionStore {
       CREATE INDEX IF NOT EXISTS inference_executions_budget_idx
         ON inference_executions (organization_id, mandate_id, created_at, status);
       `);
-    });
-    await this.migrateReconciliationSchema();
-    await this.migrateMandateReconciliationHoldSchema();
+          });
+        }
+        await this.migrateReconciliationSchema(client);
+        await this.migrateMandateReconciliationHoldSchema(client);
+        await this.migrateWorkloadShadowSchema(client);
+        await this.migrateBranchAuthorityAndShadowQueueSchema(client);
+      },
+    );
   }
 
-  private async migrateReconciliationSchema(): Promise<void> {
-    await this.transaction(async (client) => {
+  private async migrateReconciliationSchema(client: PoolClient): Promise<void> {
+    await this.transactionOnClient(client, async (client) => {
       const migrated = await client.query(
         "SELECT 1 FROM policy_schema_migrations WHERE version = 2",
       );
@@ -1161,8 +1917,8 @@ export class PolicyStore implements InferenceExecutionStore {
     });
   }
 
-  private async migrateMandateReconciliationHoldSchema(): Promise<void> {
-    await this.transaction(async (client) => {
+  private async migrateMandateReconciliationHoldSchema(client: PoolClient): Promise<void> {
+    await this.transactionOnClient(client, async (client) => {
       const migrated = await client.query(
         "SELECT 1 FROM policy_schema_migrations WHERE version = 3",
       );
@@ -1193,6 +1949,136 @@ export class PolicyStore implements InferenceExecutionStore {
           FOREIGN KEY (organization_id, mandate_id)
             REFERENCES control_mandates(organization_id, id)
         )
+      `);
+    });
+  }
+
+  private async migrateWorkloadShadowSchema(client: PoolClient): Promise<void> {
+    await this.transactionOnClient(client, async (client) => {
+      const migrated = await client.query(
+        "SELECT 1 FROM policy_schema_migrations WHERE version = 4",
+      );
+      if (migrated.rowCount !== 0) return;
+      const existing = await client.query(
+        `SELECT 1 FROM information_schema.tables
+         WHERE table_schema = current_schema()
+           AND table_name IN ('mandate_branches', 'shadow_evaluations')`,
+      );
+      if (existing.rowCount !== 0) throw new Error("UNVERSIONED_WORKLOAD_SHADOW_SCHEMA_UNSUPPORTED");
+      const claimed = await client.query(
+        `INSERT INTO policy_schema_migrations (version, applied_at)
+         VALUES (4, CURRENT_TIMESTAMP)
+         ON CONFLICT (version) DO NOTHING
+         RETURNING version`,
+      );
+      if (claimed.rowCount === 0) return;
+      await client.query(`
+        ALTER TABLE policy_versions
+          ADD COLUMN IF NOT EXISTS workload_classes JSONB NOT NULL DEFAULT '[]'::jsonb;
+        ALTER TABLE inference_executions
+          ADD COLUMN IF NOT EXISTS branch_id TEXT,
+          ADD COLUMN IF NOT EXISTS workload_class TEXT;
+        CREATE TABLE IF NOT EXISTS mandate_branches (
+          organization_id TEXT NOT NULL,
+          mandate_id TEXT NOT NULL,
+          branch_id TEXT NOT NULL,
+          parent_branch_id TEXT,
+          agent_id TEXT NOT NULL,
+          policy_id TEXT NOT NULL,
+          policy_version INTEGER NOT NULL,
+          allowed_workload_classes JSONB NOT NULL,
+          delegation_hash TEXT NOT NULL,
+          authority_source TEXT NOT NULL CHECK (authority_source = 'fuse_control_plane'),
+          created_at TIMESTAMPTZ NOT NULL,
+          created_by TEXT NOT NULL,
+          PRIMARY KEY (organization_id, mandate_id, branch_id),
+          UNIQUE (organization_id, delegation_hash),
+          FOREIGN KEY (organization_id, mandate_id)
+            REFERENCES control_mandates(organization_id, id),
+          FOREIGN KEY (organization_id, agent_id)
+            REFERENCES agent_identities(organization_id, id),
+          FOREIGN KEY (organization_id, policy_id, policy_version)
+            REFERENCES policy_versions(organization_id, policy_id, version),
+          FOREIGN KEY (organization_id, mandate_id, parent_branch_id)
+            REFERENCES mandate_branches(organization_id, mandate_id, branch_id)
+        );
+        CREATE INDEX IF NOT EXISTS mandate_branches_parent_idx
+          ON mandate_branches (organization_id, mandate_id, parent_branch_id, branch_id);
+        CREATE TABLE IF NOT EXISTS shadow_evaluations (
+          organization_id TEXT NOT NULL,
+          request_id TEXT NOT NULL,
+          mandate_id TEXT NOT NULL,
+          branch_id TEXT NOT NULL,
+          workload_class TEXT NOT NULL,
+          evidence JSONB NOT NULL,
+          evaluated_at TIMESTAMPTZ NOT NULL,
+          PRIMARY KEY (organization_id, request_id),
+          FOREIGN KEY (organization_id, request_id)
+            REFERENCES inference_executions(organization_id, request_id),
+          FOREIGN KEY (organization_id, mandate_id, branch_id)
+            REFERENCES mandate_branches(organization_id, mandate_id, branch_id)
+        );
+        CREATE INDEX IF NOT EXISTS shadow_evaluations_mandate_idx
+          ON shadow_evaluations (organization_id, mandate_id, evaluated_at, request_id);
+      `);
+    });
+  }
+
+  private async migrateBranchAuthorityAndShadowQueueSchema(client: PoolClient): Promise<void> {
+    await this.transactionOnClient(client, async (client) => {
+      const migrated = await client.query(
+        "SELECT 1 FROM policy_schema_migrations WHERE version = 5",
+      );
+      if (migrated.rowCount !== 0) return;
+      const legacyBranches = await client.query("SELECT 1 FROM mandate_branches LIMIT 1");
+      if (legacyBranches.rowCount !== 0) {
+        throw new Error("BRANCH_AUTHORITY_V5_BACKFILL_REQUIRED");
+      }
+      const claimed = await client.query(
+        `INSERT INTO policy_schema_migrations (version, applied_at)
+         VALUES (5, CURRENT_TIMESTAMP)
+         ON CONFLICT (version) DO NOTHING
+         RETURNING version`,
+      );
+      if (claimed.rowCount === 0) return;
+      await client.query(`
+        ALTER TABLE inference_executions
+          ADD COLUMN IF NOT EXISTS shadow_cohort_key TEXT,
+          ADD COLUMN IF NOT EXISTS shadow_cohort_ordinal NUMERIC(78, 0),
+          ADD COLUMN IF NOT EXISTS shadow_completed_at TIMESTAMPTZ,
+          ADD COLUMN IF NOT EXISTS shadow_order_state TEXT;
+        ALTER TABLE mandate_branches
+          ADD COLUMN IF NOT EXISTS maximum_spend_atomic NUMERIC(78, 0),
+          ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
+        ALTER TABLE mandate_branches
+          ALTER COLUMN maximum_spend_atomic SET NOT NULL;
+        CREATE TABLE IF NOT EXISTS shadow_cohort_counters (
+          organization_id TEXT NOT NULL,
+          cohort_key TEXT NOT NULL,
+          last_ordinal NUMERIC(78, 0) NOT NULL CHECK (last_ordinal > 0),
+          updated_at TIMESTAMPTZ NOT NULL,
+          PRIMARY KEY (organization_id, cohort_key)
+        );
+        CREATE TABLE IF NOT EXISTS shadow_evaluation_queue (
+          organization_id TEXT NOT NULL,
+          request_id TEXT NOT NULL,
+          state TEXT NOT NULL CHECK (state IN ('pending', 'failed', 'completed')),
+          attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+          claim_token TEXT,
+          lease_expires_at TIMESTAMPTZ,
+          last_error TEXT,
+          queued_at TIMESTAMPTZ NOT NULL,
+          updated_at TIMESTAMPTZ NOT NULL,
+          PRIMARY KEY (organization_id, request_id),
+          FOREIGN KEY (organization_id, request_id)
+            REFERENCES inference_executions(organization_id, request_id)
+        );
+        ALTER TABLE shadow_evaluation_queue
+          ADD COLUMN IF NOT EXISTS claim_token TEXT;
+        ALTER TABLE shadow_evaluation_queue
+          ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ;
+        CREATE INDEX IF NOT EXISTS shadow_evaluation_queue_pending_idx
+          ON shadow_evaluation_queue (state, queued_at, request_id);
       `);
     });
   }
@@ -1241,16 +2127,25 @@ export class PolicyStore implements InferenceExecutionStore {
     if (!row.response_json || row.actual_cost_atomic === null) {
       throw new Error("INFERENCE_EXECUTION_RESPONSE_MISSING");
     }
+    const shadowResult = await client.query<ShadowEvaluationRow>(
+      `SELECT * FROM shadow_evaluations
+       WHERE organization_id = $1 AND request_id = $2`,
+      [row.organization_id, row.request_id],
+    );
+    const shadowEvaluation = shadowResult.rows[0]
+      ? this.shadowEvaluationFromRow(shadowResult.rows[0]) : undefined;
     return {
       status: "completed",
       decision,
       reservedCostAtomic: BigInt(row.reserved_cost_atomic),
       actualCostAtomic: BigInt(row.actual_cost_atomic),
       response: row.response_json,
+      ...(shadowEvaluation ? { shadowEvaluation } : {}),
     };
   }
 
   private policyFromRow(row: PolicyRow): PolicyVersion {
+    const workloadClasses = this.deserializeWorkloadClasses(row.workload_classes);
     const policy: PolicyVersion = {
       id: row.policy_id,
       organizationId: row.organization_id,
@@ -1267,6 +2162,7 @@ export class PolicyStore implements InferenceExecutionStore {
         maxInputTokens: row.max_input_tokens,
         maxOutputTokens: row.max_output_tokens,
       },
+      ...(workloadClasses.length > 0 ? { workloadClasses } : {}),
       createdAt: row.created_at.toISOString(),
     };
     validatePolicy(policy);
@@ -1282,17 +2178,146 @@ export class PolicyStore implements InferenceExecutionStore {
       spentDayAtomic: input.spentDayAtomic.toString(),
       mandateSpentAtomic: input.mandateSpentAtomic.toString(),
       mandateMaximumAtomic: input.mandateMaximumAtomic.toString(),
+      ...(input.workload ? {
+        workload: {
+          ...input.workload,
+          branchMaximumAtomic: input.workload.branchMaximumAtomic.toString(),
+          branchSpentAtomic: input.workload.branchSpentAtomic.toString(),
+          classSpentAtomic: input.workload.classSpentAtomic.toString(),
+        },
+      } : {}),
+      ...(input.exposure ? {
+        exposure: Object.fromEntries(
+          Object.entries(input.exposure).map(([key, value]) => [key, value.toString()]),
+        ),
+      } : {}),
     };
   }
 
   private deserializeDecisionInput(snapshot: DecisionSnapshot): PolicyDecisionInput {
+    const { workload, exposure, ...rest } = snapshot;
     return {
-      ...snapshot,
+      ...rest,
       estimatedCostAtomic: BigInt(snapshot.estimatedCostAtomic),
       spentHourAtomic: BigInt(snapshot.spentHourAtomic),
       spentDayAtomic: BigInt(snapshot.spentDayAtomic),
       mandateSpentAtomic: BigInt(snapshot.mandateSpentAtomic),
       mandateMaximumAtomic: BigInt(snapshot.mandateMaximumAtomic),
+      ...(workload ? {
+        workload: {
+          ...workload,
+          branchMaximumAtomic: BigInt(workload.branchMaximumAtomic),
+          branchSpentAtomic: BigInt(workload.branchSpentAtomic),
+          classSpentAtomic: BigInt(workload.classSpentAtomic),
+        },
+      } : {}),
+      ...(exposure ? {
+        exposure: {
+          branchLimitAtomic: BigInt(exposure.branchLimitAtomic),
+          branchCommittedBeforeAtomic: BigInt(exposure.branchCommittedBeforeAtomic),
+          requestReservationAtomic: BigInt(exposure.requestReservationAtomic),
+          maximumExposureAtomic: BigInt(exposure.maximumExposureAtomic),
+          remainingAuthorityAtomic: BigInt(exposure.remainingAuthorityAtomic),
+        },
+      } : {}),
+    };
+  }
+
+  private cloneWorkloadClasses(workloadClasses: readonly WorkloadClassPolicy[]): WorkloadClassPolicy[] {
+    return workloadClasses.map((workloadClass) => ({
+      ...workloadClass,
+      shadow: workloadClass.shadow ? { ...workloadClass.shadow } : null,
+    }));
+  }
+
+  private serializeWorkloadClasses(
+    workloadClasses: readonly WorkloadClassPolicy[],
+  ): SerializedWorkloadClass[] {
+    return workloadClasses.map((workloadClass) => ({
+      ...workloadClass,
+      maxCostPerCallAtomic: workloadClass.maxCostPerCallAtomic.toString(),
+      aggregateBudgetAtomic: workloadClass.aggregateBudgetAtomic.toString(),
+      shadow: workloadClass.shadow ? {
+        ...workloadClass.shadow,
+        classPriorWindowSpendAtomic: workloadClass.shadow.classPriorWindowSpendAtomic.toString(),
+      } : null,
+    }));
+  }
+
+  private deserializeWorkloadClasses(
+    workloadClasses: readonly SerializedWorkloadClass[],
+  ): WorkloadClassPolicy[] {
+    return workloadClasses.map((workloadClass) => ({
+      ...workloadClass,
+      maxCostPerCallAtomic: BigInt(workloadClass.maxCostPerCallAtomic),
+      aggregateBudgetAtomic: BigInt(workloadClass.aggregateBudgetAtomic),
+      shadow: workloadClass.shadow ? {
+        ...workloadClass.shadow,
+        classPriorWindowSpendAtomic: BigInt(workloadClass.shadow.classPriorWindowSpendAtomic),
+      } : null,
+    }));
+  }
+
+  private verifyBranchIntegrity(row: MandateBranchRow): void {
+    if (row.authority_source !== "fuse_control_plane") {
+      throw new Error("MANDATE_BRANCH_AUTHORITY_SOURCE_INVALID");
+    }
+    const canonical = {
+      authoritySource: row.authority_source,
+      organizationId: row.organization_id,
+      mandateId: row.mandate_id,
+      branchId: row.branch_id,
+      parentBranchId: row.parent_branch_id,
+      agentId: row.agent_id,
+      policyId: row.policy_id,
+      policyVersion: row.policy_version,
+      allowedWorkloadClasses: row.allowed_workload_classes,
+      maximumSpendAtomic: BigInt(row.maximum_spend_atomic).toString(),
+      expiresAt: row.expires_at?.toISOString() ?? null,
+      createdAt: row.created_at.toISOString(),
+      createdBy: row.created_by,
+    } as const;
+    const expected = createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+    if (row.delegation_hash !== expected) {
+      throw new Error("MANDATE_BRANCH_DELEGATION_HASH_INVALID");
+    }
+  }
+
+  private branchFromRow(row: MandateBranchRow): MandateBranch {
+    this.verifyBranchIntegrity(row);
+    return {
+      id: row.branch_id,
+      organizationId: row.organization_id,
+      mandateId: row.mandate_id,
+      parentBranchId: row.parent_branch_id,
+      agentId: row.agent_id,
+      policyId: row.policy_id,
+      policyVersion: row.policy_version,
+      allowedWorkloadClasses: [...row.allowed_workload_classes],
+      maximumSpendAtomic: BigInt(row.maximum_spend_atomic),
+      expiresAt: row.expires_at?.toISOString() ?? null,
+      delegationHash: row.delegation_hash,
+      authoritySource: row.authority_source,
+      createdAt: row.created_at.toISOString(),
+      createdBy: row.created_by,
+    };
+  }
+
+  private shadowEvaluationFromRow(row: ShadowEvaluationRow): ShadowEvaluationRecord {
+    return {
+      ...row.evidence,
+      cohortOrdinal: BigInt(row.evidence.cohortOrdinal),
+      siblingAggregateAtomic: BigInt(row.evidence.siblingAggregateAtomic),
+      effectiveBaselineAtomic: BigInt(row.evidence.effectiveBaselineAtomic),
+    };
+  }
+
+  private serializeShadowEvaluation(record: ShadowEvaluationRecord): SerializedShadowEvaluation {
+    return {
+      ...record,
+      cohortOrdinal: record.cohortOrdinal.toString(),
+      siblingAggregateAtomic: record.siblingAggregateAtomic.toString(),
+      effectiveBaselineAtomic: record.effectiveBaselineAtomic.toString(),
     };
   }
 
@@ -1333,20 +2358,94 @@ export class PolicyStore implements InferenceExecutionStore {
     );
   }
 
-  private async transaction<T>(operation: (client: PoolClient) => Promise<T>): Promise<T> {
-    const client = await this.pool.connect();
+  private async transactionOnClient<T>(
+    client: PoolClient,
+    operation: (client: PoolClient) => Promise<T>,
+  ): Promise<T> {
+    await client.query("BEGIN");
     try {
-      await client.query("BEGIN");
       const result = await operation(client);
       await client.query("COMMIT");
       return result;
     } catch (error) {
       await client.query("ROLLBACK");
       throw error;
+    }
+  }
+
+  private async transaction<T>(operation: (client: PoolClient) => Promise<T>): Promise<T> {
+    const client = await this.pool.connect();
+    try {
+      return await this.transactionOnClient(client, operation);
     } finally {
       client.release();
     }
   }
+}
+
+interface SerializedWorkloadClass {
+  id: string;
+  maxCostPerCallAtomic: string;
+  maxInvocationsPerBranch: number;
+  aggregateBudgetAtomic: string;
+  minimumInputTokens: number;
+  shadow: null | {
+    classPriorWindowSpendAtomic: string;
+    windowSeconds: number;
+    targetMinimumObservations: number;
+    siblingMinimumForScoring: number;
+    siblingMinimumForIntervention: number;
+    confidenceConstant: number;
+    divergenceThresholdBps: number;
+  };
+}
+
+interface MandateBranchRow {
+  organization_id: string;
+  mandate_id: string;
+  branch_id: string;
+  parent_branch_id: string | null;
+  agent_id: string;
+  policy_id: string;
+  policy_version: number;
+  allowed_workload_classes: string[];
+  maximum_spend_atomic: string;
+  expires_at: Date | null;
+  delegation_hash: string;
+  authority_source: "fuse_control_plane";
+  created_at: Date;
+  created_by: string;
+}
+
+interface WorkloadUsageRow {
+  workload_class: string;
+  invocation_count: number;
+  spent_atomic: string;
+}
+
+interface BranchObservationRow {
+  branch_id: string;
+  observation_count: number;
+  spend_atomic: string;
+}
+
+type SerializedShadowEvaluation = Omit<
+  ShadowEvaluationRecord,
+  "cohortOrdinal" | "siblingAggregateAtomic" | "effectiveBaselineAtomic"
+> & {
+  cohortOrdinal: string;
+  siblingAggregateAtomic: string;
+  effectiveBaselineAtomic: string;
+};
+
+interface ShadowEvaluationRow {
+  organization_id: string;
+  request_id: string;
+  mandate_id: string;
+  branch_id: string;
+  workload_class: string;
+  evidence: SerializedShadowEvaluation;
+  evaluated_at: Date;
 }
 
 interface InferenceExecutionRow {
@@ -1357,6 +2456,12 @@ interface InferenceExecutionRow {
   decision_id: string;
   provider: string;
   model: string;
+  branch_id: string | null;
+  workload_class: string | null;
+  shadow_cohort_key: string | null;
+  shadow_cohort_ordinal: string | null;
+  shadow_completed_at: Date | null;
+
   request_fingerprint: string;
   status: "denied" | "executing" | "completed" | "failed" | "reconciliation_hold";
   reserved_cost_atomic: string;
@@ -1383,6 +2488,7 @@ interface PolicyRow {
   max_requests_per_minute: number;
   max_input_tokens: number;
   max_output_tokens: number;
+  workload_classes: SerializedWorkloadClass[];
   created_at: Date;
 }
 
@@ -1402,6 +2508,7 @@ interface MandatePolicyRow {
   max_requests_per_minute: number;
   max_input_tokens: number;
   max_output_tokens: number;
+  workload_classes: SerializedWorkloadClass[];
   created_at: Date;
 }
 
@@ -1422,6 +2529,19 @@ interface DecisionSnapshot {
   mandateSpentAtomic: string;
   mandateMaximumAtomic: string;
   requestCountLastMinute: number;
+  workload?: Omit<NonNullable<PolicyEvaluationInput["workload"]>,
+    "branchMaximumAtomic" | "branchSpentAtomic" | "classSpentAtomic"> & {
+    branchMaximumAtomic: string;
+    branchSpentAtomic: string;
+    classSpentAtomic: string;
+  };
+  exposure?: {
+    branchLimitAtomic: string;
+    branchCommittedBeforeAtomic: string;
+    requestReservationAtomic: string;
+    maximumExposureAtomic: string;
+    remainingAuthorityAtomic: string;
+  };
   decidedAt: string;
 }
 

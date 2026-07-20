@@ -12,6 +12,35 @@ it("creates a tenant-provider runtime without a deployment-wide provider credent
   })).not.toThrow();
 });
 
+it("requires an explicit boolean workload-shadow rollout flag", () => {
+  const base = {
+    DATABASE_URL: databaseUrl,
+    FUSE_PROVIDER_MODE: "tenant",
+    FUSE_PROVIDER_CREDENTIAL_ACTIVE_KEY_ID: "v1",
+    FUSE_PROVIDER_CREDENTIAL_KEY_V1: Buffer.alloc(32, 8).toString("base64"),
+  };
+  expect(() => createRuntimeApp({ ...base, FUSE_WORKLOAD_SHADOW_ENABLED: "yes" }))
+    .toThrow("FUSE_WORKLOAD_SHADOW_ENABLED_INVALID");
+  expect(() => createRuntimeApp({ ...base, FUSE_WORKLOAD_SHADOW_ENABLED: "true" }))
+    .not.toThrow();
+});
+
+it("requires an unpooled database connection for schema bootstrap", () => {
+  const base = {
+    FUSE_PROVIDER_MODE: "tenant",
+    FUSE_PROVIDER_CREDENTIAL_ACTIVE_KEY_ID: "v1",
+    FUSE_PROVIDER_CREDENTIAL_KEY_V1: Buffer.alloc(32, 7).toString("base64"),
+  };
+  expect(() => createRuntimeApp({
+    ...base, DATABASE_URL: "postgres://u:p@ep-example-pooler.us-east-2.aws.neon.tech/db",
+  })).toThrow("DATABASE_URL_UNPOOLED_REQUIRED");
+  expect(() => createRuntimeApp({
+    ...base,
+    DATABASE_URL: "postgres://u:p@ep-example-pooler.us-east-2.aws.neon.tech/db",
+    DATABASE_URL_UNPOOLED: databaseUrl,
+  })).not.toThrow();
+});
+
 it("fails closed in production when tenant provider mode is not configured", () => {
   expect(() => createRuntimeApp({
     NODE_ENV: "production",

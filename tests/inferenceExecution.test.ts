@@ -1,4 +1,4 @@
-import { newDb } from "pg-mem";
+import { DataType, newDb } from "pg-mem";
 import { expect, it } from "vitest";
 import type { Pool } from "pg";
 import type { InferenceProvider } from "../src/core/service.js";
@@ -32,8 +32,13 @@ async function setup(options: {
   maxRequestsPerMinute?: number;
   mode?: "dry_run" | "enforce";
   maxInputTokens?: number;
+  workloadClasses?: boolean;
 } = {}) {
   const db = newDb({ noAstCoverageCheck: true });
+  db.public.registerFunction({
+    name: "clock_timestamp", returns: DataType.timestamptz,
+    implementation: () => new Date(), impure: true,
+  });
   const adapter = db.adapters.createPg();
   const pool = new adapter.Pool() as unknown as Pool;
   const now = "2026-07-13T23:00:00.000Z";
@@ -50,7 +55,7 @@ async function setup(options: {
     name: "Mans Primary",
     ...context,
   });
-  const policies = new PolicyStore(pool);
+  const policies = new PolicyStore(pool, { supportsSavepoints: false });
   await policies.publishPolicy({
     id: "shaly-inference",
     organizationId: "org-shaly",
@@ -67,6 +72,13 @@ async function setup(options: {
       maxInputTokens: options.maxInputTokens ?? 20_000,
       maxOutputTokens: 4_000,
     },
+    ...(options.workloadClasses ? {
+      workloadClasses: [{
+        id: "lookup", maxCostPerCallAtomic: 2_000n, maxInvocationsPerBranch: 10,
+        aggregateBudgetAtomic: 10_000n, minimumInputTokens: 1,
+        shadow: null,
+      }],
+    } : {}),
     createdAt: now,
   }, context);
   await policies.createMandate({
@@ -86,6 +98,14 @@ async function setup(options: {
       organizationId: "org-shaly",
       mandateId: "shaly-main",
       agentId: "mans-primary",
+      ...context,
+    });
+  }
+  if (options.workloadClasses && options.assignAgent !== false) {
+    await policies.createBranch({
+      id: "branch-main", organizationId: "org-shaly", mandateId: "shaly-main",
+      parentBranchId: null, agentId: "mans-primary", allowedWorkloadClasses: ["lookup"],
+      maximumSpendAtomic: 10_000n, expiresAt: null,
       ...context,
     });
   }
@@ -558,6 +578,32 @@ it("records a policy denial without provider invocation or monetary reservation"
   await pool.end();
 });
 
+it("denies unauthorized workload escalation before provider invocation", async () => {
+  const { pool, policies } = await setup({ workloadClasses: true });
+  const provider = new CountingProvider();
+  const service = new InferenceExecutionService({
+    provider, store: policies, providerName: "openrouter",
+    model: "anthropic/claude-sonnet-4.6",
+    price: { inputUsdPerMillion: "3.00", outputUsdPerMillion: "15.00" },
+    now: () => "2026-07-13T23:01:00.000Z",
+  });
+
+  const result = await service.execute({
+    requestId: "req-workload-escalation", organizationId: "org-shaly",
+    mandateId: "shaly-main", agentId: "mans-primary",
+    agentCapabilities: ["inference:invoke"], branchId: "branch-main",
+    workloadClass: "summary", inputTokens: 100, maxOutputTokens: 100,
+    messages: [{ role: "user", content: "Summarize the full corpus" }],
+  });
+
+  expect(result).toMatchObject({
+    status: "denied",
+    decision: { result: { reasonCodes: ["WORKLOAD_CLASS_NOT_ALLOWED"] } },
+  });
+  expect(provider.calls).toBe(0);
+  await pool.end();
+});
+
 it("does not let denied attempts consume an authorized mandate rate quota", async () => {
   const { pool, policies } = await setup({ maxRequestsPerMinute: 1 });
   const provider = new CountingProvider();
@@ -661,7 +707,7 @@ it("replays a completed request without a second provider invocation", async () 
 });
 
 it("rejects reuse of an idempotency key for a different controlled request", async () => {
-  const { pool, policies } = await setup();
+  const { pool, policies } = await setup({ workloadClasses: true });
   const provider = new CountingProvider();
   const service = new InferenceExecutionService({
     provider,
@@ -681,10 +727,13 @@ it("rejects reuse of an idempotency key for a different controlled request", asy
     maxOutputTokens: 100,
   };
 
-  await service.execute({ ...base, messages: [{ role: "user", content: "first" }] });
+  await service.execute({
+    ...base, branchId: "branch-main", workloadClass: "lookup",
+    messages: [{ role: "user", content: "first" }],
+  });
   await expect(service.execute({
-    ...base,
-    messages: [{ role: "user", content: "different" }],
+    ...base, branchId: "branch-main", workloadClass: "summary",
+    messages: [{ role: "user", content: "first" }],
   })).rejects.toThrow("IDEMPOTENCY_CONFLICT");
   expect(provider.calls).toBe(1);
   await pool.end();

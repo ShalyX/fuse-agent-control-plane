@@ -86,6 +86,10 @@ describe("PolicyAdministration", () => {
         maxPerCallAtomic: 10_000n, maxHourlyAtomic: 50_000n, maxDailyAtomic: 250_000n,
         maxRequestsPerMinute: 10, maxInputTokens: 20_000, maxOutputTokens: 4_000,
       },
+      workloadClasses: [{
+        id: "lookup", maxCostPerCallAtomic: 2_000n, maxInvocationsPerBranch: 10,
+        aggregateBudgetAtomic: 10_000n, minimumInputTokens: 1, shadow: null,
+      }],
       requestId: "request:policy-2",
     });
     await administration.setMandatePolicy(principal, {
@@ -94,11 +98,24 @@ describe("PolicyAdministration", () => {
       policyVersion: 2,
       requestId: "request:bind-2",
     });
+    const branch = await administration.createBranch(principal, {
+      branchId: "branch-agent-1", mandateId: "mandate-1", parentBranchId: null,
+      agentId: "agent-1", allowedWorkloadClasses: ["lookup"],
+      maximumSpendAtomic: 10_000n, expiresAt: null,
+      requestId: "request:branch-agent-1",
+    });
+
+    expect(branch).toMatchObject({
+      id: "branch-agent-1", policyId: "policy-1", policyVersion: 2,
+      authoritySource: "fuse_control_plane", allowedWorkloadClasses: ["lookup"],
+    });
+    expect(branch.delegationHash).toMatch(/^[a-f0-9]{64}$/);
 
     expect((await store.getPolicy("org-1", "policy-1", 1))?.mode).toBe("dry_run");
     const viewer = { ...principal, role: "viewer" as const, capabilities: ["policies:read"] as const };
     expect((await administration.getPolicy(viewer, "policy-1", 1))?.organizationId).toBe("org-1");
     expect(await administration.listDecisions(viewer, "mandate-1")).toEqual([]);
+    expect(await administration.listShadowEvaluations(viewer, "mandate-1")).toEqual([]);
     const audit = await pool.query(
       "SELECT organization_id, actor_id, action FROM audit_events WHERE action = 'mandate.agent_assigned'",
     );

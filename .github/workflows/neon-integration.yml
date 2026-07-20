@@ -1,4 +1,4 @@
-name: Neon provider concurrency
+name: Neon persistence integration
 
 on:
   pull_request:
@@ -12,7 +12,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  provider-configuration-races:
+  persistence-integration:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -35,3 +35,5 @@ jobs:
         run: npm ci
       - name: Verify cross-instance provider races on Neon
         run: npx vitest run tests/providerConfigStore.neon.test.ts
+      - name: Verify workload shadow migrations and evidence on Neon
+        run: npx vitest run tests/workloadShadowStore.neon.test.ts

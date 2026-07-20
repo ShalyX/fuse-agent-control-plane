@@ -1,12 +1,14 @@
 import type { AdministrativePrincipal } from "../identity/credentialAdministration.js";
 import type { ApiCapability } from "../identity/apiCredentials.js";
-import type { PolicyLimits, PolicyMode, PolicyVersion } from "../domain/policy.js";
+import type { PolicyLimits, PolicyMode, PolicyVersion, WorkloadClassPolicy } from "../domain/policy.js";
 import type { MandateState } from "../domain/lifecycles.js";
 import type {
   PolicyStore,
   ReconciliationCase,
   ReconciliationResolution,
   StoredPolicyDecision,
+  MandateBranch,
+  ShadowEvaluationRecord,
 } from "../persistence/policyStore.js";
 
 export interface PublishPolicyInput {
@@ -17,6 +19,18 @@ export interface PublishPolicyInput {
   allowedModels: string[];
   requiredCapability: ApiCapability;
   limits: PolicyLimits;
+  workloadClasses?: WorkloadClassPolicy[];
+  requestId: string;
+}
+
+export interface CreateBranchInput {
+  branchId: string;
+  mandateId: string;
+  parentBranchId: string | null;
+  agentId: string;
+  allowedWorkloadClasses: string[];
+  maximumSpendAtomic: bigint;
+  expiresAt: string | null;
   requestId: string;
 }
 
@@ -63,6 +77,7 @@ export interface PolicyAdministrationPort {
   publishPolicy(principal: AdministrativePrincipal, input: PublishPolicyInput): Promise<void>;
   createMandate(principal: AdministrativePrincipal, input: CreateMandateInput): Promise<void>;
   assignAgent(principal: AdministrativePrincipal, input: AssignAgentInput): Promise<void>;
+  createBranch(principal: AdministrativePrincipal, input: CreateBranchInput): Promise<MandateBranch>;
   transitionMandate(
     principal: AdministrativePrincipal,
     input: TransitionMandateInput,
@@ -85,6 +100,10 @@ export interface PolicyAdministrationPort {
     principal: AdministrativePrincipal,
     mandateId: string,
   ): Promise<StoredPolicyDecision[]>;
+  listShadowEvaluations(
+    principal: AdministrativePrincipal,
+    mandateId: string,
+  ): Promise<ShadowEvaluationRecord[]>;
 }
 
 export class PolicyAdministration implements PolicyAdministrationPort {
@@ -109,6 +128,12 @@ export class PolicyAdministration implements PolicyAdministrationPort {
       allowedModels: [...input.allowedModels],
       requiredCapability: input.requiredCapability,
       limits: { ...input.limits },
+      ...(input.workloadClasses ? {
+        workloadClasses: input.workloadClasses.map((workloadClass) => ({
+          ...workloadClass,
+          shadow: workloadClass.shadow ? { ...workloadClass.shadow } : null,
+        })),
+      } : {}),
       createdAt: occurredAt,
     }, this.context(principal, input.requestId, occurredAt));
   }
@@ -145,6 +170,26 @@ export class PolicyAdministration implements PolicyAdministrationPort {
       organizationId: principal.organizationId,
       mandateId: input.mandateId,
       agentId: input.agentId,
+      ...this.context(principal, input.requestId, occurredAt),
+    });
+  }
+
+  async createBranch(
+    principal: AdministrativePrincipal,
+    input: CreateBranchInput,
+  ): Promise<MandateBranch> {
+    this.requireAdmin(principal, "mandates:admin", "MANDATE_CAPABILITY_REQUIRED");
+    this.requireRequestId(input.requestId);
+    const occurredAt = this.now();
+    return this.store.createBranch({
+      id: input.branchId,
+      organizationId: principal.organizationId,
+      mandateId: input.mandateId,
+      parentBranchId: input.parentBranchId,
+      agentId: input.agentId,
+      allowedWorkloadClasses: [...input.allowedWorkloadClasses],
+      maximumSpendAtomic: input.maximumSpendAtomic,
+      expiresAt: input.expiresAt,
       ...this.context(principal, input.requestId, occurredAt),
     });
   }
@@ -223,6 +268,15 @@ export class PolicyAdministration implements PolicyAdministrationPort {
     this.requireServiceCapability(principal, "policies:read", "POLICY_CAPABILITY_REQUIRED");
     if (!mandateId.trim()) throw new Error("CONTROL_MANDATE_ID_REQUIRED");
     return this.store.listDecisions(principal.organizationId, mandateId);
+  }
+
+  async listShadowEvaluations(
+    principal: AdministrativePrincipal,
+    mandateId: string,
+  ): Promise<ShadowEvaluationRecord[]> {
+    this.requireServiceCapability(principal, "policies:read", "POLICY_CAPABILITY_REQUIRED");
+    if (!mandateId.trim()) throw new Error("CONTROL_MANDATE_ID_REQUIRED");
+    return this.store.listShadowEvaluations(principal.organizationId, mandateId);
   }
 
   private requireServiceCapability(
