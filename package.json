@@ -18,6 +18,9 @@
     "smoke:production": "tsx scripts/smoke-production.ts",
     "migrate:provider-config": "tsx scripts/migrate-provider-config.ts",
     "shadow:retry": "tsx scripts/process-shadow-queue.ts",
+    "evidence:fixtures": "tsx scripts/generate-evidence-fixtures.ts",
+    "evidence:fixtures:dry": "tsx scripts/generate-evidence-fixtures.ts --dry-run",
+    "evidence:replay": "tsx scripts/replay-evidence.ts",
     "check": "npm test && npm run build"
   },
   "dependencies": {
