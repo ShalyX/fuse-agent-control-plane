@@ -60,7 +60,10 @@ describe("fixture setup contract", () => {
       expiresAt: null,
     });
 
-    for (const branch of plan.filter(({ kind }) => kind === "branch")) {
+    const branches = plan.filter(({ kind }) => kind === "branch");
+    expect(branches.find(({ body }) => body.branchId === "f2-parent")?.body.maximumSpendAtomic).toBe("800000");
+    expect(branches.find(({ body }) => body.branchId === "f2-runaway")?.body.maximumSpendAtomic).toBe("550000");
+    for (const branch of branches) {
       expect(branch.body).toEqual({
         branchId: expect.any(String),
         parentBranchId: branch.body.parentBranchId,

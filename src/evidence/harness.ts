@@ -79,10 +79,10 @@ const SPIKE = "spike-burst";
 const branchDefinitions: readonly BranchDefinition[] = [
   { branchId: "f1-parent", parentBranchId: null, classes: [BASELINE, EXPENSIVE], maximumSpendAtomic: "300000" },
   { branchId: "f1-normal", parentBranchId: "f1-parent", classes: [BASELINE, EXPENSIVE], maximumSpendAtomic: "250000" },
-  { branchId: "f2-parent", parentBranchId: null, classes: [BASELINE, SPIKE], maximumSpendAtomic: "500000" },
+  { branchId: "f2-parent", parentBranchId: null, classes: [BASELINE, SPIKE], maximumSpendAtomic: "800000" },
   { branchId: "f2-healthy-1", parentBranchId: "f2-parent", classes: [BASELINE], maximumSpendAtomic: "100000" },
   { branchId: "f2-healthy-2", parentBranchId: "f2-parent", classes: [BASELINE], maximumSpendAtomic: "100000" },
-  { branchId: "f2-runaway", parentBranchId: "f2-parent", classes: [SPIKE], maximumSpendAtomic: "250000" },
+  { branchId: "f2-runaway", parentBranchId: "f2-parent", classes: [SPIKE], maximumSpendAtomic: "550000" },
   { branchId: "f3-parent", parentBranchId: null, classes: [EXPENSIVE], maximumSpendAtomic: "400000" },
   { branchId: "f3-unusual-1", parentBranchId: "f3-parent", classes: [EXPENSIVE], maximumSpendAtomic: "180000" },
   { branchId: "f3-unusual-2", parentBranchId: "f3-parent", classes: [EXPENSIVE], maximumSpendAtomic: "180000" },
@@ -180,6 +180,9 @@ export function buildFixtureCallPlan(runId: string, model: string): FixtureCall[
 
   add(2, "f2-healthy-1", BASELINE, 50);
   add(2, "f2-healthy-2", BASELINE, 50);
+  // Behavioral evaluation is shadow-only. Deterministic authority is sized for the
+  // worst-case 10 × 50,000-atomic class envelope, so these calls must complete;
+  // a denial would contaminate the behavioral fixture rather than prove detection.
   for (let index = 0; index < 10; index++) {
     add(2, "f2-runaway", SPIKE, 600, "runaway", "completed");
   }
