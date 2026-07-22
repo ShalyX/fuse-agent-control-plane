@@ -125,11 +125,27 @@ The calibrated run `testnet-20260721-hermes4-v6` executed against the deployed F
 - cumulative cost across calibration and transient-failure runs: 196,701 USD-micros (`$0.196701`)
 - no x402 challenge was returned on this authenticated control-mode route, so no Circle payment occurred
 
+### Claim boundary
+
+This run validates the authenticated policy/anomaly path, real provider-billed inference, provider-cost persistence, and authoritative replay. It did **not** exercise x402 challenge handling, Circle payment authorization/transfer, or the combined metered-payment-plus-policy path end to end. It is therefore evidence for the policy engine and provider-cost accounting—not evidence that the full Circle-backed payment integration behaves this way.
+
 The deterministic gates behaved as intended: one unauthorized-class denial, one pre-execution model-binding denial, and three branch-budget denials after seven Fixture 10 completions.
 
 In the controlled A/B/C replay, B and C each emitted 14 warnings with four false warnings. C additionally projected four interventions, all on the labeled Fixture 2 runaway child, and projected no intervention on legitimate fixtures. The first sibling-divergence signal arrived after 1,308 USD-micros of labeled runaway spend. This is controlled-fixture evidence of incremental intervention selectivity; it is not held-out live efficacy and does not by itself establish a moat.
+
+### Why v3 and v5 are calibration, not pooled v6 replicates
+
+Both were complete, real, paid 92-attempt runs, and they are retained in the calibration ledger rather than treated as nonexistent:
+
+- `v3`: Fixture 2's healthy siblings used a different workload class from the runaway target, so persisted evaluation found zero comparable siblings. Its three-sibling intervention threshold was also unreachable at fan-out three.
+- `v5`: workload class and threshold were corrected, but each healthy sibling still had only one observation, below cohort maturity. Persisted evaluation again found zero comparable siblings.
+- `v4`: stopped after 82 attempts on a provider HTTP 502 and has no complete replay.
+- `v6`: is the first run where the target and siblings share a class, both healthy siblings are mature, and the intervention threshold is reachable.
+
+Accordingly, v3 and v5 are useful negative calibration findings, but pooling their intervention counts with v6 would mix materially different test configurations. They do provide a descriptive check on warning behavior: v3, v5, and v6 produced 12 false warnings across 202 labeled legitimate completed evaluations (5.94%), and 12 of 50 warning events were false (24%). That is **not** an independent-sample estimate: the runs reused fixed scenarios and changed the sibling configuration. The final v6 intervention result remains one calibrated run and should not be presented as a stable rate until the exact v6 configuration is repeated on fresh/held-out fixtures.
 
 Committed evidence:
 
 - `evidence/fixtures/testnet-20260721-hermes4-v6.json`
 - `evidence/replay/testnet-20260721-hermes4-v6.json`
+- `evidence/calibration/testnet-20260721-run-ledger.json`

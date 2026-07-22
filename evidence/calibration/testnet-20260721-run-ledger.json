@@ -1,0 +1,117 @@
+{
+  "schemaVersion": 1,
+  "series": "testnet-20260721-hermes4",
+  "claimBoundary": {
+    "validated": [
+      "authenticated Fuse control-path policy admission",
+      "real provider-billed inference",
+      "provider-cost persistence and authoritative replay",
+      "persisted class-prior and sibling-divergence shadow evaluation"
+    ],
+    "notValidated": [
+      "x402 challenge handling",
+      "Circle payment authorization or transfer",
+      "combined metered-payment-plus-policy behavior end to end",
+      "held-out production efficacy"
+    ]
+  },
+  "runs": [
+    {
+      "runId": "testnet-20260721-hermes4",
+      "phase": "running",
+      "attempts": 92,
+      "completed": 90,
+      "denied": 2,
+      "providerCostAtomic": "38316",
+      "classification": "discarded calibration",
+      "reasonNotPooled": "Fixture 10 did not reach its original branch budget; final validation failed."
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v2",
+      "phase": "complete",
+      "attempts": 92,
+      "completed": 80,
+      "denied": 12,
+      "providerCostAtomic": "27182",
+      "policyC": {
+        "warnings": 13,
+        "falseWarnings": 4,
+        "wouldIntervene": 0
+      },
+      "classification": "discarded calibration",
+      "reasonNotPooled": "Fixture 10 was over-corrected and denied all ten budget attempts immediately; Fixture 2 still lacked a valid comparable sibling cohort."
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v3",
+      "phase": "complete",
+      "attempts": 92,
+      "completed": 87,
+      "denied": 5,
+      "providerCostAtomic": "35472",
+      "legitimateCompleted": 66,
+      "policyC": {
+        "warnings": 18,
+        "falseWarnings": 4,
+        "wouldIntervene": 0
+      },
+      "classification": "completed calibration, not a replicate of v6",
+      "reasonNotPooled": "Fixture 2 healthy siblings used a different workload class from the runaway target, producing zero comparable siblings; its intervention threshold of three siblings was also unreachable at fan-out three."
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v4",
+      "phase": "running",
+      "attempts": 82,
+      "completed": 80,
+      "denied": 2,
+      "providerCostAtomic": "28058",
+      "classification": "partial transient-failure run",
+      "reasonNotPooled": "The provider returned HTTP 502 before Fixture 10; no complete replay exists."
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v5",
+      "phase": "complete",
+      "attempts": 92,
+      "completed": 87,
+      "denied": 5,
+      "providerCostAtomic": "35232",
+      "legitimateCompleted": 66,
+      "policyC": {
+        "warnings": 18,
+        "falseWarnings": 4,
+        "wouldIntervene": 0
+      },
+      "classification": "completed calibration, not a replicate of v6",
+      "reasonNotPooled": "Workload class and intervention threshold were corrected, but each healthy sibling had only one observation, below cohort maturity; persisted evidence still reported zero comparable siblings."
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "phase": "complete",
+      "attempts": 92,
+      "completed": 87,
+      "denied": 5,
+      "providerCostAtomic": "32441",
+      "legitimateCompleted": 70,
+      "policyC": {
+        "warnings": 14,
+        "falseWarnings": 4,
+        "wouldIntervene": 4
+      },
+      "classification": "final calibrated controlled run",
+      "reasonSelected": "Healthy siblings and target share a workload class, each sibling reaches cohort maturity, and the fan-out-three intervention threshold is reachable."
+    }
+  ],
+  "descriptiveCalibrationAggregate": {
+    "includedRuns": [
+      "testnet-20260721-hermes4-v3",
+      "testnet-20260721-hermes4-v5",
+      "testnet-20260721-hermes4-v6"
+    ],
+    "falseWarnings": 12,
+    "legitimateCompleted": 202,
+    "falseWarningRateAmongLegitimateEvaluations": 0.0594059405940594,
+    "warningEvents": 50,
+    "falseShareOfWarnings": 0.24,
+    "interpretation": "Descriptive calibration incidence only. These runs reused fixed scenarios and changed the sibling-cohort configuration, so they are neither independent samples nor valid pooled estimates of the final v6 policy."
+  },
+  "seriesProviderCostAtomic": "196701"
+}
