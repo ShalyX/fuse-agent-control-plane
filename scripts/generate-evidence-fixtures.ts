@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { createRequire } from "node:module";
 import type { initiateDeveloperControlledWalletsClient as InitiateClient } from "@circle-fin/developer-controlled-wallets";
@@ -8,14 +8,18 @@ import { x402Client } from "@x402/core/client";
 import { x402HTTPClient } from "@x402/core/http";
 import { createCircleGatewaySigner } from "../src/circle/developerWalletSigner.js";
 import {
+  buildEvidenceConfiguration,
+  buildEvidenceConfigurationFingerprint,
   buildFixtureCallPlan,
   buildFixtureSetupPlan,
   fixtureScenarios,
   validateEvidenceRunId,
   validateFixtureOutcomes,
   validateFuseUrl,
+  validateReplicationBaseline,
   type AttemptManifestEntry,
   type FixtureCall,
+  type ReplicationBaselineManifest,
   type SetupOperation,
 } from "../src/evidence/harness.js";
 
@@ -43,6 +47,19 @@ const baseUrl = validateFuseUrl(
 );
 const setupPlan = buildFixtureSetupPlan({ runId, provider, model, mandateId, policyId, agentId });
 const callPlan = buildFixtureCallPlan(runId, model);
+const configuration = buildEvidenceConfiguration(provider, model);
+const configurationFingerprint = buildEvidenceConfigurationFingerprint(configuration);
+const configurationFingerprintProvenance = "pre-run-generated" as const;
+const baselinePath = process.env["FUSE_EVIDENCE_BASELINE_MANIFEST"]?.trim();
+let replicationBaselineRunId: string | null = null;
+if (baselinePath) {
+  const baseline = JSON.parse(await readFile(baselinePath, "utf8")) as ReplicationBaselineManifest;
+  replicationBaselineRunId = validateReplicationBaseline(
+    baseline,
+    configurationFingerprint,
+    configuration.calls.length,
+  ).baselineRunId;
+}
 
 if (dryRun) {
   console.log(JSON.stringify({
@@ -50,6 +67,9 @@ if (dryRun) {
     runId,
     provider,
     model,
+    configurationFingerprint,
+    configurationFingerprintProvenance,
+    replicationBaselineRunId,
     mandateId,
     policyId,
     agentId,
@@ -114,7 +134,7 @@ console.log(JSON.stringify({ phase: "complete", runId, attempts: attempts.length
 async function persistManifest(phase: "running" | "complete"): Promise<void> {
   await mkdir(dirname(outputPath), { recursive: true });
   await writeFile(outputPath, JSON.stringify({
-    schemaVersion: 1,
+    schemaVersion: 2,
     phase,
     runId,
     mandateId,
@@ -122,6 +142,9 @@ async function persistManifest(phase: "running" | "complete"): Promise<void> {
     agentId,
     provider,
     model,
+    configurationFingerprint,
+    configurationFingerprintProvenance,
+    replicationBaselineRunId,
     generatedAt: new Date().toISOString(),
     attempts,
   }, null, 2), { mode: 0o600 });

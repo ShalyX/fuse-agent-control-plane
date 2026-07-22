@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "phase": "complete",
   "runId": "testnet-20260721-hermes4-v6",
   "mandateId": "fixture-testnet-20260721-hermes4-v6",
@@ -7,6 +7,9 @@
   "agentId": "fixture-agent-testnet-20260721-hermes4-v6",
   "provider": "openrouter",
   "model": "nousresearch/hermes-4-405b",
+  "configurationFingerprint": "sha256:797af3ef88a718744628f35b1a13bf64edb69caa7f7b868a01a075179c9a933d",
+  "configurationFingerprintProvenance": "post-hoc-db-verified",
+  "replicationBaselineRunId": null,
   "generatedAt": "2026-07-22T00:15:46.381Z",
   "attempts": [
     {

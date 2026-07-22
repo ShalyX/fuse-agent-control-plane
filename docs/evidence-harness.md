@@ -7,7 +7,7 @@ It does **not** reconstruct cohorts, invent observations, or claim behavioral en
 ## Safety and trust boundaries
 
 - `npm run evidence:fixtures:dry` performs no network or paid calls and requires no credentials.
-- `npm run evidence:fixtures` performs real provider calls and Circle x402 payments. It currently plans 92 attempts across the ten fixtures.
+- `npm run evidence:fixtures` performs real provider calls and makes a Circle x402 payment only when the target route actually returns a valid 402 challenge. It currently plans 92 attempts across the ten fixtures.
 - The administrative token is used only for setup. The one-time agent token is retained only in process memory and is never written to the manifest.
 - Request IDs are headers. Strict API request bodies contain no `requestId`, `mandateId`, or other unknown fields.
 - The runner registers the agent, issues the runtime credential, publishes the policy, creates the draft mandate, assigns the agent, creates **all** branches, and activates only after branch creation.
@@ -52,6 +52,7 @@ FUSE_PROVIDER             # anthropic or openrouter; must match tenant configura
 FUSE_EVIDENCE_MODEL       # exact configured tenant model
 ANTHROPIC_MODEL           # legacy fallback when FUSE_EVIDENCE_MODEL is unset
 FUSE_EVIDENCE_RUN_ID       # optional; use a fresh ID per run
+FUSE_EVIDENCE_BASELINE_MANIFEST # optional; required for fingerprint-guarded replication
 ```
 
 Run:
@@ -91,6 +92,36 @@ The replay command:
 - **C — branch-aware:** uses persisted `wouldSignalTarget`, `eligibleForIntervention`, signals, and immutable cohort ordinals. It does not fabricate parents, observations, or cohort membership.
 
 The report includes coverage, hard denials, warnings, projected C interventions, false warnings from fixture labels, and spend before first signal. Missing shadow evidence is listed explicitly rather than silently treated as a negative signal.
+
+## Exact-configuration replication
+
+Manifest schema v2 includes a SHA-256 configuration fingerprint over the run-independent provider/model binding, runtime capabilities, policy and shadow settings, mandate ceiling, complete branch authority tree, scenario descriptors, and all 92 call specifications. Run IDs, request IDs, mandate IDs, agent IDs, and timestamps are excluded.
+
+The v6 baseline fingerprint is:
+
+```text
+sha256:797af3ef88a718744628f35b1a13bf64edb69caa7f7b868a01a075179c9a933d
+```
+
+Because v6 predates fingerprint support, its manifest labels this anchor `post-hoc-db-verified`: the canonical configuration was reconstructed from the exact harness revision and checked against the deployed policy, branch, execution, and shadow-evidence rows. Future manifests are labeled `pre-run-generated`. These provenance classes remain explicit and are never pooled silently.
+
+Guard a dry run before any paid setup:
+
+```bash
+export FUSE_EVIDENCE_BASELINE_MANIFEST="$PWD/evidence/fixtures/testnet-20260721-hermes4-v6.json"
+export FUSE_EVIDENCE_RUN_ID="<fresh-replication-id>"
+npm run evidence:fixtures:dry
+```
+
+The command exits with `EVIDENCE_REPLICATION_CONFIGURATION_MISMATCH` before setup or provider traffic if any fingerprinted configuration differs. The v6 fingerprint is also frozen by a regression test; an intentional configuration change starts a new baseline series rather than rewriting v6. After reviewing the dry-run output, run `npm run evidence:fixtures`, replay the new manifest, then compare reports:
+
+```bash
+npm run evidence:compare -- \
+  evidence/replay/testnet-20260721-hermes4-v6.json \
+  evidence/replay/<fresh-replication-id>.json
+```
+
+The comparator requires a complete candidate report, complete persisted shadow coverage, the exact baseline fingerprint, and `replicationBaselineRunId` pointing to v6. It reports exact agreement separately for hard denials, C warnings, C false warnings, and projected C interventions; disagreement is evidence, not an automatic failure to hide.
 
 `operatorRecoveryTime` and `actualBehavioralInterventions` are explicitly unavailable: the current evaluator is shadow-only and the harness contains no human operator timing experiment.
 

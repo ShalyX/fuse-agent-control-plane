@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 export type FixtureLabel = "legitimate" | "runaway" | "hard-deny";
 export type AttemptOutcome = "completed" | "denied" | "error";
 
@@ -148,6 +150,35 @@ export interface FixtureCall {
   expected: "completed" | "denied" | "completed-or-denied";
 }
 
+export interface EvidenceConfiguration {
+  schemaVersion: 1;
+  provider: "anthropic" | "openrouter";
+  model: string;
+  fixtures: Array<{ id: number; name: string; fanOut: number }>;
+  runtimeCapabilities: string[];
+  policy: Record<string, unknown>;
+  mandate: Record<string, unknown>;
+  branches: Array<{
+    branchId: string;
+    parentBranchId: string | null;
+    allowedWorkloadClasses: string[];
+    maximumSpendAtomic: string;
+    expiresAt: null;
+  }>;
+  calls: Array<Omit<FixtureCall, "runId" | "mandateId" | "requestId">>;
+}
+
+export interface ReplicationBaselineManifest {
+  schemaVersion: number;
+  phase: string;
+  runId: string;
+  provider: string;
+  model: string;
+  configurationFingerprint: string;
+  configurationFingerprintProvenance: string;
+  attempts: unknown[];
+}
+
 export function buildFixtureCallPlan(runId: string, model: string): FixtureCall[] {
   const calls: FixtureCall[] = [];
   const mandateId = `fixture-${runId}`;
@@ -221,6 +252,203 @@ export function buildFixtureCallPlan(runId: string, model: string): FixtureCall[
     add(10, "f10-budget", BASELINE, 1_000, "hard-deny", "completed-or-denied");
   }
   return calls;
+}
+
+export function buildEvidenceConfiguration(
+  provider: "anthropic" | "openrouter",
+  model: string,
+): EvidenceConfiguration {
+  const sentinel = "configuration-fingerprint";
+  const setup = buildFixtureSetupPlan({
+    runId: sentinel,
+    provider,
+    model,
+    mandateId: `fixture-${sentinel}`,
+    policyId: `fixture-policy-${sentinel}`,
+    agentId: `fixture-agent-${sentinel}`,
+  });
+  const credential = setup.find(({ kind }) => kind === "agentCredential")?.body;
+  const policy = setup.find(({ kind }) => kind === "policy")?.body;
+  const mandate = setup.find(({ kind }) => kind === "mandate")?.body;
+  if (!credential || !policy || !mandate) throw new Error("EVIDENCE_CONFIGURATION_INVALID");
+  const capabilities = credential["capabilities"];
+  if (!Array.isArray(capabilities) || !capabilities.every((value) => typeof value === "string")) {
+    throw new Error("EVIDENCE_CONFIGURATION_INVALID");
+  }
+  const { policyId: ignoredPolicyId, ...policyConfiguration } = policy;
+  const {
+    mandateId: ignoredMandateId,
+    name: ignoredMandateName,
+    policyId: ignoredMandatePolicyId,
+    ...mandateConfiguration
+  } = mandate;
+  void ignoredPolicyId;
+  void ignoredMandateId;
+  void ignoredMandateName;
+  void ignoredMandatePolicyId;
+  const calls = buildFixtureCallPlan(sentinel, model).map((call) => ({
+    fixtureId: call.fixtureId,
+    branchId: call.branchId,
+    workloadClass: call.workloadClass,
+    model: call.model,
+    contextUnits: call.contextUnits,
+    maxOutputTokens: call.maxOutputTokens,
+    label: call.label,
+    expected: call.expected,
+  }));
+  return {
+    schemaVersion: 1,
+    provider,
+    model,
+    fixtures: fixtureScenarios.map(({ id, name, fanOut }) => ({ id, name, fanOut })),
+    runtimeCapabilities: [...capabilities],
+    policy: policyConfiguration,
+    mandate: mandateConfiguration,
+    branches: branchDefinitions.map((branch) => ({
+      branchId: branch.branchId,
+      parentBranchId: branch.parentBranchId,
+      allowedWorkloadClasses: [...branch.classes],
+      maximumSpendAtomic: branch.maximumSpendAtomic,
+      expiresAt: null,
+    })),
+    calls,
+  };
+}
+
+export function buildEvidenceConfigurationFingerprint(
+  configuration: EvidenceConfiguration,
+): string {
+  const canonical = canonicalJson(configuration);
+  return `sha256:${createHash("sha256").update(canonical).digest("hex")}`;
+}
+
+export function validateReplicationBaseline(
+  baseline: ReplicationBaselineManifest,
+  configurationFingerprint: string,
+  expectedAttemptCount: number,
+): { baselineRunId: string; configurationFingerprint: string } {
+  if (baseline.schemaVersion !== 2
+    || !baseline.runId?.trim()
+    || !/^sha256:[a-f0-9]{64}$/.test(baseline.configurationFingerprint)
+    || baseline.configurationFingerprint !== configurationFingerprint) {
+    throw new Error("EVIDENCE_REPLICATION_CONFIGURATION_MISMATCH");
+  }
+  if (baseline.configurationFingerprintProvenance !== "pre-run-generated"
+    && baseline.configurationFingerprintProvenance !== "post-hoc-db-verified") {
+    throw new Error("EVIDENCE_REPLICATION_PROVENANCE_INVALID");
+  }
+  if (baseline.phase !== "complete"
+    || !Array.isArray(baseline.attempts)
+    || baseline.attempts.length !== expectedAttemptCount) {
+    throw new Error("EVIDENCE_REPLICATION_BASELINE_INCOMPLETE");
+  }
+  return { baselineRunId: baseline.runId, configurationFingerprint };
+}
+
+export interface ReplicationComparableReport {
+  runId: string;
+  phase: "complete";
+  configurationFingerprint: string;
+  configurationFingerprintProvenance: string;
+  replicationBaselineRunId: string | null;
+  policies: {
+    A: { hardDenials: number; warnings: number; wouldIntervene: number; falseWarnings: number };
+    B: { hardDenials: number; warnings: number; wouldIntervene: number; falseWarnings: number };
+    C: { hardDenials: number; warnings: number; wouldIntervene: number; falseWarnings: number };
+  };
+  coverage: {
+    attempts: number;
+    completed: number;
+    denied: number;
+    withPersistedShadowEvidence: number;
+    missingShadowEvidence: string[];
+  };
+}
+
+export interface ReplicationComparison {
+  baselineRunId: string;
+  configurationFingerprint: string;
+  candidateCount: number;
+  runs: Array<{
+    runId: string;
+    hardDenials: number;
+    policyCWarnings: number;
+    policyCFalseWarnings: number;
+    policyCWouldIntervene: number;
+  }>;
+  exactOutcomeAgreement: {
+    hardDenials: boolean;
+    policyCWarnings: boolean;
+    policyCFalseWarnings: boolean;
+    policyCWouldIntervene: boolean;
+  };
+}
+
+export function buildReplicationComparison(
+  baseline: ReplicationComparableReport,
+  candidates: readonly ReplicationComparableReport[],
+): ReplicationComparison {
+  validateCompleteReplicationReport(baseline);
+  if (candidates.length === 0) throw new Error("EVIDENCE_REPLICATION_CANDIDATE_REQUIRED");
+  for (const candidate of candidates) {
+    if (candidate.configurationFingerprintProvenance !== "pre-run-generated") {
+      throw new Error("EVIDENCE_REPLICATION_PROVENANCE_INVALID");
+    }
+    if (candidate.configurationFingerprint !== baseline.configurationFingerprint) {
+      throw new Error("EVIDENCE_REPLICATION_CONFIGURATION_MISMATCH");
+    }
+    if (candidate.replicationBaselineRunId !== baseline.runId) {
+      throw new Error("EVIDENCE_REPLICATION_BASELINE_MISMATCH");
+    }
+    if (candidate.coverage.attempts !== baseline.coverage.attempts) {
+      throw new Error("EVIDENCE_REPLICATION_INCOMPLETE");
+    }
+    validateCompleteReplicationReport(candidate);
+  }
+  const runs = [baseline, ...candidates].map((report) => ({
+    runId: report.runId,
+    hardDenials: report.policies.A.hardDenials,
+    policyCWarnings: report.policies.C.warnings,
+    policyCFalseWarnings: report.policies.C.falseWarnings,
+    policyCWouldIntervene: report.policies.C.wouldIntervene,
+  }));
+  const exact = (key: keyof Omit<(typeof runs)[number], "runId">): boolean =>
+    runs.every((run) => run[key] === runs[0]![key]);
+  return {
+    baselineRunId: baseline.runId,
+    configurationFingerprint: baseline.configurationFingerprint,
+    candidateCount: candidates.length,
+    runs,
+    exactOutcomeAgreement: {
+      hardDenials: exact("hardDenials"),
+      policyCWarnings: exact("policyCWarnings"),
+      policyCFalseWarnings: exact("policyCFalseWarnings"),
+      policyCWouldIntervene: exact("policyCWouldIntervene"),
+    },
+  };
+}
+
+function validateCompleteReplicationReport(report: ReplicationComparableReport): void {
+  if (report.phase !== "complete"
+    || !report.runId.trim()
+    || !/^sha256:[a-f0-9]{64}$/.test(report.configurationFingerprint)
+    || (report.configurationFingerprintProvenance !== "pre-run-generated"
+      && report.configurationFingerprintProvenance !== "post-hoc-db-verified")
+    || report.coverage.attempts !== report.coverage.completed + report.coverage.denied
+    || report.coverage.withPersistedShadowEvidence !== report.coverage.completed
+    || report.coverage.missingShadowEvidence.length > 0) {
+    throw new Error("EVIDENCE_REPLICATION_INCOMPLETE");
+  }
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right));
+    return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
 }
 
 export function validateEvidenceRunId(value: string): string {

@@ -2,8 +2,11 @@
   "schemaVersion": 1,
   "runId": "testnet-20260721-hermes4-v6",
   "mandateId": "fixture-testnet-20260721-hermes4-v6",
+  "configurationFingerprint": "sha256:797af3ef88a718744628f35b1a13bf64edb69caa7f7b868a01a075179c9a933d",
+  "configurationFingerprintProvenance": "post-hoc-db-verified",
+  "replicationBaselineRunId": null,
   "sourceManifest": "evidence/fixtures/testnet-20260721-hermes4-v6.json",
-  "generatedAt": "2026-07-22T00:17:39.915Z",
+  "generatedAt": "2026-07-22T02:43:45.818Z",
   "authoritativeCoverage": {
     "executionRows": 91,
     "preExecutionDenials": [

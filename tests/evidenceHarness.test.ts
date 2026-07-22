@@ -1,8 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
+  buildEvidenceConfiguration,
+  buildEvidenceConfigurationFingerprint,
   buildFixtureCallPlan,
   buildFixtureSetupPlan,
   buildReplayReport,
+  buildReplicationComparison,
+  validateReplicationBaseline,
   validateAuthoritativeAttempts,
   validateEvidenceRunId,
   validateFixtureOutcomes,
@@ -117,6 +121,69 @@ describe("fixture setup contract", () => {
     expect(calls.every(({ mandateId }) => mandateId === "fixture-run-1")).toBe(true);
   });
 
+  it("fingerprints the complete run-independent fixture configuration", () => {
+    const configuration = buildEvidenceConfiguration("openrouter", "nousresearch/hermes-4-405b");
+    const fingerprint = buildEvidenceConfigurationFingerprint(configuration);
+
+    expect(configuration.schemaVersion).toBe(1);
+    expect(configuration.fixtures).toHaveLength(10);
+    expect(configuration.branches.find(({ branchId }) => branchId === "f2-healthy-1")?.allowedWorkloadClasses)
+      .toEqual(["spike-burst"]);
+    expect(configuration.calls).toHaveLength(92);
+    expect(fingerprint).toBe("sha256:797af3ef88a718744628f35b1a13bf64edb69caa7f7b868a01a075179c9a933d");
+    expect(buildEvidenceConfigurationFingerprint(
+      buildEvidenceConfiguration("openrouter", "nousresearch/hermes-4-405b"),
+    )).toBe(fingerprint);
+    expect(buildEvidenceConfigurationFingerprint(
+      buildEvidenceConfiguration("openrouter", "different-model"),
+    )).not.toBe(fingerprint);
+  });
+
+  it("rejects replication before setup when its configuration differs from the baseline", () => {
+    const configuration = buildEvidenceConfiguration("openrouter", "nousresearch/hermes-4-405b");
+    const fingerprint = buildEvidenceConfigurationFingerprint(configuration);
+    expect(validateReplicationBaseline({
+      schemaVersion: 2,
+      phase: "complete",
+      runId: "baseline-v6",
+      provider: "openrouter",
+      model: "nousresearch/hermes-4-405b",
+      configurationFingerprint: fingerprint,
+      configurationFingerprintProvenance: "post-hoc-db-verified",
+      attempts: Array.from({ length: 92 }),
+    }, fingerprint, 92)).toEqual({ baselineRunId: "baseline-v6", configurationFingerprint: fingerprint });
+    expect(() => validateReplicationBaseline({
+      schemaVersion: 2,
+      phase: "complete",
+      runId: "wrong",
+      provider: "openrouter",
+      model: "different-model",
+      configurationFingerprint: "sha256:" + "0".repeat(64),
+      configurationFingerprintProvenance: "pre-run-generated",
+      attempts: Array.from({ length: 92 }),
+    }, fingerprint, 92)).toThrow("EVIDENCE_REPLICATION_CONFIGURATION_MISMATCH");
+    expect(() => validateReplicationBaseline({
+      schemaVersion: 2,
+      phase: "running",
+      runId: "partial",
+      provider: "openrouter",
+      model: "nousresearch/hermes-4-405b",
+      configurationFingerprint: fingerprint,
+      configurationFingerprintProvenance: "post-hoc-db-verified",
+      attempts: Array.from({ length: 82 }),
+    }, fingerprint, 92)).toThrow("EVIDENCE_REPLICATION_BASELINE_INCOMPLETE");
+    expect(() => validateReplicationBaseline({
+      schemaVersion: 2,
+      phase: "complete",
+      runId: "unknown-provenance",
+      provider: "openrouter",
+      model: "nousresearch/hermes-4-405b",
+      configurationFingerprint: fingerprint,
+      configurationFingerprintProvenance: "unknown",
+      attempts: Array.from({ length: 92 }),
+    }, fingerprint, 92)).toThrow("EVIDENCE_REPLICATION_PROVENANCE_INVALID");
+  });
+
   it("rejects unsafe run IDs and enforces fixture-specific denial truth", () => {
     expect(validateEvidenceRunId("evidence-123.good")).toBe("evidence-123.good");
     expect(() => validateEvidenceRunId("../escape")).toThrow("EVIDENCE_RUN_ID_INVALID");
@@ -193,5 +260,78 @@ describe("truthful A/B/C replay", () => {
       .toThrow("REPLAY_AUTHORITATIVE_EXECUTION_MISSING");
     expect(() => validateAuthoritativeAttempts(attempts, [{ requestId: "request-1", status: "completed", actualCostAtomic: "126" }])).toThrow("REPLAY_AUTHORITATIVE_COST_MISMATCH");
     expect(() => validateAuthoritativeAttempts(attempts, [])).toThrow("REPLAY_AUTHORITATIVE_EXECUTION_MISSING");
+  });
+});
+
+describe("exact-configuration replication comparison", () => {
+  const fingerprint = "sha256:" + "a".repeat(64);
+  const baseline = {
+    runId: "v6",
+    phase: "complete" as const,
+    configurationFingerprint: fingerprint,
+    configurationFingerprintProvenance: "post-hoc-db-verified",
+    replicationBaselineRunId: null,
+    policies: {
+      A: { hardDenials: 5, warnings: 0, wouldIntervene: 0, falseWarnings: 0 },
+      B: { hardDenials: 5, warnings: 14, wouldIntervene: 0, falseWarnings: 4 },
+      C: { hardDenials: 5, warnings: 14, wouldIntervene: 4, falseWarnings: 4 },
+    },
+    coverage: { attempts: 92, completed: 87, denied: 5, withPersistedShadowEvidence: 87, missingShadowEvidence: [] },
+  };
+
+  it("compares only complete candidates explicitly anchored to the baseline fingerprint", () => {
+    const comparison = buildReplicationComparison(baseline, [{
+      ...baseline,
+      runId: "replicate-1",
+      configurationFingerprintProvenance: "pre-run-generated",
+      replicationBaselineRunId: "v6",
+    }]);
+    expect(comparison).toMatchObject({
+      baselineRunId: "v6",
+      configurationFingerprint: fingerprint,
+      candidateCount: 1,
+      exactOutcomeAgreement: {
+        hardDenials: true,
+        policyCWarnings: true,
+        policyCFalseWarnings: true,
+        policyCWouldIntervene: true,
+      },
+    });
+    expect(comparison.runs.map(({ runId }) => runId)).toEqual(["v6", "replicate-1"]);
+  });
+
+  it("rejects configuration drift, wrong lineage, and incomplete shadow coverage", () => {
+    expect(() => buildReplicationComparison(baseline, [{
+      ...baseline,
+      runId: "post-hoc-candidate",
+      replicationBaselineRunId: "v6",
+    }])).toThrow("EVIDENCE_REPLICATION_PROVENANCE_INVALID");
+    expect(() => buildReplicationComparison(baseline, [{
+      ...baseline,
+      runId: "drift",
+      configurationFingerprintProvenance: "pre-run-generated",
+      replicationBaselineRunId: "v6",
+      configurationFingerprint: "sha256:" + "b".repeat(64),
+    }])).toThrow("EVIDENCE_REPLICATION_CONFIGURATION_MISMATCH");
+    expect(() => buildReplicationComparison(baseline, [{
+      ...baseline,
+      runId: "wrong-lineage",
+      configurationFingerprintProvenance: "pre-run-generated",
+      replicationBaselineRunId: "other",
+    }])).toThrow("EVIDENCE_REPLICATION_BASELINE_MISMATCH");
+    expect(() => buildReplicationComparison(baseline, [{
+      ...baseline,
+      runId: "short-run",
+      configurationFingerprintProvenance: "pre-run-generated",
+      replicationBaselineRunId: "v6",
+      coverage: { ...baseline.coverage, attempts: 91, completed: 86, withPersistedShadowEvidence: 86 },
+    }])).toThrow("EVIDENCE_REPLICATION_INCOMPLETE");
+    expect(() => buildReplicationComparison(baseline, [{
+      ...baseline,
+      runId: "missing-shadow",
+      configurationFingerprintProvenance: "pre-run-generated",
+      replicationBaselineRunId: "v6",
+      coverage: { ...baseline.coverage, missingShadowEvidence: ["request-1"] },
+    }])).toThrow("EVIDENCE_REPLICATION_INCOMPLETE");
   });
 });

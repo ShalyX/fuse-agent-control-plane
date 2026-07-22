@@ -1,8 +1,10 @@
 #!/usr/bin/env node
-import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { chmod, readFile, writeFile, mkdir } from "node:fs/promises";
 import { dirname, join, relative } from "node:path";
 import { Pool } from "pg";
 import {
+  buildEvidenceConfiguration,
+  buildEvidenceConfigurationFingerprint,
   buildFixtureCallPlan,
   buildReplayReport,
   validateAuthoritativeAttempts,
@@ -17,18 +19,32 @@ interface FixtureManifest {
   schemaVersion: number;
   runId: string;
   mandateId: string;
+  provider: "anthropic" | "openrouter";
   model: string;
+  configurationFingerprint: string;
+  configurationFingerprintProvenance: string;
+  replicationBaselineRunId: string | null;
   attempts: AttemptManifestEntry[];
 }
 
 const manifestPath = process.env["FUSE_EVIDENCE_MANIFEST"]?.trim();
 if (!manifestPath) throw new Error("FUSE_EVIDENCE_MANIFEST_REQUIRED");
 const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as FixtureManifest;
-if (manifest.schemaVersion !== 1 || !manifest.runId?.trim() || !manifest.mandateId?.trim()
-  || !manifest.model?.trim() || !Array.isArray(manifest.attempts)) {
+if (manifest.schemaVersion !== 2 || !manifest.runId?.trim() || !manifest.mandateId?.trim()
+  || (manifest.provider !== "anthropic" && manifest.provider !== "openrouter")
+  || !manifest.model?.trim() || !Array.isArray(manifest.attempts)
+  || !/^sha256:[a-f0-9]{64}$/.test(manifest.configurationFingerprint)
+  || (manifest.configurationFingerprintProvenance !== "pre-run-generated"
+    && manifest.configurationFingerprintProvenance !== "post-hoc-db-verified")) {
   throw new Error("EVIDENCE_MANIFEST_INVALID");
 }
 validateEvidenceRunId(manifest.runId);
+const expectedFingerprint = buildEvidenceConfigurationFingerprint(
+  buildEvidenceConfiguration(manifest.provider, manifest.model),
+);
+if (manifest.configurationFingerprint !== expectedFingerprint) {
+  throw new Error("EVIDENCE_CONFIGURATION_FINGERPRINT_MISMATCH");
+}
 const fixtureCalls = buildFixtureCallPlan(manifest.runId, manifest.model);
 if (manifest.mandateId !== `fixture-${manifest.runId}`) throw new Error("EVIDENCE_MANIFEST_INVALID");
 validateFixtureOutcomes(fixtureCalls, manifest.attempts);
@@ -75,6 +91,9 @@ try {
     schemaVersion: 1,
     runId: manifest.runId,
     mandateId: manifest.mandateId,
+    configurationFingerprint: manifest.configurationFingerprint,
+    configurationFingerprintProvenance: manifest.configurationFingerprintProvenance,
+    replicationBaselineRunId: manifest.replicationBaselineRunId,
     sourceManifest: relative(process.cwd(), manifestPath),
     generatedAt: new Date().toISOString(),
     authoritativeCoverage,
@@ -84,7 +103,8 @@ try {
       C: "persisted branch-aware shadow evidence; no cohort reconstruction",
     },
     ...report,
-  }, null, 2));
+  }, null, 2), { mode: 0o600 });
+  await chmod(outputPath, 0o600);
   console.log(JSON.stringify({ phase: "complete", runId: manifest.runId, outputPath,
     coverage: report.coverage }));
 } finally {

@@ -90,6 +90,9 @@
       "completed": 87,
       "denied": 5,
       "providerCostAtomic": "32441",
+      "configurationFingerprint": "sha256:797af3ef88a718744628f35b1a13bf64edb69caa7f7b868a01a075179c9a933d",
+      "configurationFingerprintProvenance": "post-hoc-db-verified",
+      "replicationBaseline": true,
       "legitimateCompleted": 70,
       "policyC": {
         "warnings": 14,
