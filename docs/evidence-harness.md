@@ -8,6 +8,7 @@ It does **not** reconstruct cohorts, invent observations, or claim behavioral en
 
 - `npm run evidence:fixtures:dry` performs no network or paid calls and requires no credentials.
 - `npm run evidence:fixtures` performs real provider calls and makes a Circle x402 payment only when the target route actually returns a valid 402 challenge. It currently plans 92 attempts across the ten fixtures.
+- Set `FUSE_EVIDENCE_PROVIDER_COST_CAP_ATOMIC` to a positive USD-micros ceiling for an operator-authorized run. Before every attempt, the runner reserves the configured workload class's maximum per-call cost against cumulative persisted provider cost and aborts before the call if the ceiling could be exceeded. This operational cap is recorded in the manifest but intentionally excluded from the fixture configuration fingerprint; a binding cap leaves the run incomplete.
 - The administrative token is used only for setup. The one-time agent token is retained only in process memory and is never written to the manifest.
 - Request IDs are headers. Strict API request bodies contain no `requestId`, `mandateId`, or other unknown fields.
 - The runner registers the agent, issues the runtime credential, publishes the policy, creates the draft mandate, assigns the agent, creates **all** branches, and activates only after branch creation.
@@ -53,6 +54,7 @@ FUSE_EVIDENCE_MODEL       # exact configured tenant model
 ANTHROPIC_MODEL           # legacy fallback when FUSE_EVIDENCE_MODEL is unset
 FUSE_EVIDENCE_RUN_ID       # optional; use a fresh ID per run
 FUSE_EVIDENCE_BASELINE_MANIFEST # optional; required for fingerprint-guarded replication
+FUSE_EVIDENCE_PROVIDER_COST_CAP_ATOMIC # optional operator ceiling in USD micros
 ```
 
 Run:

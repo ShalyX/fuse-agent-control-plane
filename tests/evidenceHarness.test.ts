@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  assertEvidenceProviderCostCap,
   buildEvidenceConfiguration,
   buildEvidenceConfigurationFingerprint,
   buildFixtureCallPlan,
@@ -8,6 +9,7 @@ import {
   buildReplicationComparison,
   validateReplicationBaseline,
   validateAuthoritativeAttempts,
+  validateEvidenceProviderCostCapAtomic,
   validateEvidenceRunId,
   validateFixtureOutcomes,
   validateFuseUrl,
@@ -210,6 +212,25 @@ describe("fixture setup contract", () => {
     const relabeled = attempts.map((attempt, index) => index === 0
       ? { ...attempt, label: "runaway" as const } : attempt);
     expect(() => validateFixtureOutcomes(calls, relabeled)).toThrow("FIXTURE_MANIFEST_MISMATCH");
+  });
+
+  it("enforces an operator runtime cost cap before each provider call", () => {
+    const calls = buildFixtureCallPlan("cap", "nousresearch/hermes-4-405b");
+    const expensive = calls.find(({ workloadClass, expected }) =>
+      workloadClass === "expensive-summary" && expected === "completed")!;
+    const denied = calls.find(({ expected }) => expected === "denied")!;
+    const attempts: AttemptManifestEntry[] = [{
+      runId: "cap", fixtureId: 1, requestId: "spent", sequence: 1,
+      label: "legitimate", outcome: "completed", actualCostAtomic: "80000",
+      occurredAt: "2026-07-22T00:00:00.000Z",
+    }];
+
+    expect(validateEvidenceProviderCostCapAtomic("100000")).toBe(100000n);
+    expect(() => validateEvidenceProviderCostCapAtomic("0")).toThrow("EVIDENCE_PROVIDER_COST_CAP_INVALID");
+    expect(() => assertEvidenceProviderCostCap(attempts, expensive, 100000n))
+      .toThrow("EVIDENCE_PROVIDER_COST_CAP_EXCEEDED");
+    expect(() => assertEvidenceProviderCostCap(attempts, denied, 100000n))
+      .toThrow("EVIDENCE_PROVIDER_COST_CAP_EXCEEDED");
   });
 });
 
