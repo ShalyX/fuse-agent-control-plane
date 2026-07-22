@@ -16,7 +16,8 @@ describe("fixture setup contract", () => {
   it("matches strict HTTP bodies and creates every branch before activation", () => {
     const plan = buildFixtureSetupPlan({
       runId: "run-1",
-      model: "claude-sonnet-4-6",
+      provider: "openrouter",
+      model: "nousresearch/hermes-4-405b",
       mandateId: "fixture-run-1",
       policyId: "fixture-policy-run-1",
       agentId: "fixture-agent-run-1",
@@ -39,13 +40,16 @@ describe("fixture setup contract", () => {
       policyId: "fixture-policy-run-1",
       version: 1,
       mode: "enforce",
-      allowedProviders: ["anthropic"],
-      allowedModels: ["claude-sonnet-4-6"],
+      allowedProviders: ["openrouter"],
+      allowedModels: ["nousresearch/hermes-4-405b"],
       requiredCapability: "inference:invoke",
+      workloadClasses: expect.arrayContaining([
+        expect.objectContaining({ id: "spike-burst", shadow: expect.objectContaining({ siblingMinimumForIntervention: 2 }) }),
+      ]),
       limits: {
         maxPerCallAtomic: expect.any(String),
-        maxHourlyAtomic: expect.any(String),
-        maxDailyAtomic: expect.any(String),
+        maxHourlyAtomic: "1000000",
+        maxDailyAtomic: "1000000",
       },
     });
     expect(policy.body).not.toHaveProperty("allowedProvider");
@@ -60,9 +64,15 @@ describe("fixture setup contract", () => {
       expiresAt: null,
     });
 
+    const mandate = plan.find(({ kind }) => kind === "mandate")!;
+    expect(mandate.body.maximumSpendAtomic).toBe("1000000");
+
     const branches = plan.filter(({ kind }) => kind === "branch");
     expect(branches.find(({ body }) => body.branchId === "f2-parent")?.body.maximumSpendAtomic).toBe("800000");
     expect(branches.find(({ body }) => body.branchId === "f2-runaway")?.body.maximumSpendAtomic).toBe("550000");
+    expect(branches.find(({ body }) => body.branchId === "f2-healthy-1")?.body.allowedWorkloadClasses).toEqual(["spike-burst"]);
+    expect(branches.find(({ body }) => body.branchId === "f2-healthy-2")?.body.allowedWorkloadClasses).toEqual(["spike-burst"]);
+    expect(branches.find(({ body }) => body.branchId === "f10-budget")?.body.maximumSpendAtomic).toBe("15000");
     for (const branch of branches) {
       expect(branch.body).toEqual({
         branchId: expect.any(String),
@@ -97,6 +107,10 @@ describe("fixture setup contract", () => {
     expect(calls.find(({ fixtureId }) => fixtureId === 9)).toMatchObject({
       branchId: "f9-mismatch", model: "gpt-4o", expected: "denied", label: "hard-deny",
     });
+    const fixture2Healthy = calls.filter(({ fixtureId, label }) => fixtureId === 2 && label === "legitimate");
+    expect(fixture2Healthy).toHaveLength(6);
+    expect(fixture2Healthy.every(({ workloadClass }) => workloadClass === "spike-burst")).toBe(true);
+    expect(calls.filter(({ fixtureId, label }) => fixtureId === 2 && label === "runaway")).toHaveLength(6);
     const budgetCalls = calls.filter(({ fixtureId }) => fixtureId === 10);
     expect(budgetCalls).toHaveLength(10);
     expect(budgetCalls.every(({ expected }) => expected === "completed-or-denied")).toBe(true);
@@ -116,7 +130,7 @@ describe("fixture setup contract", () => {
       label: call.label, outcome: call.expected === "denied" ? "denied" : "completed",
       actualCostAtomic: call.expected === "denied" ? "0" : "1",
       ...(call.fixtureId === 5 ? { denialCode: "WORKLOAD_CLASS_NOT_ALLOWED" } : {}),
-      ...(call.fixtureId === 9 ? { denialCode: "MODEL_NOT_ALLOWED" } : {}),
+      ...(call.fixtureId === 9 ? { denialCode: "REQUESTED_MODEL_MISMATCH" } : {}),
       occurredAt: "2026-07-21T00:00:00.000Z",
     }));
     attempts.at(-1)!.outcome = "denied";
@@ -170,7 +184,13 @@ describe("truthful A/B/C replay", () => {
       runId: "r", fixtureId: 1, requestId: "request-1", sequence: 1, label: "legitimate",
       outcome: "completed", actualCostAtomic: "125", occurredAt: "2026-07-21T00:00:00.000Z",
     }];
-    expect(() => validateAuthoritativeAttempts(attempts, [{ requestId: "request-1", status: "completed", actualCostAtomic: "125" }])).not.toThrow();
+    expect(validateAuthoritativeAttempts(attempts, [{ requestId: "request-1", status: "completed", actualCostAtomic: "125" }])).toEqual({ executionRows: 1, preExecutionDenials: [] });
+    expect(validateAuthoritativeAttempts([{
+      ...attempts[0]!, requestId: "model-mismatch", outcome: "denied", actualCostAtomic: "0",
+      denialCode: "REQUESTED_MODEL_MISMATCH",
+    }], [])).toEqual({ executionRows: 0, preExecutionDenials: ["model-mismatch"] });
+    expect(() => validateAuthoritativeAttempts([{ ...attempts[0]!, requestId: "missing" }], []))
+      .toThrow("REPLAY_AUTHORITATIVE_EXECUTION_MISSING");
     expect(() => validateAuthoritativeAttempts(attempts, [{ requestId: "request-1", status: "completed", actualCostAtomic: "126" }])).toThrow("REPLAY_AUTHORITATIVE_COST_MISMATCH");
     expect(() => validateAuthoritativeAttempts(attempts, [])).toThrow("REPLAY_AUTHORITATIVE_EXECUTION_MISSING");
   });

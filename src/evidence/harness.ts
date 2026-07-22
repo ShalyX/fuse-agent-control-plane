@@ -59,6 +59,7 @@ export interface SetupOperation {
 
 interface SetupInput {
   runId: string;
+  provider: "anthropic" | "openrouter";
   model: string;
   mandateId: string;
   policyId: string;
@@ -80,8 +81,8 @@ const branchDefinitions: readonly BranchDefinition[] = [
   { branchId: "f1-parent", parentBranchId: null, classes: [BASELINE, EXPENSIVE], maximumSpendAtomic: "300000" },
   { branchId: "f1-normal", parentBranchId: "f1-parent", classes: [BASELINE, EXPENSIVE], maximumSpendAtomic: "250000" },
   { branchId: "f2-parent", parentBranchId: null, classes: [BASELINE, SPIKE], maximumSpendAtomic: "800000" },
-  { branchId: "f2-healthy-1", parentBranchId: "f2-parent", classes: [BASELINE], maximumSpendAtomic: "100000" },
-  { branchId: "f2-healthy-2", parentBranchId: "f2-parent", classes: [BASELINE], maximumSpendAtomic: "100000" },
+  { branchId: "f2-healthy-1", parentBranchId: "f2-parent", classes: [SPIKE], maximumSpendAtomic: "100000" },
+  { branchId: "f2-healthy-2", parentBranchId: "f2-parent", classes: [SPIKE], maximumSpendAtomic: "100000" },
   { branchId: "f2-runaway", parentBranchId: "f2-parent", classes: [SPIKE], maximumSpendAtomic: "550000" },
   { branchId: "f3-parent", parentBranchId: null, classes: [EXPENSIVE], maximumSpendAtomic: "400000" },
   { branchId: "f3-unusual-1", parentBranchId: "f3-parent", classes: [EXPENSIVE], maximumSpendAtomic: "180000" },
@@ -102,7 +103,7 @@ const branchDefinitions: readonly BranchDefinition[] = [
   { branchId: "f9-parent", parentBranchId: null, classes: [BASELINE], maximumSpendAtomic: "100000" },
   { branchId: "f9-mismatch", parentBranchId: "f9-parent", classes: [BASELINE], maximumSpendAtomic: "80000" },
   { branchId: "f10-parent", parentBranchId: null, classes: [BASELINE], maximumSpendAtomic: "30000" },
-  { branchId: "f10-budget", parentBranchId: "f10-parent", classes: [BASELINE], maximumSpendAtomic: "20000" },
+  { branchId: "f10-budget", parentBranchId: "f10-parent", classes: [BASELINE], maximumSpendAtomic: "15000" },
 ];
 
 export function buildFixtureSetupPlan(input: SetupInput): SetupOperation[] {
@@ -112,7 +113,7 @@ export function buildFixtureSetupPlan(input: SetupInput): SetupOperation[] {
     windowSeconds: 900,
     targetMinimumObservations: 3,
     siblingMinimumForScoring: 2,
-    siblingMinimumForIntervention: 3,
+    siblingMinimumForIntervention: 2,
     confidenceConstant: 5,
     divergenceThresholdBps: 15000,
   };
@@ -125,8 +126,8 @@ export function buildFixtureSetupPlan(input: SetupInput): SetupOperation[] {
   return [
     { kind: "agent", method: "POST", path: "/api/v1/admin/agents", body: { agentId: input.agentId, name: "Sibling divergence fixture agent" } },
     { kind: "agentCredential", method: "POST", path: "/api/v1/admin/agent-credentials", body: { credentialId: `fixture-runtime-${input.runId}`, agentId: input.agentId, name: "Sibling divergence fixture runtime", capabilities: ["inference:invoke", "mandates:read", "receipts:read"], expiresAt: null } },
-    { kind: "policy", method: "POST", path: "/api/v1/admin/policies", body: { policyId: input.policyId, version: 1, mode: "enforce", allowedProviders: ["anthropic"], allowedModels: [input.model], requiredCapability: "inference:invoke", limits: { maxPerCallAtomic: "50000", maxHourlyAtomic: "5000000", maxDailyAtomic: "10000000", maxRequestsPerMinute: 1000, maxInputTokens: 50000, maxOutputTokens: 1000 }, workloadClasses } },
-    { kind: "mandate", method: "POST", path: "/api/v1/admin/mandates", body: { mandateId: input.mandateId, name: "Sibling divergence evidence fixtures", assetId: "usd-micros", maximumSpendAtomic: "10000000", policyId: input.policyId, policyVersion: 1, expiresAt: null } },
+    { kind: "policy", method: "POST", path: "/api/v1/admin/policies", body: { policyId: input.policyId, version: 1, mode: "enforce", allowedProviders: [input.provider], allowedModels: [input.model], requiredCapability: "inference:invoke", limits: { maxPerCallAtomic: "50000", maxHourlyAtomic: "1000000", maxDailyAtomic: "1000000", maxRequestsPerMinute: 1000, maxInputTokens: 50000, maxOutputTokens: 1000 }, workloadClasses } },
+    { kind: "mandate", method: "POST", path: "/api/v1/admin/mandates", body: { mandateId: input.mandateId, name: "Sibling divergence evidence fixtures", assetId: "usd-micros", maximumSpendAtomic: "1000000", policyId: input.policyId, policyVersion: 1, expiresAt: null } },
     { kind: "assignment", method: "POST", path: `${mandatePath}/agents`, body: { agentId: input.agentId } },
     ...branchDefinitions.map<SetupOperation>((branch) => ({ kind: "branch", method: "POST", path: `${mandatePath}/branches`, body: { branchId: branch.branchId, parentBranchId: branch.parentBranchId, agentId: input.agentId, allowedWorkloadClasses: branch.classes, maximumSpendAtomic: branch.maximumSpendAtomic, expiresAt: null } })),
     { kind: "activation", method: "POST", path: `${mandatePath}/transitions`, body: { to: "active" } },
@@ -178,12 +179,14 @@ export function buildFixtureCallPlan(runId: string, model: string): FixtureCall[
   for (let index = 0; index < 5; index++) add(1, "f1-normal", BASELINE, 20);
   add(1, "f1-normal", EXPENSIVE, 800, "legitimate", "completed", model, 256);
 
-  add(2, "f2-healthy-1", BASELINE, 50);
-  add(2, "f2-healthy-2", BASELINE, 50);
+  for (let index = 0; index < 3; index++) {
+    add(2, "f2-healthy-1", SPIKE, 50);
+    add(2, "f2-healthy-2", SPIKE, 50);
+  }
   // Behavioral evaluation is shadow-only. Deterministic authority is sized for the
-  // worst-case 10 × 50,000-atomic class envelope, so these calls must complete;
+  // worst-case 6 × 50,000-atomic class envelope, so these calls must complete;
   // a denial would contaminate the behavioral fixture rather than prove detection.
-  for (let index = 0; index < 10; index++) {
+  for (let index = 0; index < 6; index++) {
     add(2, "f2-runaway", SPIKE, 600, "runaway", "completed");
   }
 
@@ -254,7 +257,7 @@ export function validateFixtureOutcomes(
       throw new Error("FIXTURE_OUTCOME_MISMATCH");
     }
     const expectedDenial = call.fixtureId === 5 ? "WORKLOAD_CLASS_NOT_ALLOWED"
-      : call.fixtureId === 9 ? "MODEL_NOT_ALLOWED" : null;
+      : call.fixtureId === 9 ? "REQUESTED_MODEL_MISMATCH" : null;
     if (expectedDenial && attempt.denialCode !== expectedDenial) {
       throw new Error("FIXTURE_DENIAL_REASON_MISMATCH");
     }
@@ -305,14 +308,27 @@ export interface AuthoritativeExecution {
   actualCostAtomic: string | null;
 }
 
+export interface AuthoritativeValidationSummary {
+  executionRows: number;
+  preExecutionDenials: string[];
+}
+
 export function validateAuthoritativeAttempts(
   attempts: readonly AttemptManifestEntry[],
   executions: readonly AuthoritativeExecution[],
-): void {
+): AuthoritativeValidationSummary {
   const byRequest = new Map(executions.map((execution) => [execution.requestId, execution]));
+  const preExecutionDenials: string[] = [];
   for (const attempt of attempts) {
     const execution = byRequest.get(attempt.requestId);
-    if (!execution) throw new Error("REPLAY_AUTHORITATIVE_EXECUTION_MISSING");
+    if (!execution) {
+      if (attempt.outcome === "denied" && attempt.denialCode === "REQUESTED_MODEL_MISMATCH"
+        && attempt.actualCostAtomic === "0") {
+        preExecutionDenials.push(attempt.requestId);
+        continue;
+      }
+      throw new Error("REPLAY_AUTHORITATIVE_EXECUTION_MISSING");
+    }
     const authoritativeOutcome = execution.status === "completed" ? "completed"
       : execution.status === "denied" ? "denied" : "error";
     if (attempt.outcome !== authoritativeOutcome) throw new Error("REPLAY_AUTHORITATIVE_OUTCOME_MISMATCH");
@@ -321,6 +337,7 @@ export function validateAuthoritativeAttempts(
       throw new Error("REPLAY_AUTHORITATIVE_COST_MISMATCH");
     }
   }
+  return { executionRows: executions.length, preExecutionDenials };
 }
 
 export function buildReplayReport(

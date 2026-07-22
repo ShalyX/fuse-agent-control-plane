@@ -48,7 +48,9 @@ CIRCLE_API_KEY
 CIRCLE_ENTITY_SECRET
 FUSE_PAYER_ADDRESS
 FUSE_URL                  # optional; defaults to local :8787
-ANTHROPIC_MODEL            # optional
+FUSE_PROVIDER             # anthropic or openrouter; must match tenant configuration
+FUSE_EVIDENCE_MODEL       # exact configured tenant model
+ANTHROPIC_MODEL           # legacy fallback when FUSE_EVIDENCE_MODEL is unset
 FUSE_EVIDENCE_RUN_ID       # optional; use a fresh ID per run
 ```
 
@@ -78,7 +80,7 @@ npm run evidence:replay
 
 The replay command:
 
-1. Cross-checks every manifest entry against `inference_executions` status and exact atomic cost.
+1. Cross-checks persisted attempts against `inference_executions` status and exact atomic cost. Pre-execution model-binding denials, which intentionally have no execution row, are validated against the exact fixture contract and listed separately under `authoritativeCoverage.preExecutionDenials`.
 2. Loads existing `shadow_evaluations.evidence` for those same request IDs.
 3. Produces `evidence/replay/<run-id>.json`.
 
@@ -102,7 +104,7 @@ The call plan covers all ten spec scenarios, including real operating fan-out:
 - sparse target with mature siblings: `n=4`
 - mature target with sparse siblings: `n=3`
 
-Fixture 10 uses a 20,000-atomic branch ceiling and larger requests so the deterministic budget should be reached within its ten attempts. The exact stopping attempt remains provider-price and tokenizer dependent, so the manifest records actual authoritative outcomes instead of hard-coding a fabricated call count.
+Fixture 10 uses a 15,000-atomic branch ceiling and larger requests so the deterministic budget should be reached after some spend within its ten attempts for the calibrated testnet model. The exact stopping attempt remains provider-price and tokenizer dependent, so the manifest records actual authoritative outcomes instead of hard-coding a fabricated call count.
 
 ## Decision boundary
 
@@ -111,3 +113,23 @@ This harness can generate controlled fixture evidence. It does not establish pro
 > If C does not materially improve detection time or dollars-through at fan-out 2–4 without worsening false interventions, sibling divergence is not treated as the product moat.
 
 Controlled fixture results and later held-out live-shadow results must be labeled separately.
+
+## Controlled testnet run — 2026-07-22
+
+The calibrated run `testnet-20260721-hermes4-v6` executed against the deployed Fuse HTTP control path with OpenRouter model `nousresearch/hermes-4-405b`:
+
+- 92 authenticated attempts: 87 completed, 5 denied
+- authoritative coverage: 91 persisted `inference_executions`; the model-binding denial occurred before execution persistence and is listed separately
+- persisted shadow coverage: 87/87 completed attempts, with no missing evidence
+- final-run provider cost: 32,441 USD-micros (`$0.032441`)
+- cumulative cost across calibration and transient-failure runs: 196,701 USD-micros (`$0.196701`)
+- no x402 challenge was returned on this authenticated control-mode route, so no Circle payment occurred
+
+The deterministic gates behaved as intended: one unauthorized-class denial, one pre-execution model-binding denial, and three branch-budget denials after seven Fixture 10 completions.
+
+In the controlled A/B/C replay, B and C each emitted 14 warnings with four false warnings. C additionally projected four interventions, all on the labeled Fixture 2 runaway child, and projected no intervention on legitimate fixtures. The first sibling-divergence signal arrived after 1,308 USD-micros of labeled runaway spend. This is controlled-fixture evidence of incremental intervention selectivity; it is not held-out live efficacy and does not by itself establish a moat.
+
+Committed evidence:
+
+- `evidence/fixtures/testnet-20260721-hermes4-v6.json`
+- `evidence/replay/testnet-20260721-hermes4-v6.json`

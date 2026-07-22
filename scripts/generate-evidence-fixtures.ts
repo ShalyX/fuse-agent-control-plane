@@ -28,20 +28,28 @@ const dryRun = process.argv.includes("--dry-run");
 const runId = validateEvidenceRunId(
   process.env["FUSE_EVIDENCE_RUN_ID"]?.trim() ?? `evidence-${Date.now()}`,
 );
-const model = process.env["ANTHROPIC_MODEL"]?.trim() ?? "claude-sonnet-4-6";
+const providerValue = process.env["FUSE_PROVIDER"]?.trim().toLowerCase() ?? "anthropic";
+if (providerValue !== "anthropic" && providerValue !== "openrouter") {
+  throw new Error("FUSE_PROVIDER_INVALID");
+}
+const provider: "anthropic" | "openrouter" = providerValue;
+const model = process.env["FUSE_EVIDENCE_MODEL"]?.trim()
+  ?? process.env["ANTHROPIC_MODEL"]?.trim() ?? "claude-sonnet-4-6";
 const mandateId = `fixture-${runId}`;
 const policyId = `fixture-policy-${runId}`;
 const agentId = `fixture-agent-${runId}`;
 const baseUrl = validateFuseUrl(
   process.env["FUSE_URL"]?.trim() ?? "http://127.0.0.1:8787",
 );
-const setupPlan = buildFixtureSetupPlan({ runId, model, mandateId, policyId, agentId });
+const setupPlan = buildFixtureSetupPlan({ runId, provider, model, mandateId, policyId, agentId });
 const callPlan = buildFixtureCallPlan(runId, model);
 
 if (dryRun) {
   console.log(JSON.stringify({
     phase: "dry-run",
     runId,
+    provider,
+    model,
     mandateId,
     policyId,
     agentId,
@@ -112,6 +120,7 @@ async function persistManifest(phase: "running" | "complete"): Promise<void> {
     mandateId,
     policyId,
     agentId,
+    provider,
     model,
     generatedAt: new Date().toISOString(),
     attempts,

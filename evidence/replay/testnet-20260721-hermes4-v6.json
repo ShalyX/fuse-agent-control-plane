@@ -1,0 +1,68 @@
+{
+  "schemaVersion": 1,
+  "runId": "testnet-20260721-hermes4-v6",
+  "mandateId": "fixture-testnet-20260721-hermes4-v6",
+  "sourceManifest": "evidence/fixtures/testnet-20260721-hermes4-v6.json",
+  "generatedAt": "2026-07-22T00:17:39.915Z",
+  "authoritativeCoverage": {
+    "executionRows": 91,
+    "preExecutionDenials": [
+      "testnet-20260721-hermes4-v6-f9-82"
+    ]
+  },
+  "policySemantics": {
+    "A": "persisted deterministic ceiling/policy outcomes plus explicitly listed pre-execution model-binding denials",
+    "B": "class-prior-only v1, projected from persisted CLASS_PRIOR_EXCEEDED evidence",
+    "C": "persisted branch-aware shadow evidence; no cohort reconstruction"
+  },
+  "phase": "complete",
+  "policies": {
+    "A": {
+      "hardDenials": 5,
+      "warnings": 0,
+      "wouldIntervene": 0,
+      "falseWarnings": 0,
+      "firstSignalRequestId": null,
+      "spendBeforeFirstSignalAtomic": null,
+      "firstRunawaySignalRequestId": null,
+      "runawaySpendBeforeFirstSignalAtomic": null,
+      "firstSiblingDivergenceRequestId": null,
+      "runawaySpendBeforeSiblingDivergenceAtomic": null
+    },
+    "B": {
+      "hardDenials": 5,
+      "warnings": 14,
+      "wouldIntervene": 0,
+      "falseWarnings": 4,
+      "firstSignalRequestId": "testnet-20260721-hermes4-v6-f2-15",
+      "spendBeforeFirstSignalAtomic": "3186",
+      "firstRunawaySignalRequestId": "testnet-20260721-hermes4-v6-f2-15",
+      "runawaySpendBeforeFirstSignalAtomic": "1308",
+      "firstSiblingDivergenceRequestId": null,
+      "runawaySpendBeforeSiblingDivergenceAtomic": null
+    },
+    "C": {
+      "hardDenials": 5,
+      "warnings": 14,
+      "wouldIntervene": 4,
+      "falseWarnings": 4,
+      "firstSignalRequestId": "testnet-20260721-hermes4-v6-f2-15",
+      "spendBeforeFirstSignalAtomic": "3186",
+      "firstRunawaySignalRequestId": "testnet-20260721-hermes4-v6-f2-15",
+      "runawaySpendBeforeFirstSignalAtomic": "1308",
+      "firstSiblingDivergenceRequestId": "testnet-20260721-hermes4-v6-f2-15",
+      "runawaySpendBeforeSiblingDivergenceAtomic": "1308"
+    }
+  },
+  "coverage": {
+    "attempts": 92,
+    "completed": 87,
+    "denied": 5,
+    "withPersistedShadowEvidence": 87,
+    "missingShadowEvidence": []
+  },
+  "unavailableMetrics": [
+    "operatorRecoveryTime",
+    "actualBehavioralInterventions"
+  ]
+}

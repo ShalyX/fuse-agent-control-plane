@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { readFile, writeFile, mkdir } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { Pool } from "pg";
 import {
   buildFixtureCallPlan,
@@ -55,7 +55,7 @@ try {
     status: row.status,
     actualCostAtomic: row.actual_cost_atomic,
   }));
-  validateAuthoritativeAttempts(manifest.attempts, executions);
+  const authoritativeCoverage = validateAuthoritativeAttempts(manifest.attempts, executions);
 
   const evidenceResult = await pool.query<{ evidence: Record<string, unknown> }>(`
     SELECT evaluation.evidence
@@ -75,10 +75,11 @@ try {
     schemaVersion: 1,
     runId: manifest.runId,
     mandateId: manifest.mandateId,
-    sourceManifest: manifestPath,
+    sourceManifest: relative(process.cwd(), manifestPath),
     generatedAt: new Date().toISOString(),
+    authoritativeCoverage,
     policySemantics: {
-      A: "authoritative deterministic ceiling and policy denials from inference_executions",
+      A: "persisted deterministic ceiling/policy outcomes plus explicitly listed pre-execution model-binding denials",
       B: "class-prior-only v1, projected from persisted CLASS_PRIOR_EXCEEDED evidence",
       C: "persisted branch-aware shadow evidence; no cohort reconstruction",
     },
