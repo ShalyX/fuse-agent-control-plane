@@ -100,18 +100,29 @@
       "reasonSelected": "Healthy siblings and target share a workload class, each sibling reaches cohort maturity, and the fan-out-three intervention threshold is reachable."
     }
   ],
-  "descriptiveCalibrationAggregate": {
+  "descriptiveNonFixture2FalseWarningAggregate": {
     "includedRuns": [
       "testnet-20260721-hermes4-v3",
       "testnet-20260721-hermes4-v5",
       "testnet-20260721-hermes4-v6"
     ],
+    "scope": "Labeled legitimate completed evaluations from Fixtures 1 and 3 through 10; Fixture 2 is excluded from numerator and denominator.",
+    "configurationCheck": {
+      "nonFixture2BranchShapeSha256Prefix": "43395a74dc24af90",
+      "nonFixture2ExecutionShapeSha256Prefix": "706062a94c7c87ea",
+      "globalDifference": "siblingMinimumForIntervention was 3 in v3 and 2 in v5/v6; it affects intervention eligibility but not wouldSignalTarget warning generation.",
+      "falseWarningEvidence": "All false warnings were insufficient_siblings CLASS_PRIOR_EXCEEDED signals with eligibleForIntervention false."
+    },
+    "falseWarningLocationsPerRun": [
+      "f3-23",
+      "f3-24",
+      "f8-78",
+      "f8-79"
+    ],
     "falseWarnings": 12,
-    "legitimateCompleted": 202,
-    "falseWarningRateAmongLegitimateEvaluations": 0.0594059405940594,
-    "warningEvents": 50,
-    "falseShareOfWarnings": 0.24,
-    "interpretation": "Descriptive calibration incidence only. These runs reused fixed scenarios and changed the sibling-cohort configuration, so they are neither independent samples nor valid pooled estimates of the final v6 policy."
+    "legitimateCompleted": 192,
+    "falseWarningRateAmongLegitimateEvaluations": 0.0625,
+    "interpretation": "Descriptive repeated-fixed-fixture incidence only, not an independent-sample estimate. The prior 12/202 denominator is rejected because it included differently configured Fixture 2 healthy-sibling evaluations."
   },
   "seriesProviderCostAtomic": "196701"
 }
