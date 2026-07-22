@@ -147,22 +147,25 @@ This harness can generate controlled fixture evidence. It does not establish pro
 
 Controlled fixture results and later held-out live-shadow results must be labeled separately.
 
-## Controlled testnet run — 2026-07-22
+## Controlled testnet baseline and exact replication — 2026-07-22
 
-The calibrated run `testnet-20260721-hermes4-v6` executed against the deployed Fuse HTTP control path with OpenRouter model `nousresearch/hermes-4-405b`:
+The calibrated baseline `testnet-20260721-hermes4-v6` and fresh exact-configuration replication `testnet-20260722-hermes4-v7` executed against the deployed Fuse HTTP control path with OpenRouter model `nousresearch/hermes-4-405b` and fingerprint `sha256:797af3ef88a718744628f35b1a13bf64edb69caa7f7b868a01a075179c9a933d`:
 
-- 92 authenticated attempts: 87 completed, 5 denied
-- authoritative coverage: 91 persisted `inference_executions`; the model-binding denial occurred before execution persistence and is listed separately
-- persisted shadow coverage: 87/87 completed attempts, with no missing evidence
-- final-run provider cost: 32,441 USD-micros (`$0.032441`)
-- cumulative cost across calibration and transient-failure runs: 196,701 USD-micros (`$0.196701`)
+- each run had 92 authenticated attempts: 87 completed, 5 denied
+- each replay had authoritative coverage of 91 persisted `inference_executions`; the model-binding denial occurred before execution persistence and is listed separately
+- each run had persisted shadow coverage for all 87 completed attempts, with no missing evidence
+- provider cost: v6 32,441 USD-micros (`$0.032441`); v7 32,609 USD-micros (`$0.032609`)
+- v7 completed below its operator-authorized 100,000 USD-micros (`$0.10`) ceiling
+- cumulative provider cost across calibration, transient-failure, baseline, and replication runs: 229,310 USD-micros (`$0.229310`)
 - no x402 challenge was returned on this authenticated control-mode route, so no Circle payment occurred
+
+The comparator found exact v6/v7 agreement for five hard denials, 14 Policy C warnings, four Policy C false warnings, and four projected Policy C interventions. This is one fresh repeat of the same fixed controlled fixtures—not held-out production efficacy or an independent-sample rate.
 
 ### Claim boundary
 
-This run validates the authenticated policy/anomaly path, real provider-billed inference, provider-cost persistence, and authoritative replay. It did **not** exercise x402 challenge handling, Circle payment authorization/transfer, or the combined metered-payment-plus-policy path end to end. It is therefore evidence for the policy engine and provider-cost accounting—not evidence that the full Circle-backed payment integration behaves this way.
+These runs validate the authenticated policy/anomaly path, real provider-billed inference, provider-cost persistence, and authoritative replay. They did **not** exercise x402 challenge handling, Circle payment authorization/transfer, or the combined metered-payment-plus-policy path end to end. They are therefore evidence for the policy engine and provider-cost accounting—not evidence that the full Circle-backed payment integration behaves this way.
 
-The deterministic gates behaved as intended: one unauthorized-class denial, one pre-execution model-binding denial, and three branch-budget denials after seven Fixture 10 completions.
+The deterministic gates behaved identically in both runs: one unauthorized-class denial, one pre-execution model-binding denial, and three branch-budget denials after seven Fixture 10 completions.
 
 In the controlled A/B/C replay, B and C each emitted 14 warnings with four false warnings. C additionally projected four interventions, all on the labeled Fixture 2 runaway child, and projected no intervention on legitimate fixtures. The first sibling-divergence signal arrived after 1,308 USD-micros of labeled runaway spend. This is controlled-fixture evidence of incremental intervention selectivity; it is not held-out live efficacy and does not by itself establish a moat.
 
@@ -177,10 +180,13 @@ Both were complete, real, paid 92-attempt runs, and they are retained in the cal
 
 Accordingly, v3 and v5 are useful negative calibration findings, but pooling their intervention counts with v6 would mix materially different test configurations. A second comparison of deployed policy rows, branch rows, executions, and persisted signals found that the nine non-Fixture-2 scenarios had identical branch and execution shapes across v3/v5/v6. One global setting did change: `siblingMinimumForIntervention` was 3 in v3 and 2 in v5/v6. That setting only controls intervention eligibility; it does not enter `wouldSignalTarget`, and every false warning in these runs was an `insufficient_siblings` `CLASS_PRIOR_EXCEEDED` signal with `eligibleForIntervention: false`.
 
-For the clean descriptive comparison, Fixture 2 is now excluded from both numerator and denominator. The same four false-warning positions recurred in each run—two in Fixture 3 and two in Fixture 8—yielding 12 false warnings across 192 identically shaped, labeled legitimate non-Fixture-2 completed evaluations (6.25%). This is still **not** an independent-sample estimate because the runs reused fixed scenarios. The prior 12/202 denominator included differently configured Fixture 2 healthy-sibling evaluations and is not used. The final v6 intervention result remains one calibrated run and should not be presented as a stable rate until the exact v6 configuration is repeated on fresh/held-out fixtures.
+For the clean descriptive comparison, Fixture 2 is now excluded from both numerator and denominator. The same four false-warning positions recurred in each calibration run—two in Fixture 3 and two in Fixture 8—yielding 12 false warnings across 192 identically shaped, labeled legitimate non-Fixture-2 completed evaluations (6.25%). This is still **not** an independent-sample estimate because the runs reused fixed scenarios. The prior 12/202 denominator included differently configured Fixture 2 healthy-sibling evaluations and is not used. V7 now supplies one exact repeat of the fixed v6 configuration with the same headline outcome counts; two fixed-fixture runs still do not establish a stable production rate or held-out efficacy.
 
 Committed evidence:
 
 - `evidence/fixtures/testnet-20260721-hermes4-v6.json`
 - `evidence/replay/testnet-20260721-hermes4-v6.json`
+- `evidence/fixtures/testnet-20260722-hermes4-v7.json`
+- `evidence/replay/testnet-20260722-hermes4-v7.json`
+- `evidence/replication/testnet-20260721-hermes4-v6-comparison.json`
 - `evidence/calibration/testnet-20260721-run-ledger.json`

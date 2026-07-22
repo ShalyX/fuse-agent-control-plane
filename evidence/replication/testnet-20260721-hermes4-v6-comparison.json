@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-07-22T04:12:38.117Z",
+  "baselineReport": "evidence/replay/testnet-20260721-hermes4-v6.json",
+  "candidateReports": [
+    "evidence/replay/testnet-20260722-hermes4-v7.json"
+  ],
+  "baselineRunId": "testnet-20260721-hermes4-v6",
+  "configurationFingerprint": "sha256:797af3ef88a718744628f35b1a13bf64edb69caa7f7b868a01a075179c9a933d",
+  "candidateCount": 1,
+  "runs": [
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "hardDenials": 5,
+      "policyCWarnings": 14,
+      "policyCFalseWarnings": 4,
+      "policyCWouldIntervene": 4
+    },
+    {
+      "runId": "testnet-20260722-hermes4-v7",
+      "hardDenials": 5,
+      "policyCWarnings": 14,
+      "policyCFalseWarnings": 4,
+      "policyCWouldIntervene": 4
+    }
+  ],
+  "exactOutcomeAgreement": {
+    "hardDenials": true,
+    "policyCWarnings": true,
+    "policyCFalseWarnings": true,
+    "policyCWouldIntervene": true
+  }
+}
