@@ -78,6 +78,11 @@ interface BranchDefinition {
 const BASELINE = "baseline-lookup";
 const EXPENSIVE = "expensive-summary";
 const SPIKE = "spike-burst";
+const WORKLOAD_MAX_COST_ATOMIC: Readonly<Record<string, bigint>> = {
+  [BASELINE]: 10000n,
+  [EXPENSIVE]: 30000n,
+  [SPIKE]: 50000n,
+};
 
 const branchDefinitions: readonly BranchDefinition[] = [
   { branchId: "f1-parent", parentBranchId: null, classes: [BASELINE, EXPENSIVE], maximumSpendAtomic: "300000" },
@@ -120,9 +125,9 @@ export function buildFixtureSetupPlan(input: SetupInput): SetupOperation[] {
     divergenceThresholdBps: 15000,
   };
   const workloadClasses = [
-    { id: BASELINE, maxCostPerCallAtomic: "10000", maxInvocationsPerBranch: 100, aggregateBudgetAtomic: "1000000", minimumInputTokens: 1, shadow },
-    { id: EXPENSIVE, maxCostPerCallAtomic: "30000", maxInvocationsPerBranch: 100, aggregateBudgetAtomic: "1000000", minimumInputTokens: 1, shadow },
-    { id: SPIKE, maxCostPerCallAtomic: "50000", maxInvocationsPerBranch: 100, aggregateBudgetAtomic: "1000000", minimumInputTokens: 1, shadow },
+    { id: BASELINE, maxCostPerCallAtomic: WORKLOAD_MAX_COST_ATOMIC[BASELINE]!.toString(), maxInvocationsPerBranch: 100, aggregateBudgetAtomic: "1000000", minimumInputTokens: 1, shadow },
+    { id: EXPENSIVE, maxCostPerCallAtomic: WORKLOAD_MAX_COST_ATOMIC[EXPENSIVE]!.toString(), maxInvocationsPerBranch: 100, aggregateBudgetAtomic: "1000000", minimumInputTokens: 1, shadow },
+    { id: SPIKE, maxCostPerCallAtomic: WORKLOAD_MAX_COST_ATOMIC[SPIKE]!.toString(), maxInvocationsPerBranch: 100, aggregateBudgetAtomic: "1000000", minimumInputTokens: 1, shadow },
   ];
 
   return [
@@ -252,6 +257,29 @@ export function buildFixtureCallPlan(runId: string, model: string): FixtureCall[
     add(10, "f10-budget", BASELINE, 1_000, "hard-deny", "completed-or-denied");
   }
   return calls;
+}
+
+export function validateEvidenceProviderCostCapAtomic(value: string): bigint {
+  if (!/^\d+$/.test(value)) throw new Error("EVIDENCE_PROVIDER_COST_CAP_INVALID");
+  const cap = BigInt(value);
+  if (cap <= 0n) throw new Error("EVIDENCE_PROVIDER_COST_CAP_INVALID");
+  return cap;
+}
+
+export function assertEvidenceProviderCostCap(
+  attempts: readonly AttemptManifestEntry[],
+  nextCall: FixtureCall,
+  capAtomic: bigint,
+): void {
+  const spentAtomic = attempts.reduce((total, attempt) => {
+    if (!/^\d+$/.test(attempt.actualCostAtomic)) throw new Error("EVIDENCE_PROVIDER_COST_INVALID");
+    return total + BigInt(attempt.actualCostAtomic);
+  }, 0n);
+  const nextMaximumAtomic = WORKLOAD_MAX_COST_ATOMIC[nextCall.workloadClass];
+  if (nextMaximumAtomic === undefined) throw new Error("EVIDENCE_WORKLOAD_COST_CAP_MISSING");
+  if (spentAtomic + nextMaximumAtomic > capAtomic) {
+    throw new Error("EVIDENCE_PROVIDER_COST_CAP_EXCEEDED");
+  }
 }
 
 export function buildEvidenceConfiguration(

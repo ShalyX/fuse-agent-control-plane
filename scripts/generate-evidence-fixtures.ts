@@ -8,11 +8,13 @@ import { x402Client } from "@x402/core/client";
 import { x402HTTPClient } from "@x402/core/http";
 import { createCircleGatewaySigner } from "../src/circle/developerWalletSigner.js";
 import {
+  assertEvidenceProviderCostCap,
   buildEvidenceConfiguration,
   buildEvidenceConfigurationFingerprint,
   buildFixtureCallPlan,
   buildFixtureSetupPlan,
   fixtureScenarios,
+  validateEvidenceProviderCostCapAtomic,
   validateEvidenceRunId,
   validateFixtureOutcomes,
   validateFuseUrl,
@@ -50,6 +52,10 @@ const callPlan = buildFixtureCallPlan(runId, model);
 const configuration = buildEvidenceConfiguration(provider, model);
 const configurationFingerprint = buildEvidenceConfigurationFingerprint(configuration);
 const configurationFingerprintProvenance = "pre-run-generated" as const;
+const providerCostCapValue = process.env["FUSE_EVIDENCE_PROVIDER_COST_CAP_ATOMIC"]?.trim();
+const providerCostCapAtomic = providerCostCapValue
+  ? validateEvidenceProviderCostCapAtomic(providerCostCapValue)
+  : null;
 const baselinePath = process.env["FUSE_EVIDENCE_BASELINE_MANIFEST"]?.trim();
 let replicationBaselineRunId: string | null = null;
 if (baselinePath) {
@@ -69,6 +75,7 @@ if (dryRun) {
     model,
     configurationFingerprint,
     configurationFingerprintProvenance,
+    providerCostCapAtomic: providerCostCapAtomic?.toString() ?? null,
     replicationBaselineRunId,
     mandateId,
     policyId,
@@ -119,6 +126,9 @@ const attempts: AttemptManifestEntry[] = [];
 const outputPath = join(process.cwd(), "evidence", "fixtures", `${runId}.json`);
 await persistManifest("running");
 for (const [index, call] of callPlan.entries()) {
+  if (providerCostCapAtomic !== null) {
+    assertEvidenceProviderCostCap(attempts, call, providerCostCapAtomic);
+  }
   const attempt = await executeFixtureCall(call, runtimeToken, index + 1);
   attempts.push(attempt);
   await persistManifest("running");
@@ -144,6 +154,7 @@ async function persistManifest(phase: "running" | "complete"): Promise<void> {
     model,
     configurationFingerprint,
     configurationFingerprintProvenance,
+    providerCostCapAtomic: providerCostCapAtomic?.toString() ?? null,
     replicationBaselineRunId,
     generatedAt: new Date().toISOString(),
     attempts,
