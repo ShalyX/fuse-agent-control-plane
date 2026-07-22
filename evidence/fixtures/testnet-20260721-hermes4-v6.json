@@ -1,0 +1,941 @@
+{
+  "schemaVersion": 2,
+  "phase": "complete",
+  "runId": "testnet-20260721-hermes4-v6",
+  "mandateId": "fixture-testnet-20260721-hermes4-v6",
+  "policyId": "fixture-policy-testnet-20260721-hermes4-v6",
+  "agentId": "fixture-agent-testnet-20260721-hermes4-v6",
+  "provider": "openrouter",
+  "model": "nousresearch/hermes-4-405b",
+  "configurationFingerprint": "sha256:797af3ef88a718744628f35b1a13bf64edb69caa7f7b868a01a075179c9a933d",
+  "configurationFingerprintProvenance": "post-hoc-db-verified",
+  "replicationBaselineRunId": null,
+  "generatedAt": "2026-07-22T00:15:46.381Z",
+  "attempts": [
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 1,
+      "requestId": "testnet-20260721-hermes4-v6-f1-1",
+      "sequence": 1,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "59",
+      "occurredAt": "2026-07-22T00:13:11.855Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 1,
+      "requestId": "testnet-20260721-hermes4-v6-f1-2",
+      "sequence": 2,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "74",
+      "occurredAt": "2026-07-22T00:13:12.892Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 1,
+      "requestId": "testnet-20260721-hermes4-v6-f1-3",
+      "sequence": 3,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "59",
+      "occurredAt": "2026-07-22T00:13:13.389Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 1,
+      "requestId": "testnet-20260721-hermes4-v6-f1-4",
+      "sequence": 4,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "59",
+      "occurredAt": "2026-07-22T00:13:14.419Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 1,
+      "requestId": "testnet-20260721-hermes4-v6-f1-5",
+      "sequence": 5,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "59",
+      "occurredAt": "2026-07-22T00:13:14.897Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 1,
+      "requestId": "testnet-20260721-hermes4-v6-f1-6",
+      "sequence": 6,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "989",
+      "occurredAt": "2026-07-22T00:13:16.767Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 2,
+      "requestId": "testnet-20260721-hermes4-v6-f2-7",
+      "sequence": 7,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "104",
+      "occurredAt": "2026-07-22T00:13:17.416Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 2,
+      "requestId": "testnet-20260721-hermes4-v6-f2-8",
+      "sequence": 8,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "104",
+      "occurredAt": "2026-07-22T00:13:18.028Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 2,
+      "requestId": "testnet-20260721-hermes4-v6-f2-9",
+      "sequence": 9,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "89",
+      "occurredAt": "2026-07-22T00:13:18.518Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 2,
+      "requestId": "testnet-20260721-hermes4-v6-f2-10",
+      "sequence": 10,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "89",
+      "occurredAt": "2026-07-22T00:13:18.972Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 2,
+      "requestId": "testnet-20260721-hermes4-v6-f2-11",
+      "sequence": 11,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "104",
+      "occurredAt": "2026-07-22T00:13:19.564Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 2,
+      "requestId": "testnet-20260721-hermes4-v6-f2-12",
+      "sequence": 12,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "89",
+      "occurredAt": "2026-07-22T00:13:20.036Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 2,
+      "requestId": "testnet-20260721-hermes4-v6-f2-13",
+      "sequence": 13,
+      "label": "runaway",
+      "outcome": "completed",
+      "actualCostAtomic": "654",
+      "occurredAt": "2026-07-22T00:13:21.235Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 2,
+      "requestId": "testnet-20260721-hermes4-v6-f2-14",
+      "sequence": 14,
+      "label": "runaway",
+      "outcome": "completed",
+      "actualCostAtomic": "654",
+      "occurredAt": "2026-07-22T00:13:21.836Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 2,
+      "requestId": "testnet-20260721-hermes4-v6-f2-15",
+      "sequence": 15,
+      "label": "runaway",
+      "outcome": "completed",
+      "actualCostAtomic": "654",
+      "occurredAt": "2026-07-22T00:13:22.364Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 2,
+      "requestId": "testnet-20260721-hermes4-v6-f2-16",
+      "sequence": 16,
+      "label": "runaway",
+      "outcome": "completed",
+      "actualCostAtomic": "654",
+      "occurredAt": "2026-07-22T00:13:22.927Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 2,
+      "requestId": "testnet-20260721-hermes4-v6-f2-17",
+      "sequence": 17,
+      "label": "runaway",
+      "outcome": "completed",
+      "actualCostAtomic": "654",
+      "occurredAt": "2026-07-22T00:13:23.550Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 2,
+      "requestId": "testnet-20260721-hermes4-v6-f2-18",
+      "sequence": 18,
+      "label": "runaway",
+      "outcome": "completed",
+      "actualCostAtomic": "654",
+      "occurredAt": "2026-07-22T00:13:27.012Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 3,
+      "requestId": "testnet-20260721-hermes4-v6-f3-19",
+      "sequence": 19,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "1614",
+      "occurredAt": "2026-07-22T00:13:31.038Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 3,
+      "requestId": "testnet-20260721-hermes4-v6-f3-20",
+      "sequence": 20,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "1524",
+      "occurredAt": "2026-07-22T00:13:33.872Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 3,
+      "requestId": "testnet-20260721-hermes4-v6-f3-21",
+      "sequence": 21,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "1614",
+      "occurredAt": "2026-07-22T00:13:47.289Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 3,
+      "requestId": "testnet-20260721-hermes4-v6-f3-22",
+      "sequence": 22,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "1482",
+      "occurredAt": "2026-07-22T00:14:10.297Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 3,
+      "requestId": "testnet-20260721-hermes4-v6-f3-23",
+      "sequence": 23,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "1614",
+      "occurredAt": "2026-07-22T00:14:14.098Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 3,
+      "requestId": "testnet-20260721-hermes4-v6-f3-24",
+      "sequence": 24,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "1614",
+      "occurredAt": "2026-07-22T00:14:18.088Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 4,
+      "requestId": "testnet-20260721-hermes4-v6-f4-25",
+      "sequence": 25,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "104",
+      "occurredAt": "2026-07-22T00:14:18.679Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 4,
+      "requestId": "testnet-20260721-hermes4-v6-f4-26",
+      "sequence": 26,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "89",
+      "occurredAt": "2026-07-22T00:14:19.393Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 4,
+      "requestId": "testnet-20260721-hermes4-v6-f4-27",
+      "sequence": 27,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "104",
+      "occurredAt": "2026-07-22T00:14:20.008Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 4,
+      "requestId": "testnet-20260721-hermes4-v6-f4-28",
+      "sequence": 28,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "89",
+      "occurredAt": "2026-07-22T00:14:20.465Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 4,
+      "requestId": "testnet-20260721-hermes4-v6-f4-29",
+      "sequence": 29,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "454",
+      "occurredAt": "2026-07-22T00:14:21.029Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 4,
+      "requestId": "testnet-20260721-hermes4-v6-f4-30",
+      "sequence": 30,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "454",
+      "occurredAt": "2026-07-22T00:14:21.867Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 4,
+      "requestId": "testnet-20260721-hermes4-v6-f4-31",
+      "sequence": 31,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "454",
+      "occurredAt": "2026-07-22T00:14:30.750Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 4,
+      "requestId": "testnet-20260721-hermes4-v6-f4-32",
+      "sequence": 32,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "454",
+      "occurredAt": "2026-07-22T00:14:37.234Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 5,
+      "requestId": "testnet-20260721-hermes4-v6-f5-33",
+      "sequence": 33,
+      "label": "hard-deny",
+      "outcome": "denied",
+      "actualCostAtomic": "0",
+      "denialCode": "WORKLOAD_CLASS_NOT_ALLOWED",
+      "occurredAt": "2026-07-22T00:14:37.299Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 6,
+      "requestId": "testnet-20260721-hermes4-v6-f6-34",
+      "sequence": 34,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "69",
+      "occurredAt": "2026-07-22T00:14:37.744Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 6,
+      "requestId": "testnet-20260721-hermes4-v6-f6-35",
+      "sequence": 35,
+      "label": "runaway",
+      "outcome": "completed",
+      "actualCostAtomic": "454",
+      "occurredAt": "2026-07-22T00:14:48.150Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 6,
+      "requestId": "testnet-20260721-hermes4-v6-f6-36",
+      "sequence": 36,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "84",
+      "occurredAt": "2026-07-22T00:14:48.713Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 6,
+      "requestId": "testnet-20260721-hermes4-v6-f6-37",
+      "sequence": 37,
+      "label": "runaway",
+      "outcome": "completed",
+      "actualCostAtomic": "454",
+      "occurredAt": "2026-07-22T00:14:49.278Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 6,
+      "requestId": "testnet-20260721-hermes4-v6-f6-38",
+      "sequence": 38,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "69",
+      "occurredAt": "2026-07-22T00:14:49.785Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 6,
+      "requestId": "testnet-20260721-hermes4-v6-f6-39",
+      "sequence": 39,
+      "label": "runaway",
+      "outcome": "completed",
+      "actualCostAtomic": "454",
+      "occurredAt": "2026-07-22T00:14:50.349Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 6,
+      "requestId": "testnet-20260721-hermes4-v6-f6-40",
+      "sequence": 40,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "69",
+      "occurredAt": "2026-07-22T00:14:50.835Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 6,
+      "requestId": "testnet-20260721-hermes4-v6-f6-41",
+      "sequence": 41,
+      "label": "runaway",
+      "outcome": "completed",
+      "actualCostAtomic": "454",
+      "occurredAt": "2026-07-22T00:14:51.701Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 7,
+      "requestId": "testnet-20260721-hermes4-v6-f7-42",
+      "sequence": 42,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "119",
+      "occurredAt": "2026-07-22T00:14:52.141Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 7,
+      "requestId": "testnet-20260721-hermes4-v6-f7-43",
+      "sequence": 43,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "119",
+      "occurredAt": "2026-07-22T00:14:52.587Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 7,
+      "requestId": "testnet-20260721-hermes4-v6-f7-44",
+      "sequence": 44,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "119",
+      "occurredAt": "2026-07-22T00:14:53.033Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 7,
+      "requestId": "testnet-20260721-hermes4-v6-f7-45",
+      "sequence": 45,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "119",
+      "occurredAt": "2026-07-22T00:14:53.488Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 7,
+      "requestId": "testnet-20260721-hermes4-v6-f7-46",
+      "sequence": 46,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "119",
+      "occurredAt": "2026-07-22T00:14:54.432Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 7,
+      "requestId": "testnet-20260721-hermes4-v6-f7-47",
+      "sequence": 47,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "119",
+      "occurredAt": "2026-07-22T00:14:55.154Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 7,
+      "requestId": "testnet-20260721-hermes4-v6-f7-48",
+      "sequence": 48,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "119",
+      "occurredAt": "2026-07-22T00:14:55.714Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 7,
+      "requestId": "testnet-20260721-hermes4-v6-f7-49",
+      "sequence": 49,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "119",
+      "occurredAt": "2026-07-22T00:14:57.172Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 7,
+      "requestId": "testnet-20260721-hermes4-v6-f7-50",
+      "sequence": 50,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "119",
+      "occurredAt": "2026-07-22T00:14:57.730Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 7,
+      "requestId": "testnet-20260721-hermes4-v6-f7-51",
+      "sequence": 51,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "119",
+      "occurredAt": "2026-07-22T00:14:58.173Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 7,
+      "requestId": "testnet-20260721-hermes4-v6-f7-52",
+      "sequence": 52,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "119",
+      "occurredAt": "2026-07-22T00:14:58.620Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 7,
+      "requestId": "testnet-20260721-hermes4-v6-f7-53",
+      "sequence": 53,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "134",
+      "occurredAt": "2026-07-22T00:14:59.206Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 7,
+      "requestId": "testnet-20260721-hermes4-v6-f7-54",
+      "sequence": 54,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "119",
+      "occurredAt": "2026-07-22T00:14:59.641Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 7,
+      "requestId": "testnet-20260721-hermes4-v6-f7-55",
+      "sequence": 55,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "119",
+      "occurredAt": "2026-07-22T00:15:00.066Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 7,
+      "requestId": "testnet-20260721-hermes4-v6-f7-56",
+      "sequence": 56,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "119",
+      "occurredAt": "2026-07-22T00:15:00.476Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 7,
+      "requestId": "testnet-20260721-hermes4-v6-f7-57",
+      "sequence": 57,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "119",
+      "occurredAt": "2026-07-22T00:15:00.898Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 7,
+      "requestId": "testnet-20260721-hermes4-v6-f7-58",
+      "sequence": 58,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "119",
+      "occurredAt": "2026-07-22T00:15:01.334Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 7,
+      "requestId": "testnet-20260721-hermes4-v6-f7-59",
+      "sequence": 59,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "119",
+      "occurredAt": "2026-07-22T00:15:01.766Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 7,
+      "requestId": "testnet-20260721-hermes4-v6-f7-60",
+      "sequence": 60,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "119",
+      "occurredAt": "2026-07-22T00:15:02.201Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 7,
+      "requestId": "testnet-20260721-hermes4-v6-f7-61",
+      "sequence": 61,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "119",
+      "occurredAt": "2026-07-22T00:15:02.630Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 7,
+      "requestId": "testnet-20260721-hermes4-v6-f7-62",
+      "sequence": 62,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "119",
+      "occurredAt": "2026-07-22T00:15:12.983Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 7,
+      "requestId": "testnet-20260721-hermes4-v6-f7-63",
+      "sequence": 63,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "119",
+      "occurredAt": "2026-07-22T00:15:13.456Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 7,
+      "requestId": "testnet-20260721-hermes4-v6-f7-64",
+      "sequence": 64,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "119",
+      "occurredAt": "2026-07-22T00:15:13.926Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 7,
+      "requestId": "testnet-20260721-hermes4-v6-f7-65",
+      "sequence": 65,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "119",
+      "occurredAt": "2026-07-22T00:15:14.383Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 7,
+      "requestId": "testnet-20260721-hermes4-v6-f7-66",
+      "sequence": 66,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "354",
+      "occurredAt": "2026-07-22T00:15:14.963Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 7,
+      "requestId": "testnet-20260721-hermes4-v6-f7-67",
+      "sequence": 67,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "404",
+      "occurredAt": "2026-07-22T00:15:15.555Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 8,
+      "requestId": "testnet-20260721-hermes4-v6-f8-68",
+      "sequence": 68,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "139",
+      "occurredAt": "2026-07-22T00:15:25.425Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 8,
+      "requestId": "testnet-20260721-hermes4-v6-f8-69",
+      "sequence": 69,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "139",
+      "occurredAt": "2026-07-22T00:15:25.874Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 8,
+      "requestId": "testnet-20260721-hermes4-v6-f8-70",
+      "sequence": 70,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "139",
+      "occurredAt": "2026-07-22T00:15:26.297Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 8,
+      "requestId": "testnet-20260721-hermes4-v6-f8-71",
+      "sequence": 71,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "139",
+      "occurredAt": "2026-07-22T00:15:26.955Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 8,
+      "requestId": "testnet-20260721-hermes4-v6-f8-72",
+      "sequence": 72,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "139",
+      "occurredAt": "2026-07-22T00:15:27.416Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 8,
+      "requestId": "testnet-20260721-hermes4-v6-f8-73",
+      "sequence": 73,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "139",
+      "occurredAt": "2026-07-22T00:15:27.866Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 8,
+      "requestId": "testnet-20260721-hermes4-v6-f8-74",
+      "sequence": 74,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "139",
+      "occurredAt": "2026-07-22T00:15:32.969Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 8,
+      "requestId": "testnet-20260721-hermes4-v6-f8-75",
+      "sequence": 75,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "139",
+      "occurredAt": "2026-07-22T00:15:33.394Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 8,
+      "requestId": "testnet-20260721-hermes4-v6-f8-76",
+      "sequence": 76,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "139",
+      "occurredAt": "2026-07-22T00:15:33.829Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 8,
+      "requestId": "testnet-20260721-hermes4-v6-f8-77",
+      "sequence": 77,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "154",
+      "occurredAt": "2026-07-22T00:15:38.223Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 8,
+      "requestId": "testnet-20260721-hermes4-v6-f8-78",
+      "sequence": 78,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "139",
+      "occurredAt": "2026-07-22T00:15:38.683Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 8,
+      "requestId": "testnet-20260721-hermes4-v6-f8-79",
+      "sequence": 79,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "139",
+      "occurredAt": "2026-07-22T00:15:39.088Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 8,
+      "requestId": "testnet-20260721-hermes4-v6-f8-80",
+      "sequence": 80,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "89",
+      "occurredAt": "2026-07-22T00:15:39.789Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 8,
+      "requestId": "testnet-20260721-hermes4-v6-f8-81",
+      "sequence": 81,
+      "label": "legitimate",
+      "outcome": "completed",
+      "actualCostAtomic": "89",
+      "occurredAt": "2026-07-22T00:15:40.299Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 9,
+      "requestId": "testnet-20260721-hermes4-v6-f9-82",
+      "sequence": 82,
+      "label": "hard-deny",
+      "outcome": "denied",
+      "actualCostAtomic": "0",
+      "denialCode": "REQUESTED_MODEL_MISMATCH",
+      "occurredAt": "2026-07-22T00:15:40.345Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 10,
+      "requestId": "testnet-20260721-hermes4-v6-f10-83",
+      "sequence": 83,
+      "label": "hard-deny",
+      "outcome": "completed",
+      "actualCostAtomic": "1054",
+      "occurredAt": "2026-07-22T00:15:41.145Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 10,
+      "requestId": "testnet-20260721-hermes4-v6-f10-84",
+      "sequence": 84,
+      "label": "hard-deny",
+      "outcome": "completed",
+      "actualCostAtomic": "1054",
+      "occurredAt": "2026-07-22T00:15:42.023Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 10,
+      "requestId": "testnet-20260721-hermes4-v6-f10-85",
+      "sequence": 85,
+      "label": "hard-deny",
+      "outcome": "completed",
+      "actualCostAtomic": "1054",
+      "occurredAt": "2026-07-22T00:15:42.798Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 10,
+      "requestId": "testnet-20260721-hermes4-v6-f10-86",
+      "sequence": 86,
+      "label": "hard-deny",
+      "outcome": "completed",
+      "actualCostAtomic": "1054",
+      "occurredAt": "2026-07-22T00:15:43.669Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 10,
+      "requestId": "testnet-20260721-hermes4-v6-f10-87",
+      "sequence": 87,
+      "label": "hard-deny",
+      "outcome": "completed",
+      "actualCostAtomic": "1054",
+      "occurredAt": "2026-07-22T00:15:44.228Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 10,
+      "requestId": "testnet-20260721-hermes4-v6-f10-88",
+      "sequence": 88,
+      "label": "hard-deny",
+      "outcome": "completed",
+      "actualCostAtomic": "1054",
+      "occurredAt": "2026-07-22T00:15:45.054Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 10,
+      "requestId": "testnet-20260721-hermes4-v6-f10-89",
+      "sequence": 89,
+      "label": "hard-deny",
+      "outcome": "completed",
+      "actualCostAtomic": "1054",
+      "occurredAt": "2026-07-22T00:15:46.200Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 10,
+      "requestId": "testnet-20260721-hermes4-v6-f10-90",
+      "sequence": 90,
+      "label": "hard-deny",
+      "outcome": "denied",
+      "actualCostAtomic": "0",
+      "denialCode": "BRANCH_BUDGET_EXCEEDED",
+      "occurredAt": "2026-07-22T00:15:46.259Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 10,
+      "requestId": "testnet-20260721-hermes4-v6-f10-91",
+      "sequence": 91,
+      "label": "hard-deny",
+      "outcome": "denied",
+      "actualCostAtomic": "0",
+      "denialCode": "BRANCH_BUDGET_EXCEEDED",
+      "occurredAt": "2026-07-22T00:15:46.317Z"
+    },
+    {
+      "runId": "testnet-20260721-hermes4-v6",
+      "fixtureId": 10,
+      "requestId": "testnet-20260721-hermes4-v6-f10-92",
+      "sequence": 92,
+      "label": "hard-deny",
+      "outcome": "denied",
+      "actualCostAtomic": "0",
+      "denialCode": "BRANCH_BUDGET_EXCEEDED",
+      "occurredAt": "2026-07-22T00:15:46.380Z"
+    }
+  ]
+}
