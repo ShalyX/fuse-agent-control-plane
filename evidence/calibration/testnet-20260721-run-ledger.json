@@ -99,10 +99,42 @@
         "falseWarnings": 4,
         "wouldIntervene": 4
       },
-      "classification": "final calibrated controlled run",
+      "classification": "final calibrated controlled run and replication baseline",
       "reasonSelected": "Healthy siblings and target share a workload class, each sibling reaches cohort maturity, and the fan-out-three intervention threshold is reachable."
+    },
+    {
+      "runId": "testnet-20260722-hermes4-v7",
+      "phase": "complete",
+      "attempts": 92,
+      "completed": 87,
+      "denied": 5,
+      "providerCostAtomic": "32609",
+      "providerCostCapAtomic": "100000",
+      "configurationFingerprint": "sha256:797af3ef88a718744628f35b1a13bf64edb69caa7f7b868a01a075179c9a933d",
+      "configurationFingerprintProvenance": "pre-run-generated",
+      "replicationBaselineRunId": "testnet-20260721-hermes4-v6",
+      "legitimateCompleted": 70,
+      "policyC": {
+        "warnings": 14,
+        "falseWarnings": 4,
+        "wouldIntervene": 4
+      },
+      "classification": "exact-configuration replication",
+      "reasonSelected": "Completed under the v6 fingerprint and explicit baseline lineage with full authoritative and persisted-shadow coverage."
     }
   ],
+  "exactReplicationSummary": {
+    "baselineRunId": "testnet-20260721-hermes4-v6",
+    "candidateRunId": "testnet-20260722-hermes4-v7",
+    "configurationFingerprint": "sha256:797af3ef88a718744628f35b1a13bf64edb69caa7f7b868a01a075179c9a933d",
+    "exactOutcomeAgreement": {
+      "hardDenials": true,
+      "policyCWarnings": true,
+      "policyCFalseWarnings": true,
+      "policyCWouldIntervene": true
+    },
+    "scope": "One fresh exact-configuration repeat of fixed controlled fixtures; not held-out production efficacy or an independent-sample rate."
+  },
   "descriptiveNonFixture2FalseWarningAggregate": {
     "includedRuns": [
       "testnet-20260721-hermes4-v3",
@@ -127,5 +159,5 @@
     "falseWarningRateAmongLegitimateEvaluations": 0.0625,
     "interpretation": "Descriptive repeated-fixed-fixture incidence only, not an independent-sample estimate. The prior 12/202 denominator is rejected because it included differently configured Fixture 2 healthy-sibling evaluations."
   },
-  "seriesProviderCostAtomic": "196701"
+  "seriesProviderCostAtomic": "229310"
 }
