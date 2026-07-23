@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { readFile } from "node:fs/promises";
 import { join, relative } from "node:path";
-import { Pool } from "pg";
+import { Client } from "pg";
 import { assertArtifactCommittedAtHead } from "../src/evidence/committedArtifact.js";
 import {
   assertEvidenceProviderCostSpent,
@@ -34,11 +34,13 @@ import {
   validateAuthoritativeSetup,
 } from "../src/evidence/authoritative.js";
 import { writeOnceJson } from "../src/evidence/durableArtifacts.js";
+import { assertReplayableEvidenceManifestLifecycle } from "../src/evidence/runLifecycle.js";
 
 interface FixtureManifest {
   schemaVersion: number;
-  phase: "running" | "complete";
+  phase: "running" | "complete" | "incomplete";
   evidenceType?: "fixed-fixtures" | "held-out";
+  configurationStatus?: "pending" | "ready";
   protocolVersion?: number | null;
   runId: string;
   mandateId: string;
@@ -48,27 +50,36 @@ interface FixtureManifest {
   model: string;
   configurationFingerprint: string;
   configurationFingerprintProvenance: string;
-  authoritativeSetupFingerprint: string;
-  authoritativeSetupSource: string;
+  authoritativeSetupFingerprint?: string;
+  authoritativeSetupSource?: string;
   replicationBaselineRunId: string | null;
   heldOutPlanFingerprint?: string | null;
   heldOutBeaconRound?: number | null;
   heldOutBeaconChainHash?: string | null;
   providerCostCapAtomic?: string | null;
+  failure?: unknown;
   attempts: AttemptManifestEntry[];
 }
 
 const manifestPath = process.env["FUSE_EVIDENCE_MANIFEST"]?.trim();
 if (!manifestPath) throw new Error("FUSE_EVIDENCE_MANIFEST_REQUIRED");
 const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as FixtureManifest;
-if (manifest.schemaVersion !== 2 || manifest.phase !== "complete"
+assertReplayableEvidenceManifestLifecycle(manifest);
+const legacySchemaV2 = manifest.schemaVersion === 2
+  && manifest.authoritativeSetupFingerprint === undefined
+  && manifest.authoritativeSetupSource === undefined
+  && manifest.configurationFingerprintProvenance === "post-hoc-db-verified";
+const authoritativeSetupSealed = typeof manifest.authoritativeSetupFingerprint === "string"
+  && /^sha256:[a-f0-9]{64}$/.test(manifest.authoritativeSetupFingerprint)
+  && manifest.authoritativeSetupSource === AUTHORITATIVE_SETUP_SOURCE;
+if ((manifest.schemaVersion !== 2 && manifest.schemaVersion !== 3)
+  || (manifest.schemaVersion === 3 && manifest.configurationStatus !== "ready")
   || !manifest.runId?.trim() || !manifest.mandateId?.trim() || !manifest.policyId?.trim()
   || !manifest.agentId?.trim()
   || (manifest.provider !== "anthropic" && manifest.provider !== "openrouter")
   || !manifest.model?.trim() || !Array.isArray(manifest.attempts)
   || !/^sha256:[a-f0-9]{64}$/.test(manifest.configurationFingerprint)
-  || !/^sha256:[a-f0-9]{64}$/.test(manifest.authoritativeSetupFingerprint)
-  || manifest.authoritativeSetupSource !== AUTHORITATIVE_SETUP_SOURCE
+  || (!legacySchemaV2 && !authoritativeSetupSealed)
   || (manifest.configurationFingerprintProvenance !== "pre-run-generated"
     && manifest.configurationFingerprintProvenance !== "post-hoc-db-verified"
     && manifest.configurationFingerprintProvenance !== "sealed-drand-plan")) {
@@ -132,8 +143,21 @@ const databaseUrl = process.env["DATABASE_URL_UNPOOLED"]?.trim()
 if (!databaseUrl) throw new Error("DATABASE_URL_REQUIRED");
 if (new URL(databaseUrl).hostname.includes("-pooler")) throw new Error("USE_UNPOOLED_CONNECTION");
 
-const pool = new Pool({ connectionString: databaseUrl, max: 2 });
+const client = new Client({
+  connectionString: databaseUrl,
+  connectionTimeoutMillis: 10_000,
+  query_timeout: 31_000,
+  statement_timeout: 30_000,
+});
+let clientClosed = false;
+const closeClient = () => {
+  client.connection.stream.destroy();
+  if (clientClosed) return;
+  clientClosed = true;
+  void client.end().catch(() => undefined);
+};
 try {
+  await withReplayTimeout(client.connect(), closeClient);
   const requestIds = manifest.attempts.map(({ requestId }) => requestId);
   const intendedSetup = buildIntendedAuthoritativeSetup({
     setupPlan,
@@ -145,17 +169,17 @@ try {
   });
   const replaySetup = validateAuthoritativeSetup(
     intendedSetup,
-    await queryAuthoritativeSetup(pool, {
+    await withReplayTimeout(queryAuthoritativeSetup(client, {
       mandateId: manifest.mandateId,
       policyId: manifest.policyId,
       policyVersion: 1,
-    }),
+    }), closeClient),
   );
-  if (replaySetup.fingerprint !== manifest.authoritativeSetupFingerprint
-    || replaySetup.source !== manifest.authoritativeSetupSource) {
+  if (!legacySchemaV2 && (replaySetup.fingerprint !== manifest.authoritativeSetupFingerprint
+    || replaySetup.source !== manifest.authoritativeSetupSource)) {
     throw new Error("REPLAY_AUTHORITATIVE_SETUP_FINGERPRINT_MISMATCH");
   }
-  const executionsResult = await pool.query<{
+  const executionsResult = await withReplayTimeout(client.query<{
     organization_id: string;
     request_id: string;
     status: string;
@@ -187,7 +211,7 @@ try {
       ON decision.organization_id = execution.organization_id
      AND decision.id = execution.decision_id
     WHERE execution.mandate_id = $1
-  `, [manifest.mandateId]);
+  `, [manifest.mandateId]), closeClient);
   const executions: AuthoritativeExecution[] = executionsResult.rows.map((row) => ({
     organizationId: row.organization_id,
     requestId: row.request_id,
@@ -211,11 +235,11 @@ try {
   const authoritativeCoverage = validateAuthoritativeAttempts(
     manifest.attempts,
     executions,
-    fixtureCalls,
+    legacySchemaV2 ? undefined : fixtureCalls,
     heldOut ? { provider: manifest.provider, model: manifest.model } : undefined,
   );
 
-  const evidenceResult = await pool.query<{ evidence: Record<string, unknown> }>(`
+  const evidenceResult = await withReplayTimeout(client.query<{ evidence: Record<string, unknown> }>(`
     SELECT evaluation.evidence
     FROM shadow_evaluations evaluation
     JOIN inference_executions execution
@@ -224,7 +248,7 @@ try {
     WHERE execution.mandate_id = $1
       AND evaluation.request_id = ANY($2::text[])
     ORDER BY (evaluation.evidence->>'cohortOrdinal')::numeric
-  `, [manifest.mandateId, requestIds]);
+  `, [manifest.mandateId, requestIds]), closeClient);
   const evidence = evidenceResult.rows.map(({ evidence: value }) => parseEvidence(value));
   const report = heldOutPlan ? null : buildReplayReport(manifest.attempts, evidence);
   const heldOutSummary = heldOutPlan
@@ -265,7 +289,29 @@ try {
     coverage: report?.coverage ?? { attempts: manifest.attempts.length, evidence: evidence.length },
     heldOutGate: heldOutSummary?.gate ?? null }));
 } finally {
-  await pool.end();
+  if (!clientClosed) {
+    const closing = client.end();
+    clientClosed = true;
+    await withReplayTimeout(closing, () => client.connection.stream.destroy());
+  }
+}
+
+async function withReplayTimeout<T>(
+  operation: Promise<T>,
+  cancel: () => void = () => undefined,
+): Promise<T> {
+  let timeout: NodeJS.Timeout | undefined;
+  const timedOut = new Promise<never>((_resolve, reject) => {
+    timeout = setTimeout(() => {
+      try { cancel(); } catch { /* preserve the timeout failure */ }
+      reject(new Error("REPLAY_DATABASE_TIMEOUT"));
+    }, 30_000);
+  });
+  try {
+    return await Promise.race([operation, timedOut]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
 }
 
 function parseEvidence(value: Record<string, unknown>): PersistedShadowEvidence {
