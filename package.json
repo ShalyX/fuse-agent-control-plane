@@ -22,6 +22,10 @@
     "evidence:fixtures:dry": "tsx scripts/generate-evidence-fixtures.ts --dry-run",
     "evidence:replay": "tsx scripts/replay-evidence.ts",
     "evidence:compare": "tsx scripts/compare-evidence-replications.ts",
+    "evidence:held-out:seal": "tsx scripts/seal-held-out-plan.ts",
+    "evidence:held-out:run": "tsx scripts/generate-evidence-fixtures.ts",
+    "evidence:held-out:dry": "tsx scripts/generate-evidence-fixtures.ts --dry-run",
+    "evidence:held-out:replay": "tsx scripts/replay-evidence.ts",
     "check": "npm test && npm run build"
   },
   "dependencies": {
