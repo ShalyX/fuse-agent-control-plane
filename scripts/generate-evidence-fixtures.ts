@@ -1,20 +1,24 @@
 #!/usr/bin/env node
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { access, readFile } from "node:fs/promises";
+import { join } from "node:path";
 import { createRequire } from "node:module";
 import type { initiateDeveloperControlledWalletsClient as InitiateClient } from "@circle-fin/developer-controlled-wallets";
 import { registerBatchScheme } from "@circle-fin/x402-batching/client";
 import { x402Client } from "@x402/core/client";
 import { x402HTTPClient } from "@x402/core/http";
+import { Pool } from "pg";
 import { createCircleGatewaySigner } from "../src/circle/developerWalletSigner.js";
+import { assertArtifactCommittedAtHead } from "../src/evidence/committedArtifact.js";
 import {
   assertEvidenceProviderCostCap,
+  assertEvidenceProviderCostSpent,
   buildEvidenceConfiguration,
   buildEvidenceConfigurationFingerprint,
   buildFixtureCallPlan,
   buildFixtureSetupPlan,
   fixtureScenarios,
   validateEvidenceProviderCostCapAtomic,
+  validateEvidenceCallOutcomes,
   validateEvidenceRunId,
   validateFixtureOutcomes,
   validateFuseUrl,
@@ -24,6 +28,23 @@ import {
   type ReplicationBaselineManifest,
   type SetupOperation,
 } from "../src/evidence/harness.js";
+import {
+  buildHeldOutCallPlan,
+  buildHeldOutConfigurationFingerprint,
+  buildHeldOutSetupPlan,
+  validateHeldOutPlan,
+  type HeldOutPlan,
+} from "../src/evidence/heldOut.js";
+import {
+  buildIntendedAuthoritativeSetup,
+  queryAuthoritativeSetup,
+  withVerifiedAuthoritativeSetup,
+} from "../src/evidence/authoritative.js";
+import {
+  acquireRunClaim,
+  atomicReplaceJson,
+  recordAttemptDurablyBeforeAssertions,
+} from "../src/evidence/durableArtifacts.js";
 
 const require = createRequire(import.meta.url);
 const { initiateDeveloperControlledWalletsClient } = require("@circle-fin/developer-controlled-wallets") as {
@@ -31,32 +52,54 @@ const { initiateDeveloperControlledWalletsClient } = require("@circle-fin/develo
 };
 
 const dryRun = process.argv.includes("--dry-run");
+const heldOutPlanPath = process.env["FUSE_HELD_OUT_PLAN"]?.trim();
+const heldOutPlan = heldOutPlanPath
+  ? JSON.parse(await readFile(heldOutPlanPath, "utf8")) as HeldOutPlan
+  : null;
+if (heldOutPlan) validateHeldOutPlan(heldOutPlan);
 const runId = validateEvidenceRunId(
   process.env["FUSE_EVIDENCE_RUN_ID"]?.trim() ?? `evidence-${Date.now()}`,
 );
-const providerValue = process.env["FUSE_PROVIDER"]?.trim().toLowerCase() ?? "anthropic";
+const providerValue = heldOutPlan?.provider
+  ?? process.env["FUSE_PROVIDER"]?.trim().toLowerCase() ?? "anthropic";
 if (providerValue !== "anthropic" && providerValue !== "openrouter") {
   throw new Error("FUSE_PROVIDER_INVALID");
 }
 const provider: "anthropic" | "openrouter" = providerValue;
-const model = process.env["FUSE_EVIDENCE_MODEL"]?.trim()
+const model = heldOutPlan?.model ?? process.env["FUSE_EVIDENCE_MODEL"]?.trim()
   ?? process.env["ANTHROPIC_MODEL"]?.trim() ?? "claude-sonnet-4-6";
-const mandateId = `fixture-${runId}`;
-const policyId = `fixture-policy-${runId}`;
-const agentId = `fixture-agent-${runId}`;
+if (heldOutPlan && (process.env["FUSE_PROVIDER"]?.trim().toLowerCase() ?? provider) !== provider) {
+  throw new Error("HELD_OUT_PROVIDER_OVERRIDE_FORBIDDEN");
+}
+if (heldOutPlan && (process.env["FUSE_EVIDENCE_MODEL"]?.trim() ?? model) !== model) {
+  throw new Error("HELD_OUT_MODEL_OVERRIDE_FORBIDDEN");
+}
+const mandateId = heldOutPlan ? `heldout-${runId}` : `fixture-${runId}`;
+const policyId = heldOutPlan ? `heldout-policy-${runId}` : `fixture-policy-${runId}`;
+const agentId = heldOutPlan ? `heldout-agent-${runId}` : `fixture-agent-${runId}`;
 const baseUrl = validateFuseUrl(
   process.env["FUSE_URL"]?.trim() ?? "http://127.0.0.1:8787",
 );
-const setupPlan = buildFixtureSetupPlan({ runId, provider, model, mandateId, policyId, agentId });
-const callPlan = buildFixtureCallPlan(runId, model);
+const setupPlan = heldOutPlan
+  ? buildHeldOutSetupPlan(heldOutPlan, runId)
+  : buildFixtureSetupPlan({ runId, provider, model, mandateId, policyId, agentId });
+const callPlan = heldOutPlan ? buildHeldOutCallPlan(heldOutPlan, runId) : buildFixtureCallPlan(runId, model);
 const configuration = buildEvidenceConfiguration(provider, model);
-const configurationFingerprint = buildEvidenceConfigurationFingerprint(configuration);
-const configurationFingerprintProvenance = "pre-run-generated" as const;
+const configurationFingerprint = heldOutPlan
+  ? buildHeldOutConfigurationFingerprint(heldOutPlan)
+  : buildEvidenceConfigurationFingerprint(configuration);
+const configurationFingerprintProvenance = heldOutPlan
+  ? "sealed-drand-plan" as const
+  : "pre-run-generated" as const;
 const providerCostCapValue = process.env["FUSE_EVIDENCE_PROVIDER_COST_CAP_ATOMIC"]?.trim();
 const providerCostCapAtomic = providerCostCapValue
   ? validateEvidenceProviderCostCapAtomic(providerCostCapValue)
   : null;
+if (heldOutPlan && !dryRun && providerCostCapAtomic === null) {
+  throw new Error("HELD_OUT_PROVIDER_COST_CAP_REQUIRED");
+}
 const baselinePath = process.env["FUSE_EVIDENCE_BASELINE_MANIFEST"]?.trim();
+if (heldOutPlan && baselinePath) throw new Error("HELD_OUT_BASELINE_POOLING_FORBIDDEN");
 let replicationBaselineRunId: string | null = null;
 if (baselinePath) {
   const baseline = JSON.parse(await readFile(baselinePath, "utf8")) as ReplicationBaselineManifest;
@@ -65,6 +108,17 @@ if (baselinePath) {
     configurationFingerprint,
     configuration.calls.length,
   ).baselineRunId;
+}
+const outputPath = join(process.cwd(), "evidence", heldOutPlan ? "held-out/manifests" : "fixtures", `${runId}.json`);
+if (heldOutPlan && !dryRun) {
+  await assertArtifactCommittedAtHead(heldOutPlanPath!);
+  try {
+    await access(outputPath);
+    throw new Error("HELD_OUT_MANIFEST_ALREADY_EXISTS");
+  } catch (error) {
+    if (error instanceof Error && error.message === "HELD_OUT_MANIFEST_ALREADY_EXISTS") throw error;
+    if (!error || typeof error !== "object" || !("code" in error) || error.code !== "ENOENT") throw error;
+  }
 }
 
 if (dryRun) {
@@ -75,13 +129,18 @@ if (dryRun) {
     model,
     configurationFingerprint,
     configurationFingerprintProvenance,
+    heldOutPlanFingerprint: heldOutPlan?.planFingerprint ?? null,
     providerCostCapAtomic: providerCostCapAtomic?.toString() ?? null,
     replicationBaselineRunId,
     mandateId,
     policyId,
     agentId,
     setupOperations: setupPlan.map(({ kind, method, path }) => ({ kind, method, path })),
-    fixtures: fixtureScenarios,
+    evidenceType: heldOutPlan ? "held-out" : "fixed-fixtures",
+    protocolVersion: heldOutPlan?.protocolVersion ?? null,
+    heldOutRound: heldOutPlan?.beacon.round ?? null,
+    heldOutChainHash: heldOutPlan?.beacon.chainHash ?? null,
+    fixtures: heldOutPlan?.cohorts ?? fixtureScenarios,
     callCount: callPlan.length,
     paidCallsExecuted: 0,
   }, null, 2));
@@ -89,6 +148,14 @@ if (dryRun) {
 }
 
 const adminToken = requiredEnv("FUSE_ADMIN_TOKEN");
+const claimPath = join(process.cwd(), "evidence", ".run-claims",
+  heldOutPlan ? "held-out" : "fixed-fixtures", `${runId}.claim`);
+await acquireRunClaim(claimPath, {
+  schemaVersion: 1,
+  runId,
+  evidenceType: heldOutPlan ? "held-out" : "fixed-fixtures",
+  claimedAt: new Date().toISOString(),
+});
 let paymentHttp: x402HTTPClient | undefined;
 
 async function getPaymentHttp(): Promise<x402HTTPClient> {
@@ -122,29 +189,58 @@ for (const [index, operation] of setupPlan.entries()) {
 }
 if (!runtimeToken) throw new Error("FIXTURE_AGENT_TOKEN_MISSING");
 
+const databaseUrl = process.env["DATABASE_URL_UNPOOLED"]?.trim()
+  ?? process.env["DATABASE_URL"]?.trim();
+if (!databaseUrl) throw new Error("DATABASE_URL_REQUIRED");
+if (new URL(databaseUrl).hostname.includes("-pooler")) throw new Error("USE_UNPOOLED_CONNECTION");
+const intendedAuthoritativeSetup = buildIntendedAuthoritativeSetup({
+  setupPlan, provider, model, mandateId, policyId, agentId,
+});
+const setupPool = new Pool({ connectionString: databaseUrl, max: 1 });
+const authoritativeSetup = await (async () => {
+  try {
+    return await withVerifiedAuthoritativeSetup(
+      intendedAuthoritativeSetup,
+      () => queryAuthoritativeSetup(setupPool, { mandateId, policyId, policyVersion: 1 }),
+      async (verification) => verification,
+    );
+  } finally {
+    await setupPool.end();
+  }
+})();
+
 const attempts: AttemptManifestEntry[] = [];
-const outputPath = join(process.cwd(), "evidence", "fixtures", `${runId}.json`);
 await persistManifest("running");
 for (const [index, call] of callPlan.entries()) {
   if (providerCostCapAtomic !== null) {
     assertEvidenceProviderCostCap(attempts, call, providerCostCapAtomic);
   }
   const attempt = await executeFixtureCall(call, runtimeToken, index + 1);
-  attempts.push(attempt);
-  await persistManifest("running");
-  if (call.expected !== "completed-or-denied" && attempt.outcome !== call.expected) {
-    throw new Error(`FIXTURE_EXPECTATION_FAILED:${call.requestId}:${call.expected}:${attempt.outcome}`);
-  }
+  await recordAttemptDurablyBeforeAssertions(
+    attempts,
+    attempt,
+    () => persistManifest("running"),
+    () => {
+      if (providerCostCapAtomic !== null) {
+        assertEvidenceProviderCostSpent(attempts, providerCostCapAtomic);
+      }
+      if (call.expected !== "completed-or-denied" && attempt.outcome !== call.expected) {
+        throw new Error(`FIXTURE_EXPECTATION_FAILED:${call.requestId}:${call.expected}:${attempt.outcome}`);
+      }
+    },
+  );
 }
 
-validateFixtureOutcomes(callPlan, attempts);
+if (heldOutPlan) validateEvidenceCallOutcomes(callPlan, attempts);
+else validateFixtureOutcomes(callPlan, attempts);
 await persistManifest("complete");
 console.log(JSON.stringify({ phase: "complete", runId, attempts: attempts.length, outputPath }));
 
 async function persistManifest(phase: "running" | "complete"): Promise<void> {
-  await mkdir(dirname(outputPath), { recursive: true });
-  await writeFile(outputPath, JSON.stringify({
+  await atomicReplaceJson(outputPath, {
     schemaVersion: 2,
+    evidenceType: heldOutPlan ? "held-out" : "fixed-fixtures",
+    protocolVersion: heldOutPlan?.protocolVersion ?? null,
     phase,
     runId,
     mandateId,
@@ -154,11 +250,16 @@ async function persistManifest(phase: "running" | "complete"): Promise<void> {
     model,
     configurationFingerprint,
     configurationFingerprintProvenance,
+    authoritativeSetupFingerprint: authoritativeSetup.fingerprint,
+    authoritativeSetupSource: authoritativeSetup.source,
+    heldOutPlanFingerprint: heldOutPlan?.planFingerprint ?? null,
     providerCostCapAtomic: providerCostCapAtomic?.toString() ?? null,
     replicationBaselineRunId,
+    heldOutBeaconRound: heldOutPlan?.beacon.round ?? null,
+    heldOutBeaconChainHash: heldOutPlan?.beacon.chainHash ?? null,
     generatedAt: new Date().toISOString(),
     attempts,
-  }, null, 2), { mode: 0o600 });
+  }, { immutableWhenComplete: true });
 }
 
 async function executeAdminOperation(
@@ -216,22 +317,48 @@ async function executeFixtureCall(
   }
   const responseBody = await readJson(response);
   const occurredAt = new Date().toISOString();
+  const dimensions = {
+    provider,
+    model: call.model,
+    branchId: call.branchId,
+    workloadClass: call.workloadClass,
+    maxOutputTokens: call.maxOutputTokens,
+    agentId,
+    policyId,
+    policyVersion: 1,
+  } as const;
   if (response.ok) {
     const actual = responseBody?.["fuse"];
     const actualCostAtomic = actual && typeof actual === "object" && "actualCostAtomic" in actual
       ? actual.actualCostAtomic : undefined;
-    if (typeof actualCostAtomic !== "string" || !/^\d+$/.test(actualCostAtomic)) {
-      throw new Error(`FIXTURE_COST_MISSING:${call.requestId}`);
+    const decision = actual && typeof actual === "object" && "decision" in actual
+      && actual.decision && typeof actual.decision === "object"
+      ? actual.decision as Record<string, unknown> : undefined;
+    if (typeof actualCostAtomic !== "string" || !/^\d+$/.test(actualCostAtomic)
+      || typeof decision?.["id"] !== "string" || typeof decision["outcome"] !== "string"
+      || typeof decision["wouldOutcome"] !== "string" || typeof decision["enforced"] !== "boolean") {
+      return { runId, fixtureId: call.fixtureId, requestId: call.requestId, sequence,
+        label: call.label, outcome: "error", actualCostAtomic: "0",
+        denialCode: "FIXTURE_RESPONSE_EVIDENCE_MISSING", occurredAt, ...dimensions };
     }
     return { runId, fixtureId: call.fixtureId, requestId: call.requestId, sequence,
-      label: call.label, outcome: "completed", actualCostAtomic, occurredAt };
+      label: call.label, outcome: "completed", actualCostAtomic, occurredAt, ...dimensions,
+      decisionId: decision["id"], decisionOutcome: decision["outcome"],
+      decisionWouldOutcome: decision["wouldOutcome"], decisionEnforced: decision["enforced"] };
   }
   if (response.status >= 400 && response.status < 500) {
+    const error = responseBody?.["error"];
+    const decisionId = error && typeof error === "object" && "decisionId" in error
+      && typeof error.decisionId === "string" ? error.decisionId : undefined;
     return { runId, fixtureId: call.fixtureId, requestId: call.requestId, sequence,
       label: call.label, outcome: "denied", actualCostAtomic: "0",
-      denialCode: errorCode(responseBody), occurredAt };
+      denialCode: errorCode(responseBody), occurredAt, ...dimensions,
+      ...(decisionId ? { decisionId } : {}) };
   }
-  throw new Error(`FIXTURE_CALL_FAILED:${call.requestId}:${response.status}:${errorCode(responseBody)}`);
+  return { runId, fixtureId: call.fixtureId, requestId: call.requestId, sequence,
+    label: call.label, outcome: "error", actualCostAtomic: "0",
+    denialCode: `FIXTURE_CALL_FAILED_${response.status}_${errorCode(responseBody)}`,
+    occurredAt, ...dimensions };
 }
 
 async function readJson(response: Response): Promise<Record<string, unknown> | undefined> {

@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "evidenceType": "held-out",
+  "protocolVersion": 1,
+  "status": "preregistered",
+  "sourceDocument": "docs/held-out-fixture-protocol-v1.md",
+  "publicReceipt": {
+    "repository": "https://github.com/ShalyX/fuse-agent-control-plane",
+    "pullRequest": "https://github.com/ShalyX/fuse-agent-control-plane/pull/6",
+    "mergeCommit": "8b72660964992de80c40928e63ee1ccbd06c90d2",
+    "mergedAt": "2026-07-22T19:30:19Z"
+  },
+  "beacon": {
+    "chainHash": "8990e7a9aaed2ffed73dbd7092123d6f289930540d7651336225dc172e51b2ce",
+    "round": 6311188,
+    "expectedAvailability": "2026-07-23T00:31:00Z"
+  }
+}

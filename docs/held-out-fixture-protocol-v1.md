@@ -97,7 +97,7 @@ A runaway cohort is a **C detection** when the target has at least one persisted
 - `SIBLING_DIVERGENCE` in `signals`; and
 - `eligibleForIntervention = true`.
 
-A legitimate cohort is a **C false intervention** when any branch in that cohort has a persisted evaluation with `eligibleForIntervention = true`.
+A legitimate cohort is a **C false intervention** when any branch in that cohort has a persisted evaluation with both `eligibleForIntervention = true` and `wouldSignalTarget = true`, which is the production `wouldSignal` predicate. Eligibility alone only records sufficient mature sibling coverage and is not an intervention signal.
 
 Co-primary outcomes:
 
@@ -149,6 +149,12 @@ evidence/held-out/replay/<run-id>.json
 ```
 
 Every plan, manifest, and replay report carries `evidenceType: "held-out"`, `protocolVersion: 1`, the beacon round and chain hash, and the sealed plan fingerprint. Generated sensitive artifacts are written mode `0600`. Comparator and ledger code must reject silent pooling across evidence types.
+
+## Authoritative replay trust boundary
+
+Before provider or payment initialization, the runner reads the persisted PostgreSQL provider/model binding, complete policy and workload-class configuration including shadow thresholds, mandate and policy version, assigned agent, and full branch hierarchy. These fields are canonicalized against the intended sealed setup. Any missing, extra, or mismatched persisted setup field invalidates the run before traffic. The resulting authoritative setup fingerprint and the source `postgres-authoritative-setup-v1` are persisted in every manifest.
+
+Replay independently repeats that PostgreSQL setup query and verifies the persisted fingerprint. For each execution it verifies every experiment-defining dimension present in the current authoritative schema: request and decision linkage, provider, model, branch, workload class, maximum output tokens, agent, policy ID/version, decision outcome/would-outcome/enforcement, status, actual cost, and the presence and format of the request fingerprint. Extra or duplicate execution rows are invalid. The schema does not attest provider-side prompt bytes or hidden routing beyond the persisted provider/model binding; replay makes no claim over those unavailable dimensions.
 
 ## Implementation gate
 

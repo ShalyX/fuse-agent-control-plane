@@ -13,6 +13,18 @@ export interface AttemptManifestEntry {
   actualCostAtomic: string;
   denialCode?: string;
   occurredAt: string;
+  provider?: "anthropic" | "openrouter";
+  model?: string;
+  branchId?: string;
+  workloadClass?: string;
+  maxOutputTokens?: number;
+  agentId?: string;
+  policyId?: string;
+  policyVersion?: number;
+  decisionId?: string;
+  decisionOutcome?: string;
+  decisionWouldOutcome?: string;
+  decisionEnforced?: boolean;
 }
 
 export interface PersistedShadowEvidence {
@@ -78,7 +90,7 @@ interface BranchDefinition {
 const BASELINE = "baseline-lookup";
 const EXPENSIVE = "expensive-summary";
 const SPIKE = "spike-burst";
-const WORKLOAD_MAX_COST_ATOMIC: Readonly<Record<string, bigint>> = {
+export const EVIDENCE_WORKLOAD_MAX_COST_ATOMIC: Readonly<Record<string, bigint>> = {
   [BASELINE]: 10000n,
   [EXPENSIVE]: 30000n,
   [SPIKE]: 50000n,
@@ -125,9 +137,9 @@ export function buildFixtureSetupPlan(input: SetupInput): SetupOperation[] {
     divergenceThresholdBps: 15000,
   };
   const workloadClasses = [
-    { id: BASELINE, maxCostPerCallAtomic: WORKLOAD_MAX_COST_ATOMIC[BASELINE]!.toString(), maxInvocationsPerBranch: 100, aggregateBudgetAtomic: "1000000", minimumInputTokens: 1, shadow },
-    { id: EXPENSIVE, maxCostPerCallAtomic: WORKLOAD_MAX_COST_ATOMIC[EXPENSIVE]!.toString(), maxInvocationsPerBranch: 100, aggregateBudgetAtomic: "1000000", minimumInputTokens: 1, shadow },
-    { id: SPIKE, maxCostPerCallAtomic: WORKLOAD_MAX_COST_ATOMIC[SPIKE]!.toString(), maxInvocationsPerBranch: 100, aggregateBudgetAtomic: "1000000", minimumInputTokens: 1, shadow },
+    { id: BASELINE, maxCostPerCallAtomic: EVIDENCE_WORKLOAD_MAX_COST_ATOMIC[BASELINE]!.toString(), maxInvocationsPerBranch: 100, aggregateBudgetAtomic: "1000000", minimumInputTokens: 1, shadow },
+    { id: EXPENSIVE, maxCostPerCallAtomic: EVIDENCE_WORKLOAD_MAX_COST_ATOMIC[EXPENSIVE]!.toString(), maxInvocationsPerBranch: 100, aggregateBudgetAtomic: "1000000", minimumInputTokens: 1, shadow },
+    { id: SPIKE, maxCostPerCallAtomic: EVIDENCE_WORKLOAD_MAX_COST_ATOMIC[SPIKE]!.toString(), maxInvocationsPerBranch: 100, aggregateBudgetAtomic: "1000000", minimumInputTokens: 1, shadow },
   ];
 
   return [
@@ -266,6 +278,17 @@ export function validateEvidenceProviderCostCapAtomic(value: string): bigint {
   return cap;
 }
 
+export function assertEvidenceProviderCostSpent(
+  attempts: readonly AttemptManifestEntry[],
+  capAtomic: bigint,
+): void {
+  const spentAtomic = attempts.reduce((total, attempt) => {
+    if (!/^\d+$/.test(attempt.actualCostAtomic)) throw new Error("EVIDENCE_PROVIDER_COST_INVALID");
+    return total + BigInt(attempt.actualCostAtomic);
+  }, 0n);
+  if (spentAtomic > capAtomic) throw new Error("EVIDENCE_PROVIDER_COST_CAP_EXCEEDED");
+}
+
 export function assertEvidenceProviderCostCap(
   attempts: readonly AttemptManifestEntry[],
   nextCall: FixtureCall,
@@ -275,7 +298,7 @@ export function assertEvidenceProviderCostCap(
     if (!/^\d+$/.test(attempt.actualCostAtomic)) throw new Error("EVIDENCE_PROVIDER_COST_INVALID");
     return total + BigInt(attempt.actualCostAtomic);
   }, 0n);
-  const nextMaximumAtomic = WORKLOAD_MAX_COST_ATOMIC[nextCall.workloadClass];
+  const nextMaximumAtomic = EVIDENCE_WORKLOAD_MAX_COST_ATOMIC[nextCall.workloadClass];
   if (nextMaximumAtomic === undefined) throw new Error("EVIDENCE_WORKLOAD_COST_CAP_MISSING");
   if (spentAtomic + nextMaximumAtomic > capAtomic) {
     throw new Error("EVIDENCE_PROVIDER_COST_CAP_EXCEEDED");
@@ -374,6 +397,7 @@ export function validateReplicationBaseline(
 }
 
 export interface ReplicationComparableReport {
+  evidenceType?: "fixed-fixtures" | "held-out";
   runId: string;
   phase: "complete";
   configurationFingerprint: string;
@@ -416,6 +440,10 @@ export function buildReplicationComparison(
   baseline: ReplicationComparableReport,
   candidates: readonly ReplicationComparableReport[],
 ): ReplicationComparison {
+  if (baseline.evidenceType === "held-out"
+    || candidates.some((candidate) => candidate.evidenceType === "held-out")) {
+    throw new Error("EVIDENCE_TYPE_POOLING_FORBIDDEN");
+  }
   validateCompleteReplicationReport(baseline);
   if (candidates.length === 0) throw new Error("EVIDENCE_REPLICATION_CANDIDATE_REQUIRED");
   for (const candidate of candidates) {
@@ -494,24 +522,37 @@ export function validateFuseUrl(value: string): string {
   return url.origin;
 }
 
-export function validateFixtureOutcomes(
+export function validateEvidenceCallOutcomes(
   calls: readonly FixtureCall[],
   attempts: readonly AttemptManifestEntry[],
 ): void {
   if (attempts.length !== calls.length) throw new Error("FIXTURE_MANIFEST_MISMATCH");
   const byRequest = new Map(attempts.map((attempt) => [attempt.requestId, attempt]));
+  if (byRequest.size !== attempts.length) throw new Error("FIXTURE_MANIFEST_MISMATCH");
   for (const [index, call] of calls.entries()) {
     const attempt = byRequest.get(call.requestId);
     if (!attempt) throw new Error("FIXTURE_ATTEMPT_MISSING");
     if (attempt.runId !== call.runId
       || attempt.fixtureId !== call.fixtureId
       || attempt.sequence !== index + 1
-      || attempt.label !== call.label) {
+      || attempt.label !== call.label
+      || !/^\d+$/.test(attempt.actualCostAtomic)) {
       throw new Error("FIXTURE_MANIFEST_MISMATCH");
     }
     if (call.expected !== "completed-or-denied" && attempt.outcome !== call.expected) {
       throw new Error("FIXTURE_OUTCOME_MISMATCH");
     }
+  }
+}
+
+export function validateFixtureOutcomes(
+  calls: readonly FixtureCall[],
+  attempts: readonly AttemptManifestEntry[],
+): void {
+  validateEvidenceCallOutcomes(calls, attempts);
+  const byRequest = new Map(attempts.map((attempt) => [attempt.requestId, attempt]));
+  for (const call of calls) {
+    const attempt = byRequest.get(call.requestId)!;
     const expectedDenial = call.fixtureId === 5 ? "WORKLOAD_CLASS_NOT_ALLOWED"
       : call.fixtureId === 9 ? "REQUESTED_MODEL_MISMATCH" : null;
     if (expectedDenial && attempt.denialCode !== expectedDenial) {
@@ -562,6 +603,21 @@ export interface AuthoritativeExecution {
   requestId: string;
   status: string;
   actualCostAtomic: string | null;
+  organizationId?: string;
+  provider?: string;
+  model?: string;
+  branchId?: string | null;
+  workloadClass?: string | null;
+  maxOutputTokens?: number;
+  inputTokens?: number;
+  agentId?: string;
+  policyId?: string;
+  policyVersion?: number;
+  decisionId?: string;
+  requestFingerprint?: string;
+  decisionOutcome?: string;
+  decisionWouldOutcome?: string;
+  decisionEnforced?: boolean;
 }
 
 export interface AuthoritativeValidationSummary {
@@ -569,13 +625,61 @@ export interface AuthoritativeValidationSummary {
   preExecutionDenials: string[];
 }
 
+export function buildAuthoritativeRequestFingerprint(
+  call: FixtureCall,
+  execution: AuthoritativeExecution,
+): string {
+  if (!execution.organizationId || !execution.agentId || !execution.provider || !execution.model
+    || !Number.isSafeInteger(execution.inputTokens) || execution.inputTokens! < 0) {
+    throw new Error("REPLAY_AUTHORITATIVE_REQUEST_FINGERPRINT_INPUT_INVALID");
+  }
+  const messages = [{
+    role: "user",
+    content: `${"context ".repeat(call.contextUnits)}\nReply only: FUSE`,
+  }];
+  return createHash("sha256").update(JSON.stringify({
+    organizationId: execution.organizationId,
+    mandateId: call.mandateId,
+    agentId: execution.agentId,
+    branchId: call.branchId ?? null,
+    workloadClass: call.workloadClass ?? null,
+    provider: execution.provider,
+    model: execution.model,
+    requestedModel: call.model,
+    inputTokens: execution.inputTokens,
+    maxOutputTokens: call.maxOutputTokens,
+    messages,
+  })).digest("hex");
+}
+
 export function validateAuthoritativeAttempts(
   attempts: readonly AttemptManifestEntry[],
   executions: readonly AuthoritativeExecution[],
+  calls?: readonly FixtureCall[],
+  binding?: { provider: "anthropic" | "openrouter"; model: string },
 ): AuthoritativeValidationSummary {
-  const byRequest = new Map(executions.map((execution) => [execution.requestId, execution]));
+  const byRequest = new Map<string, AuthoritativeExecution>();
+  for (const execution of executions) {
+    if (byRequest.has(execution.requestId)) throw new Error("REPLAY_AUTHORITATIVE_EXECUTION_DUPLICATE");
+    byRequest.set(execution.requestId, execution);
+  }
+  const attemptIds = new Set(attempts.map(({ requestId }) => requestId));
+  if (executions.some(({ requestId }) => !attemptIds.has(requestId))) {
+    throw new Error("REPLAY_AUTHORITATIVE_EXECUTION_EXTRA");
+  }
   const preExecutionDenials: string[] = [];
-  for (const attempt of attempts) {
+  for (const [index, attempt] of attempts.entries()) {
+    const call = calls?.[index];
+    if (calls && (!call || call.requestId !== attempt.requestId)) {
+      throw new Error("REPLAY_MANIFEST_CALL_MISMATCH");
+    }
+    if (binding && (attempt.provider !== binding.provider || attempt.model !== binding.model)) {
+      throw new Error("REPLAY_MANIFEST_PLAN_BINDING_MISMATCH");
+    }
+    if (call && (attempt.model !== call.model || attempt.branchId !== call.branchId
+      || attempt.workloadClass !== call.workloadClass || attempt.maxOutputTokens !== call.maxOutputTokens)) {
+      throw new Error("REPLAY_MANIFEST_CALL_MISMATCH");
+    }
     const execution = byRequest.get(attempt.requestId);
     if (!execution) {
       if (attempt.outcome === "denied" && attempt.denialCode === "REQUESTED_MODEL_MISMATCH"
@@ -591,6 +695,23 @@ export function validateAuthoritativeAttempts(
     if (attempt.outcome === "completed"
       && execution.actualCostAtomic !== attempt.actualCostAtomic) {
       throw new Error("REPLAY_AUTHORITATIVE_COST_MISMATCH");
+    }
+    if (call) {
+      if (execution.provider !== attempt.provider || execution.model !== attempt.model
+        || execution.branchId !== attempt.branchId || execution.workloadClass !== attempt.workloadClass
+        || execution.maxOutputTokens !== attempt.maxOutputTokens || execution.agentId !== attempt.agentId
+        || execution.policyId !== attempt.policyId || execution.policyVersion !== attempt.policyVersion
+        || (attempt.decisionId !== undefined && execution.decisionId !== attempt.decisionId)
+        || (attempt.decisionOutcome !== undefined && execution.decisionOutcome !== attempt.decisionOutcome)
+        || (attempt.decisionWouldOutcome !== undefined
+          && execution.decisionWouldOutcome !== attempt.decisionWouldOutcome)
+        || (attempt.decisionEnforced !== undefined && execution.decisionEnforced !== attempt.decisionEnforced)) {
+        throw new Error("REPLAY_AUTHORITATIVE_DIMENSION_MISMATCH");
+      }
+      if (!execution.requestFingerprint || execution.requestFingerprint
+        !== buildAuthoritativeRequestFingerprint(call, execution)) {
+        throw new Error("REPLAY_AUTHORITATIVE_REQUEST_FINGERPRINT_MISMATCH");
+      }
     }
   }
   return { executionRows: executions.length, preExecutionDenials };

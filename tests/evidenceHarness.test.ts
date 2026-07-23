@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   assertEvidenceProviderCostCap,
+  assertEvidenceProviderCostSpent,
   buildEvidenceConfiguration,
   buildEvidenceConfigurationFingerprint,
   buildFixtureCallPlan,
@@ -231,6 +232,10 @@ describe("fixture setup contract", () => {
       .toThrow("EVIDENCE_PROVIDER_COST_CAP_EXCEEDED");
     expect(() => assertEvidenceProviderCostCap(attempts, denied, 100000n))
       .toThrow("EVIDENCE_PROVIDER_COST_CAP_EXCEEDED");
+    expect(() => assertEvidenceProviderCostSpent([
+      ...attempts,
+      { ...attempts[0]!, requestId: "overspend", actualCostAtomic: "20001" },
+    ], 100000n)).toThrow("EVIDENCE_PROVIDER_COST_CAP_EXCEEDED");
   });
 });
 
@@ -321,7 +326,12 @@ describe("exact-configuration replication comparison", () => {
     expect(comparison.runs.map(({ runId }) => runId)).toEqual(["v6", "replicate-1"]);
   });
 
-  it("rejects configuration drift, wrong lineage, and incomplete shadow coverage", () => {
+  it("rejects configuration drift, wrong lineage, incomplete shadow coverage, and evidence-type pooling", () => {
+    expect(() => buildReplicationComparison(
+      { ...baseline, evidenceType: "held-out" },
+      [{ ...baseline, runId: "replicate-1", configurationFingerprintProvenance: "pre-run-generated",
+        replicationBaselineRunId: "v6", evidenceType: "fixed-fixtures" }],
+    )).toThrow("EVIDENCE_TYPE_POOLING_FORBIDDEN");
     expect(() => buildReplicationComparison(baseline, [{
       ...baseline,
       runId: "post-hoc-candidate",
