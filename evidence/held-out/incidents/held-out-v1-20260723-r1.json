@@ -1,0 +1,52 @@
+{
+  "schemaVersion": 1,
+  "evidenceType": "held-out",
+  "protocolVersion": 1,
+  "runId": "held-out-v1-20260723-r1",
+  "classification": "incomplete",
+  "classificationReason": "provider_outcome_ambiguous",
+  "planFingerprint": "sha256:32c55311f3f7f66398ac4b5effbbfc9dd50c50f0cce585764e0aa9534df8734d",
+  "beaconRound": 6311188,
+  "provider": "openrouter",
+  "model": "nousresearch/hermes-4-405b",
+  "authorizedProviderCostCapAtomic": "5480000",
+  "plannedCalls": 224,
+  "persistedAttempts": 14,
+  "completedAttempts": 13,
+  "errorAttempts": 1,
+  "knownProviderCostAtomic": "4781",
+  "knownProviderCostUsd": "0.004781",
+  "unresolvedProviderCost": true,
+  "firstIncompleteRequest": {
+    "requestId": "held-out-v1-20260723-r1-ho-14",
+    "sequence": 14,
+    "manifestOutcome": "error",
+    "manifestDenialCode": "FIXTURE_CALL_FAILED_502_PROVIDER_UNAVAILABLE",
+    "authoritativeExecutionStatus": "reconciliation_hold",
+    "authoritativeFailureCode": "PROVIDER_OUTCOME_AMBIGUOUS",
+    "authoritativeActualCostAtomic": null,
+    "vercelHttpStatus": 502,
+    "vercelRequestId": "b472ee7d-18f0-4ee0-8adf-48d88720da45",
+    "vercelObservedAt": "2026-07-23T01:22:51.928Z"
+  },
+  "primaryOutcomeEvaluation": null,
+  "primaryOutcomeReason": "The preregistered run did not complete, so the cohort gate cannot pass and partial cohorts are descriptive only.",
+  "replayArtifact": null,
+  "replayReason": "Authoritative replay rejects non-complete manifests by design.",
+  "protocolConstraints": {
+    "retrySameSeed": false,
+    "replacementCohorts": false,
+    "thresholdChanges": false
+  },
+  "artifacts": {
+    "claim": {
+      "path": "evidence/.run-claims/held-out/held-out-v1-20260723-r1.claim",
+      "sha256": "e94ac86f6ab21c47cdc75de1b693d28991bfd2d67a8b2a52b44d5b605a7d6022"
+    },
+    "manifest": {
+      "path": "evidence/held-out/manifests/held-out-v1-20260723-r1.json",
+      "sha256": "58916e04bf593a08a90e081822d7271715d67ec4afa4ebabdde8892942b9f9bd"
+    }
+  },
+  "recordedAt": "2026-07-23T01:25:25Z"
+}
