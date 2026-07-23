@@ -141,20 +141,20 @@ it("keeps Shaly signer authority behind a tenant-bound capped service", async ()
   })).status).toBe(403);
   expect(calls).toHaveLength(0);
 
-  const signed = await request(app).post("/v1/sign").set("Authorization", authorizationHeader).send({
+  const replayPayload = {
     organizationId: "org-shaly", requestId: "c".repeat(64),
     amountAtomic: "100", typedData: typedData("100"),
-  });
+  };
+  const signed = await request(app).post("/v1/sign").set("Authorization", authorizationHeader)
+    .send(replayPayload);
   expect(signed.status).toBe(200);
   expect(signed.body).toEqual({
     organizationId: "org-shaly", requestId: "c".repeat(64),
     walletAddress, signature: expect.stringMatching(/^0x[0-9a-f]{130}$/),
   });
   expect(calls).toHaveLength(1);
-  const replay = await request(app).post("/v1/sign").set("Authorization", authorizationHeader).send({
-    organizationId: "org-shaly", requestId: "c".repeat(64),
-    amountAtomic: "100", typedData: typedData("100"),
-  });
+  const replay = await request(app).post("/v1/sign").set("Authorization", authorizationHeader)
+    .send(replayPayload);
   expect(replay.status).toBe(200);
   expect(replay.body.signature).toBe(signed.body.signature);
   expect(calls).toHaveLength(1);
