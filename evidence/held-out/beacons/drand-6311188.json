@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "evidenceType": "held-out",
+  "protocolVersion": 1,
+  "chainHash": "8990e7a9aaed2ffed73dbd7092123d6f289930540d7651336225dc172e51b2ce",
+  "source": "https://api.drand.sh/public/6311188",
+  "response": {
+    "round": 6311188,
+    "randomness": "2b26df64aefef28669ed21ac728ff55884d512ab38a0510c528c480723f892c3",
+    "signature": "afcf0ad890f08d41ecf6af729388067f8e1a84aab0b5537f4f1158fee1ee452e190cd4540fa3026dfb7e30f8929b53d418abf21ea2aeb82c1e8fb4eb7be32227c6ac1b3b348ad1653efb267b0ed2f403155594d4f8622e0bc858cbfd8f7737bb",
+    "previous_signature": "92c47a4065829fdb9506b2b20adf45c513546a203ec0d1f8ec446836629ff2934d52ebe57c7deb9ba25b220294e13b9d0d40aa3a0571f29bfe023bb40b0a22e10ea727e93fe9ad85356eaa7837de4c2bf3a720c56e7d2f33115cca04fd9a896a"
+  }
+}
