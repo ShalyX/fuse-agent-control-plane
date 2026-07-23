@@ -14,8 +14,13 @@ async function withOrganization(
     now: string,
   ) => Promise<void>,
 ) {
-  const databaseUrl = process.env["DATABASE_URL"];
-  if (!databaseUrl) throw new Error("DATABASE_URL_REQUIRED");
+  const configuredUrl = process.env["NEON_INTEGRATION_DATABASE_URL_UNPOOLED"]
+    ?? process.env["DATABASE_URL_UNPOOLED"] ?? process.env["DATABASE_URL"];
+  if (!configuredUrl) throw new Error("DATABASE_URL_REQUIRED");
+  // Schema bootstrap uses session-level advisory locks, which require backend affinity.
+  const unpooled = new URL(configuredUrl);
+  unpooled.hostname = unpooled.hostname.replace("-pooler.", ".");
+  const databaseUrl = unpooled.toString();
   const firstPool = createPostgresPool(databaseUrl);
   const secondPool = createPostgresPool(databaseUrl);
   const organizationId = `provider-integration-${randomUUID()}`;
