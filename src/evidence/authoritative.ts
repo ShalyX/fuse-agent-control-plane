@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 import type { Pool } from "pg";
 import type { SetupOperation } from "./harness.js";
 
+type AuthoritativeQueryClient = Pick<Pool, "query">;
+
 export const AUTHORITATIVE_SETUP_SOURCE = "postgres-authoritative-setup-v1" as const;
 
 type ShadowSetup = {
@@ -119,7 +121,7 @@ export function buildIntendedAuthoritativeSetup(input: {
 }
 
 export async function queryAuthoritativeSetup(
-  pool: Pool,
+  pool: AuthoritativeQueryClient,
   input: { mandateId: string; policyId: string; policyVersion: number },
 ): Promise<AuthoritativeSetup> {
   const provider = await pool.query<{ organization_id: string; provider: string; model: string }>(`

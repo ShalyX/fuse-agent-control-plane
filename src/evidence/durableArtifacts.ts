@@ -1,9 +1,11 @@
-import { chmod, link, mkdir, open, readFile, rename, rm } from "node:fs/promises";
+import { chmod, link, mkdir, open, readFile, rename, rm, type FileHandle } from "node:fs/promises";
 import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
 
 export interface AtomicJsonOptions {
-  immutableWhenComplete?: boolean;
+  immutableWhenTerminal?: boolean;
+  beforeLock?: () => void | Promise<void>;
   beforeRename?: () => void | Promise<void>;
 }
 
@@ -44,6 +46,21 @@ export async function acquireRunClaim(path: string, value: unknown): Promise<voi
   await syncDirectory(directory);
 }
 
+async function acquireArtifactWriteLock(path: string): Promise<{ file: FileHandle; path: string }> {
+  const lockPath = `${path}.write-lock`;
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    try {
+      return { file: await open(lockPath, "wx", 0o600), path: lockPath };
+    } catch (error) {
+      const occupied = error && typeof error === "object" && "code" in error && error.code === "EEXIST";
+      if (!occupied) throw error;
+      if (attempt === 499) throw new Error("EVIDENCE_ARTIFACT_WRITE_LOCKED");
+      await delay(10);
+    }
+  }
+  throw new Error("EVIDENCE_ARTIFACT_WRITE_LOCKED");
+}
+
 export async function atomicReplaceJson(
   path: string,
   value: unknown,
@@ -51,23 +68,34 @@ export async function atomicReplaceJson(
 ): Promise<void> {
   const directory = dirname(path);
   await mkdir(directory, { recursive: true, mode: 0o700 });
-  if (options.immutableWhenComplete) {
-    try {
-      const existing = JSON.parse(await readFile(path, "utf8")) as { phase?: unknown };
-      if (existing.phase === "complete") throw new Error("EVIDENCE_COMPLETED_ARTIFACT_IMMUTABLE");
-    } catch (error) {
-      if (error instanceof Error && error.message === "EVIDENCE_COMPLETED_ARTIFACT_IMMUTABLE") throw error;
-      if (!error || typeof error !== "object" || !("code" in error) || error.code !== "ENOENT") throw error;
-    }
-  }
-  const tempPath = await writeSyncedTemp(path, value);
+  await options.beforeLock?.();
+  const lock = options.immutableWhenTerminal ? await acquireArtifactWriteLock(path) : null;
   try {
-    await options.beforeRename?.();
-    await rename(tempPath, path);
-    await chmod(path, 0o600);
-    await syncDirectory(directory);
+    if (options.immutableWhenTerminal) {
+      try {
+        const existing = JSON.parse(await readFile(path, "utf8")) as { phase?: unknown };
+        if (existing.phase === "complete" || existing.phase === "incomplete") {
+          throw new Error("EVIDENCE_TERMINAL_ARTIFACT_IMMUTABLE");
+        }
+      } catch (error) {
+        if (error instanceof Error && error.message === "EVIDENCE_TERMINAL_ARTIFACT_IMMUTABLE") throw error;
+        if (!error || typeof error !== "object" || !("code" in error) || error.code !== "ENOENT") throw error;
+      }
+    }
+    const tempPath = await writeSyncedTemp(path, value);
+    try {
+      await options.beforeRename?.();
+      await rename(tempPath, path);
+      await chmod(path, 0o600);
+      await syncDirectory(directory);
+    } finally {
+      await rm(tempPath, { force: true });
+    }
   } finally {
-    await rm(tempPath, { force: true });
+    if (lock) {
+      await lock.file.close();
+      await rm(lock.path, { force: true });
+    }
   }
 }
 

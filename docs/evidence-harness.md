@@ -1,15 +1,17 @@
 # Sibling-Divergence Evidence Harness
 
-This harness generates a labeled execution manifest through the real authenticated Fuse HTTP path, handles a Circle x402 challenge when the target deployment presents one, then produces a report from authoritative execution rows and persisted shadow evidence.
+This harness generates a labeled execution manifest through the real authenticated Fuse HTTP path, then produces a report from authoritative execution rows and persisted shadow evidence. It never signs or submits an x402 payment.
 
 It does **not** reconstruct cohorts, invent observations, or claim behavioral enforcement.
 
 ## Safety and trust boundaries
 
 - `npm run evidence:fixtures:dry` performs no network or paid calls and requires no credentials.
-- `npm run evidence:fixtures` performs real provider calls and makes a Circle x402 payment only when the target route actually returns a valid 402 challenge. It currently plans 92 attempts across the ten fixtures.
+- `npm run evidence:fixtures` performs real provider calls but never signs or submits an x402 payment. A 402 response terminalizes the run as incomplete with `EVIDENCE_X402_PAYMENT_REQUIRED`. It currently plans 92 attempts across the ten fixtures.
 - Set `FUSE_EVIDENCE_PROVIDER_COST_CAP_ATOMIC` to a positive USD-micros ceiling for an operator-authorized run. Before every attempt, the runner reserves the configured workload class's maximum per-call cost against cumulative persisted provider cost and aborts before the call if the ceiling could be exceeded. This operational cap is recorded in the manifest but intentionally excluded from the fixture configuration fingerprint; a binding cap leaves the run incomplete.
 - The administrative token is used only for setup. The one-time agent token is retained only in process memory and is never written to the manifest.
+- HTTP operations include response-body consumption under one abort deadline, enforce a 1 MiB body ceiling, cancel oversized streams, and persist only allowlisted response error codes. Unknown response codes become `EVIDENCE_RESPONSE_ERROR_CODE_UNTRUSTED`.
+- Authoritative PostgreSQL reads use a dedicated connection with server-side statement timeouts. Interruption or an operation deadline destroys that connection before incomplete terminalization; replay applies the same server-side query bound.
 - Request IDs are headers. Strict API request bodies contain no `requestId`, `mandateId`, or other unknown fields.
 - The runner registers the agent, issues the runtime credential, publishes the policy, creates the draft mandate, assigns the agent, creates **all** branches, and activates only after branch creation.
 - Manifests and reports are written under `evidence/` with mode `0600`. Do not commit generated evidence blindly; inspect it first.
@@ -38,16 +40,14 @@ Prerequisites:
 
 - A running Fuse deployment with `FUSE_WORKLOAD_SHADOW_ENABLED=true`
 - An active admin service-account token with `agents:write`, `credentials:issue`, `policies:write`, and `mandates:admin`
-- Circle developer-controlled-wallet credentials and a funded Arc Testnet payer wallet **only if** the target deployment actually returns an x402 challenge. The current authenticated control-mode route normally executes without that challenge; Circle setup is lazy and unused in that case.
 - Provider configuration for the organization and selected model
+
+The evidence runner has no wallet or payment path. A target response of HTTP 402 terminalizes the run as incomplete; Circle credentials and a payer wallet are neither read nor required.
 
 Keep values out of shell history where possible. Required environment variable names are:
 
 ```text
 FUSE_ADMIN_TOKEN
-CIRCLE_API_KEY
-CIRCLE_ENTITY_SECRET
-FUSE_PAYER_ADDRESS
 FUSE_URL                  # optional; defaults to local :8787
 FUSE_PROVIDER             # anthropic or openrouter; must match tenant configuration
 FUSE_EVIDENCE_MODEL       # exact configured tenant model
@@ -69,7 +69,7 @@ The runner writes incrementally to:
 evidence/fixtures/<run-id>.json
 ```
 
-Incremental writes preserve completed attempt truth if a later paid call or expectation fails. A fixed mandate is intentionally not reused: a fresh run ID prevents stale policy, branch, budget, and idempotency state from contaminating evidence.
+Incremental writes preserve completed attempt truth if a later paid call or expectation fails. New runs use manifest schema v3. Immediately after the durable run claim, the runner writes `phase: "running"` with `configurationStatus: "pending"` and nullable configuration fields before parsing attributable runtime configuration or performing stateful setup. After validation it replaces that state with `configurationStatus: "ready"`. A handled configuration, setup, authoritative-verification, provider, x402-requirement, cost-cap, post-call, final-validation, `SIGINT`, or `SIGTERM` failure atomically finalizes it with `phase: "incomplete"` and a bounded `failure` record containing the stable code, stage, timestamp, active request/sequence, persisted-attempt count, and planned-attempt count. Raw exception text, stacks, responses, credentials, and provider payloads are never persisted. Both `complete` and `incomplete` manifests are terminal and immutable. Every running or terminal replacement is serialized by an exclusive per-artifact write lock. A `.write-lock` left by process death is a fail-closed crash marker: the runner does not delete it automatically, and an operator must preserve and inspect the claim, lock, manifest, and process state before any recovery decision. Replay accepts legacy complete schema-v2 artifacts and complete schema-v3 artifacts, rejects valid incomplete artifacts with `EVIDENCE_MANIFEST_INCOMPLETE`, and classifies `running` artifacts as `EVIDENCE_MANIFEST_NOT_TERMINAL`; partial cohorts remain descriptive only. An uncatchable process termination such as `SIGKILL` or host loss can still leave `phase: "running"`, which is preserved as interrupted evidence rather than rewritten post hoc. A fixed mandate is intentionally not reused: a fresh run ID prevents stale policy, branch, budget, and idempotency state from contaminating evidence.
 
 ## Replay/report
 
