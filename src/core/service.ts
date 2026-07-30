@@ -9,6 +9,8 @@ export type CompletionRequest = {
   inputTokens: number;
   maxOutputTokens: number;
   messages: Array<{ role: string; content: string }>;
+  /** Reliability-v2 transport boundary hook. Implementations must await it immediately before entering the HTTP primitive. */
+  onDispatchPrimitiveEntered?: () => Promise<void>;
 };
 
 export interface ProviderResult {

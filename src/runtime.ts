@@ -13,12 +13,21 @@ import { providerCredentialKeyRingFromEnv } from "./providers/providerCredential
 import { ProviderConfigStore } from "./persistence/providerConfigStore.js";
 import { ProviderAdministration } from "./providers/providerAdministration.js";
 import { TenantProviderResolver } from "./providers/tenantProviderResolver.js";
+import { ReliabilityProtocolStore } from "./reliability/protocolStore.js";
+import { ReliabilityInferenceExecutionStore } from "./reliability/inferenceStore.js";
 
 const unavailableLegacyProvider: InferenceProvider = {
   async complete() {
     throw new Error("TENANT_PROVIDER_CONFIGURATION_REQUIRED");
   },
 };
+
+export function reliabilityProtocolEnabledFromEnv(env: NodeJS.ProcessEnv): boolean {
+  const value = env["FUSE_RELIABILITY_PROTOCOL_ENABLED"]?.trim().toLowerCase();
+  if (value === undefined || value === "false") return false;
+  if (value === "true") return true;
+  throw new Error("FUSE_RELIABILITY_PROTOCOL_ENABLED_INVALID");
+}
 
 export function createRuntimeApp(env: NodeJS.ProcessEnv = process.env) {
   const signerOnlySecrets = [
@@ -52,7 +61,22 @@ export function createRuntimeApp(env: NodeJS.ProcessEnv = process.env) {
   const credentialAdministration = identityStore
     ? new CredentialAdministration(identityStore)
     : undefined;
-  const policyStore = databasePool ? new PolicyStore(databasePool) : undefined;
+  const reliabilityProtocolEnabled = reliabilityProtocolEnabledFromEnv(env);
+  if (reliabilityProtocolEnabled && !databasePool) {
+    throw new Error("DATABASE_URL is required for the optional reliability protocol");
+  }
+  const policyStore = databasePool ? new PolicyStore(databasePool, {
+    protocolMutationExclusionEnabled: reliabilityProtocolEnabled,
+    protocolMutationLockTimeoutMs: 5_000,
+  }) : undefined;
+  const reliabilityStore = reliabilityProtocolEnabled && databasePool
+    ? new ReliabilityProtocolStore(databasePool)
+    : undefined;
+  const executionStore = databasePool && policyStore
+    ? reliabilityStore
+      ? new ReliabilityInferenceExecutionStore(policyStore, reliabilityStore)
+      : policyStore
+    : policyStore;
   const policyAdministration = policyStore ? new PolicyAdministration(policyStore) : undefined;
 
   let provider: InferenceProvider;
@@ -60,6 +84,7 @@ export function createRuntimeApp(env: NodeJS.ProcessEnv = process.env) {
   let inferenceExecution: InferenceExecutionService | undefined;
   let providerAdministration: ProviderAdministration | undefined;
   let providerConfigStore: ProviderConfigStore | undefined;
+
 
   if (tenantProviderRequested && databasePool && policyStore) {
     providerConfigStore = new ProviderConfigStore(
@@ -72,13 +97,14 @@ export function createRuntimeApp(env: NodeJS.ProcessEnv = process.env) {
       undefined,
       env["FUSE_PUBLIC_URL"] ?? "https://fuse-agent-control-plane.vercel.app",
     );
+
     provider = unavailableLegacyProvider;
     price = {
       inputUsdPerMillion: env["FUSE_INPUT_USD_PER_M"] ?? "3.00",
       outputUsdPerMillion: env["FUSE_OUTPUT_USD_PER_M"] ?? "15.00",
     };
     inferenceExecution = new InferenceExecutionService({
-      store: policyStore,
+      store: executionStore!,
       resolveProvider: (organizationId) => resolver.resolve(organizationId),
     });
   } else {
@@ -118,13 +144,14 @@ export function createRuntimeApp(env: NodeJS.ProcessEnv = process.env) {
     };
     inferenceExecution = policyStore ? new InferenceExecutionService({
       provider,
-      store: policyStore,
+      store: executionStore!,
       providerName,
       model: providerModel,
       price,
       requireProviderCost: providerName === "openrouter",
       requireProviderModelMatch: providerName === "openrouter",
     }) : undefined;
+
   }
 
   const payerWallet = env["FUSE_PAYER_ADDRESS"] ?? "0x68abdce904bd68c53b0daf43c9b83a5aa8c0b2f7";
@@ -145,6 +172,10 @@ export function createRuntimeApp(env: NodeJS.ProcessEnv = process.env) {
     policyAdministration,
     providerAdministration,
     inferenceExecution,
+    reliabilityContextIssuer: reliabilityStore ? (input) => reliabilityStore.authorizeHttpReliabilityContext(input) : undefined,
+    sealedReplayExecution: reliabilityStore
+      ? { execute: (input) => reliabilityStore.executeAuthenticatedSealedReplay(input) }
+      : undefined,
     workloadShadowEnabled,
     readiness: async () => {
       if (!databasePool || !policyStore) {

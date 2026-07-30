@@ -154,25 +154,36 @@ it.runIf(runNeon)("migrates workload shadow schema concurrently and persists cro
 
     const evaluatorInternals = first as unknown as {
       evaluateAndPersistShadow: (...args: unknown[]) => Promise<unknown>;
+      transaction: <T>(operation: (client: {
+        query: (...args: unknown[]) => Promise<unknown>;
+      }) => Promise<T>) => Promise<T>;
     };
     const originalEvaluator = evaluatorInternals.evaluateAndPersistShadow;
+    const originalTransaction = evaluatorInternals.transaction.bind(first);
     evaluatorInternals.evaluateAndPersistShadow = async () => {
       throw new Error("INJECTED_OVERLAPPING_WORKER_FAILURE");
     };
-    const originalPoolQuery = firstPool.query.bind(firstPool);
     let releaseFailure!: () => void;
     let failureUpdateReached!: () => void;
     const failureGate = new Promise<void>((resolve) => { releaseFailure = resolve; });
     const failureReached = new Promise<void>((resolve) => { failureUpdateReached = resolve; });
-    (firstPool as unknown as { query: (...args: unknown[]) => Promise<unknown> }).query =
-      async (...args: unknown[]) => {
-        const sql = String(args[0]);
-        if (sql.includes("SET state = 'failed'")) {
+    evaluatorInternals.transaction = async <T>(operation: (client: {
+      query: (...args: unknown[]) => Promise<unknown>;
+    }) => Promise<T>) => originalTransaction(async (client) => {
+      const originalQuery = client.query.bind(client);
+      client.query = async (...args: unknown[]) => {
+        if (String(args[0]).includes("SET state = 'failed'")) {
           failureUpdateReached();
           await failureGate;
         }
-        return originalPoolQuery(...args as Parameters<typeof firstPool.query>);
+        return originalQuery(...args);
       };
+      try {
+        return await operation(client);
+      } finally {
+        client.query = originalQuery;
+      }
+    });
     const overlappingFailure = run(first, "target", 100n);
     await failureReached;
     evaluatorInternals.evaluateAndPersistShadow = originalEvaluator;
@@ -186,7 +197,7 @@ it.runIf(runNeon)("migrates workload shadow schema concurrently and persists cro
     releaseFailure();
     const overlapped = await overlappingFailure;
     expect(overlapped.status).toBe("completed");
-    (firstPool as unknown as { query: typeof firstPool.query }).query = originalPoolQuery;
+    evaluatorInternals.transaction = originalTransaction;
     const overlappedRequestId = overlapped.status === "completed" ? overlapped.response.id : "";
     expect((await secondPool.query(
       `SELECT queue.state, EXISTS (

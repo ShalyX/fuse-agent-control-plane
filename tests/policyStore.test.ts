@@ -1,4 +1,4 @@
-import { newDb } from "pg-mem";
+import { DataType, newDb } from "pg-mem";
 import type { Pool } from "pg";
 import { describe, expect, it } from "vitest";
 import { IdentityStore } from "../src/persistence/identityStore.js";
@@ -31,8 +31,10 @@ const version = (overrides: Partial<PolicyVersion> = {}): PolicyVersion => ({
   ...overrides,
 });
 
+function policyMemoryDb(){const db=newDb({noAstCoverageCheck:true});db.public.registerFunction({name:"hashtextextended",args:[DataType.text,DataType.integer],returns:DataType.bigint,implementation:()=>1});db.public.registerFunction({name:"pg_advisory_xact_lock_shared",args:[DataType.bigint],returns:DataType.integer,implementation:()=>0});return db;}
+
 async function setup() {
-  const db = newDb({ noAstCoverageCheck: true });
+  const db = policyMemoryDb();
   const adapter = db.adapters.createPg();
   const pool = new adapter.Pool();
   const identity = new IdentityStore(pool);
@@ -46,7 +48,7 @@ async function setup() {
 
 describe("PolicyStore", () => {
   it("serializes concurrent policy schema initialization", async () => {
-    const db = newDb({ noAstCoverageCheck: true });
+    const db = policyMemoryDb();
     const adapter = db.adapters.createPg();
     const pool = new adapter.Pool();
     await new IdentityStore(pool).ensureSchema();
@@ -60,7 +62,7 @@ describe("PolicyStore", () => {
   });
 
   it("upgrades an empty workload-shadow v4 schema to branch-authority v5", async () => {
-    const db = newDb({ noAstCoverageCheck: true });
+    const db = policyMemoryDb();
     const adapter = db.adapters.createPg();
     const pool = new adapter.Pool();
     await new IdentityStore(pool).ensureSchema();
@@ -93,7 +95,7 @@ describe("PolicyStore", () => {
   });
 
   it("fails closed on an unversioned reconciliation table", async () => {
-    const db = newDb({ noAstCoverageCheck: true });
+    const db = policyMemoryDb();
     const adapter = db.adapters.createPg();
     const pool = new adapter.Pool();
     await new IdentityStore(pool).ensureSchema();
@@ -318,7 +320,7 @@ describe("PolicyStore", () => {
   });
 
   it("fails closed instead of silently adopting an unversioned policy schema", async () => {
-    const db = newDb({ noAstCoverageCheck: true });
+    const db = policyMemoryDb();
     const adapter = db.adapters.createPg();
     const pool = new adapter.Pool() as unknown as Pool;
     await pool.query("CREATE TABLE policy_versions (organization_id TEXT NOT NULL)");

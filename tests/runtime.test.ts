@@ -1,7 +1,15 @@
 import { expect, it } from "vitest";
-import { createRuntimeApp } from "../src/runtime.js";
+import { createRuntimeApp, reliabilityProtocolEnabledFromEnv } from "../src/runtime.js";
 
 const databaseUrl = "postgres://localhost:5432/fuse";
+
+it("keeps the optional held-out reliability protocol disabled unless explicitly enabled", () => {
+  expect(reliabilityProtocolEnabledFromEnv({})).toBe(false);
+  expect(reliabilityProtocolEnabledFromEnv({ FUSE_RELIABILITY_PROTOCOL_ENABLED: "false" })).toBe(false);
+  expect(reliabilityProtocolEnabledFromEnv({ FUSE_RELIABILITY_PROTOCOL_ENABLED: "true" })).toBe(true);
+  expect(() => reliabilityProtocolEnabledFromEnv({ FUSE_RELIABILITY_PROTOCOL_ENABLED: "yes" }))
+    .toThrow("FUSE_RELIABILITY_PROTOCOL_ENABLED_INVALID");
+});
 
 it("creates a tenant-provider runtime without a deployment-wide provider credential", () => {
   expect(() => createRuntimeApp({

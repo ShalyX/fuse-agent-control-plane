@@ -15,6 +15,9 @@ import type {
   AdmissionResult,
   ControlledInferenceInput,
 } from "../inference/inferenceExecution.js";
+import { issueReliabilityProtocolContext } from "../inference/inferenceExecution.js";
+import { withTrustedReplayOperation } from "../reliability/replayOperationContext.js";
+import type { StableSuccessfulResponseProjection } from "../reliability/commitments.js";
 
 const completionSchema = z.object({
   model: z.string().min(1),
@@ -160,6 +163,24 @@ type AppDependencies = {
   providerAdministration?: ProviderAdministrationPort;
   inferenceExecution?: {
     execute(input: ControlledInferenceInput): Promise<AdmissionResult>;
+  };
+  reliabilityContextIssuer?: (input: {
+    runId: string | null; laneId: string | null; block: number | null; requestId: string;
+    organizationId: string; agentId: string; credentialId: string; mandateId: string; branchId: string | null;
+    workloadClass: string | null; model: string; maxOutputTokens: number; body: unknown;
+  }) => Promise<{ kind: "ordinary" } | { kind?: "reliability"; callOrdinal: number } | null>;
+  replayOperationAuthorizer?: (input: {
+    operationId: string; organizationId: string; credentialId: string; agentId: string;
+    mandateId: string; branchId: string | null; workloadClass: string | null;
+    idempotencyKey: string; body: unknown;
+  }) => Promise<{ authorized: true } | null>;
+  sealedReplayExecution?: {
+    execute(input: {
+      operationId: string; organizationId: string; credentialId: string; agentId: string;
+      mandateId: string; branchId: string | null; workloadClass: string | null;
+      requestId: string; body: unknown; inputTokens: number; maxOutputTokens: number;
+      messages: Array<{ role: string; content: string }>;
+    }): Promise<StableSuccessfulResponseProjection>;
   };
   readiness?: () => Promise<Record<string, boolean>>;
   workloadShadowEnabled?: boolean;
@@ -1125,9 +1146,44 @@ export function createFuseApp(dependencies: AppDependencies) {
             response.status(409).json({ error: { code: "WORKLOAD_SHADOW_ROLLOUT_DISABLED" } });
             return;
           }
-          const execution = await dependencies.inferenceExecution!.execute({
+          const reliabilityRunId = request.header("X-Fuse-Reliability-Run")?.trim();
+          const reliabilityLaneId = request.header("X-Fuse-Reliability-Lane")?.trim();
+          const reliabilityBlockText = request.header("X-Fuse-Reliability-Block")?.trim();
+          const replayOperationId = request.header("X-Fuse-Replay-Operation")?.trim();
+          let reliabilityContext: ReturnType<typeof issueReliabilityProtocolContext> | undefined;
+          if (!replayOperationId && dependencies.reliabilityContextIssuer) {
+            const block = reliabilityBlockText === undefined ? null : Number(reliabilityBlockText);
+            const authorized = await dependencies.reliabilityContextIssuer({
+                runId: reliabilityRunId ?? null, laneId: reliabilityLaneId ?? null,
+                block: block !== null && Number.isInteger(block) ? block : null, requestId,
+                organizationId: principal.organizationId, agentId: principal.principalId, credentialId: principal.credentialId, mandateId,
+                branchId: branchId ?? null, workloadClass: workloadClass ?? null,
+                model: parsed.data.model, maxOutputTokens: parsed.data.max_tokens, body: parsed.data,
+              });
+            if (!authorized) {
+              const hasCoordinates = Boolean(reliabilityRunId || reliabilityLaneId || reliabilityBlockText);
+              response.status(403).json({ error: { code: hasCoordinates
+                ? "RELIABILITY_PROTOCOL_CONTEXT_INVALID" : "RELIABILITY_PROTOCOL_CONTEXT_REQUIRED" } });
+              return;
+            }
+            if (authorized.kind !== "ordinary") {
+              if (!reliabilityRunId || !reliabilityLaneId || block === null) {
+                response.status(403).json({ error: { code: "RELIABILITY_PROTOCOL_CONTEXT_REQUIRED" } });
+                return;
+              }
+              reliabilityContext = issueReliabilityProtocolContext({
+                runId: reliabilityRunId, laneId: reliabilityLaneId, block,
+                callOrdinal: authorized.callOrdinal,
+              });
+            }
+          } else if (!replayOperationId && (reliabilityRunId || reliabilityLaneId || reliabilityBlockText)) {
+            response.status(403).json({ error: { code: "RELIABILITY_PROTOCOL_CONTEXT_INVALID" } });
+            return;
+          }
+          const executionInput: ControlledInferenceInput = {
             requestId,
             organizationId: principal.organizationId,
+            credentialId: principal.credentialId,
             mandateId,
             agentId: principal.principalId,
             agentCapabilities: [...principal.capabilities],
@@ -1136,7 +1192,82 @@ export function createFuseApp(dependencies: AppDependencies) {
             inputTokens: dependencies.estimateInputTokens(parsed.data.messages),
             maxOutputTokens: parsed.data.max_tokens,
             messages: parsed.data.messages,
-          });
+            ...(reliabilityContext ? { reliabilityContext } : {}),
+          };
+          let execution: AdmissionResult;
+          if (replayOperationId) {
+            if (dependencies.sealedReplayExecution) {
+              try {
+                const replayResponse = await dependencies.sealedReplayExecution.execute({
+                  operationId: replayOperationId,
+                  organizationId: principal.organizationId,
+                  credentialId: principal.credentialId,
+                  agentId: principal.principalId,
+                  mandateId,
+                  branchId: branchId ?? null,
+                  workloadClass: workloadClass ?? null,
+                  requestId,
+                  body: parsed.data,
+                  inputTokens: executionInput.inputTokens,
+                  maxOutputTokens: parsed.data.max_tokens,
+                  messages: parsed.data.messages,
+                });
+                response.json(replayResponse);
+                return;
+              } catch (error) {
+                const code = error instanceof Error ? error.message : "";
+                if (code === "REPLAY_OPERATION_ID_INVALID") {
+                  response.status(403).json({ error: { code: "REPLAY_AUTHORIZATION_INVALID" } });
+                  return;
+                }
+                if (["REPLAY_TARGET_NOT_IMMUTABLE", "REPLAY_TARGET_INELIGIBLE", "REPLAY_TARGET_NOT_SEALED",
+                  "REPLAY_REQUEST_PROJECTION_CONFLICT"].includes(code)) {
+                  response.status(409).json({ error: { code: "REPLAY_TARGET_NOT_IMMUTABLE" } });
+                  return;
+                }
+                throw error;
+              }
+            }
+            if (!dependencies.replayOperationAuthorizer) {
+              response.status(403).json({ error: { code: "REPLAY_AUTHORIZATION_INVALID" } });
+              return;
+            }
+            let replayAuthorization: { authorized: true } | null;
+            try {
+              replayAuthorization = await dependencies.replayOperationAuthorizer({
+                operationId: replayOperationId,
+                organizationId: principal.organizationId,
+                credentialId: principal.credentialId,
+                agentId: principal.principalId,
+                mandateId,
+                branchId: branchId ?? null,
+                workloadClass: workloadClass ?? null,
+                idempotencyKey: requestId,
+                body: parsed.data,
+              });
+            } catch {
+              response.status(403).json({ error: { code: "REPLAY_AUTHORIZATION_INVALID" } });
+              return;
+            }
+            if (!replayAuthorization?.authorized) {
+              response.status(409).json({ error: { code: "REPLAY_TARGET_NOT_IMMUTABLE" } });
+              return;
+            }
+            try {
+              execution = await withTrustedReplayOperation(
+                replayOperationId,
+                () => dependencies.inferenceExecution!.execute(executionInput),
+              );
+            } catch (error) {
+              if (error instanceof Error && error.message === "REPLAY_OPERATION_ID_INVALID") {
+                response.status(403).json({ error: { code: "REPLAY_AUTHORIZATION_INVALID" } });
+                return;
+              }
+              throw error;
+            }
+          } else {
+            execution = await dependencies.inferenceExecution!.execute(executionInput);
+          }
           if (execution.status === "denied") {
             response.status(403).json({
               error: {

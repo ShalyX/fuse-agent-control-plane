@@ -19,6 +19,8 @@ import type {
 } from "../inference/inferenceExecution.js";
 import type { MandateState } from "../domain/lifecycles.js";
 import { withSchemaBootstrapLock } from "./schemaBootstrap.js";
+import { currentTrustedReplayOperation } from "../reliability/replayOperationContext.js";
+import { acquireOrdinaryMutationExclusion } from "../reliability/protocolMutationExclusion.js";
 import {
   evaluateSiblingDivergence,
   type SiblingDivergenceSignal,
@@ -187,7 +189,11 @@ export class PolicyStore implements InferenceExecutionStore {
 
   constructor(
     private readonly pool: Pool,
-    private readonly options: { supportsSavepoints?: boolean } = {},
+    private readonly options: {
+      supportsSavepoints?: boolean;
+      protocolMutationExclusionEnabled?: boolean;
+      protocolMutationLockTimeoutMs?: number;
+    } = {},
   ) {}
 
   ensureSchema(): Promise<void> {
@@ -727,7 +733,7 @@ export class PolicyStore implements InferenceExecutionStore {
     maxOutputTokens: number;
     requestFingerprint: string;
     decidedAt: string;
-  }): Promise<AdmissionResult> {
+  }, atomicHook?: (client: PoolClient, result: AdmissionResult) => Promise<void>): Promise<AdmissionResult> {
     input = { ...input, agentCapabilities: [...input.agentCapabilities] };
     if (!input.requestId.trim()) throw new Error("POLICY_DECISION_REQUEST_REQUIRED");
     if (!input.organizationId.trim()) throw new Error("POLICY_DECISION_ORGANIZATION_REQUIRED");
@@ -770,7 +776,9 @@ export class PolicyStore implements InferenceExecutionStore {
         if (existingRow.request_fingerprint !== input.requestFingerprint) {
           throw new Error("IDEMPOTENCY_CONFLICT");
         }
-        return this.admissionFromExecution(client, existingRow, input.decidedAt);
+        const replayed = await this.admissionFromExecution(client, existingRow, input.decidedAt);
+        if (atomicHook) await atomicHook(client, replayed);
+        return replayed;
       }
 
       const assignment = await client.query(
@@ -989,10 +997,19 @@ export class PolicyStore implements InferenceExecutionStore {
           input.maxOutputTokens, input.decidedAt,
         ],
       );
-      return evaluation.outcome === "ALLOW"
+      const result: AdmissionResult = evaluation.outcome === "ALLOW"
         ? { status: "execute", decision, reservedCostAtomic: reservation }
         : { status: "denied", decision };
+      if (atomicHook) await atomicHook(client, result);
+      return result;
     });
+  }
+
+  admitInferenceAtomically(
+    input: Parameters<InferenceExecutionStore["admitInference"]>[0],
+    hook: (client: PoolClient, result: AdmissionResult) => Promise<void>,
+  ): Promise<AdmissionResult> {
+    return this.admitInference(input, hook);
   }
 
   async completeInference(input: {
@@ -1001,7 +1018,7 @@ export class PolicyStore implements InferenceExecutionStore {
     actualCostAtomic: bigint;
     response: ProviderResult;
     completedAt: string;
-  }): Promise<CompletionPersistenceResult> {
+  }, atomicHook?: (client: PoolClient, result: CompletionPersistenceResult) => Promise<void>): Promise<CompletionPersistenceResult> {
     if (input.actualCostAtomic < 0n) throw new Error("ACTUAL_COST_INVALID");
     await this.ensureSchema();
     const completion = await this.transaction(async (client) => {
@@ -1024,7 +1041,7 @@ export class PolicyStore implements InferenceExecutionStore {
             JSON.stringify(input.response), input.completedAt],
         );
         await this.holdMandateForReconciliation(client, input.organizationId, row.mandate_id);
-        return {
+        const heldCompletion = {
           result: {
             status: "reconciliation_hold" as const,
             reservedCostAtomic,
@@ -1033,6 +1050,8 @@ export class PolicyStore implements InferenceExecutionStore {
           },
           shadowQueued: false,
         };
+        if (atomicHook) await atomicHook(client, heldCompletion.result);
+        return heldCompletion;
       }
       await client.query(
         `UPDATE inference_executions
@@ -1048,7 +1067,7 @@ export class PolicyStore implements InferenceExecutionStore {
           response_json: input.response, updated_at: new Date(input.completedAt) },
         input.completedAt,
       );
-      return {
+      const successfulCompletion = {
         result: {
           status: "completed" as const,
           reservedCostAtomic,
@@ -1057,6 +1076,8 @@ export class PolicyStore implements InferenceExecutionStore {
         },
         shadowQueued,
       };
+      if (atomicHook) await atomicHook(client, successfulCompletion.result);
+      return successfulCompletion;
     });
     if (!completion.shadowQueued || completion.result.status !== "completed") return completion.result;
     const shadowEvaluation = await this.processShadowEvaluationBestEffort(
@@ -1068,6 +1089,13 @@ export class PolicyStore implements InferenceExecutionStore {
       ...completion.result,
       ...(shadowEvaluation ? { shadowEvaluation } : {}),
     };
+  }
+
+  completeInferenceAtomically(
+    input: Parameters<InferenceExecutionStore["completeInference"]>[0],
+    hook: (client: PoolClient, result: CompletionPersistenceResult) => Promise<void>,
+  ): Promise<CompletionPersistenceResult> {
+    return this.completeInference(input, hook);
   }
 
   async holdInference(input: {
@@ -1106,13 +1134,25 @@ export class PolicyStore implements InferenceExecutionStore {
     failureCode: string;
     failedAt: string;
   }): Promise<void> {
+    await this.failInferenceAtomically(input);
+  }
+
+  async failInferenceAtomically(input: {
+    requestId: string;
+    organizationId: string;
+    failureCode: string;
+    failedAt: string;
+  }, atomicHook?: (client: PoolClient) => Promise<void>): Promise<void> {
     await this.ensureSchema();
-    await this.pool.query(
-      `UPDATE inference_executions
-       SET status = 'failed', failure_code = $3, updated_at = $4
-       WHERE organization_id = $1 AND request_id = $2 AND status = 'executing'`,
-      [input.organizationId, input.requestId, input.failureCode, input.failedAt],
-    );
+    await this.transaction(async (client) => {
+      await client.query(
+        `UPDATE inference_executions
+         SET status = 'failed', failure_code = $3, updated_at = $4
+         WHERE organization_id = $1 AND request_id = $2 AND status = 'executing'`,
+        [input.organizationId, input.requestId, input.failureCode, input.failedAt],
+      );
+      if (atomicHook) await atomicHook(client);
+    });
   }
 
   async listReconciliationCases(organizationId: string): Promise<ReconciliationCase[]> {
@@ -1520,20 +1560,22 @@ export class PolicyStore implements InferenceExecutionStore {
       });
     } catch {
       try {
-        await this.pool.query(
-          `UPDATE shadow_evaluation_queue
-           SET state = 'failed', claim_token = NULL, lease_expires_at = NULL,
-               last_error = 'SHADOW_EVALUATION_FAILED', updated_at = $3
-           WHERE organization_id = $1 AND request_id = $2
-             AND claim_token = $4
-             AND state IN ('pending', 'failed')
-             AND attempts <= 3
-             AND NOT EXISTS (
-               SELECT 1 FROM shadow_evaluations evidence
-               WHERE evidence.organization_id = $1 AND evidence.request_id = $2
-             )`,
-          [organizationId, requestId, evaluatedAt, claimToken],
-        );
+        await this.transaction(async (client) => {
+          await client.query(
+            `UPDATE shadow_evaluation_queue
+             SET state = 'failed', claim_token = NULL, lease_expires_at = NULL,
+                 last_error = 'SHADOW_EVALUATION_FAILED', updated_at = $3
+             WHERE organization_id = $1 AND request_id = $2
+               AND claim_token = $4
+               AND state IN ('pending', 'failed')
+               AND attempts <= 3
+               AND NOT EXISTS (
+                 SELECT 1 FROM shadow_evaluations evidence
+                 WHERE evidence.organization_id = $1 AND evidence.request_id = $2
+               )`,
+            [organizationId, requestId, evaluatedAt, claimToken],
+          );
+        });
       } catch {
         // Shadow telemetry must never alter the authoritative completion result.
       }
@@ -2364,6 +2406,16 @@ export class PolicyStore implements InferenceExecutionStore {
   ): Promise<T> {
     await client.query("BEGIN");
     try {
+      if (this.options.protocolMutationExclusionEnabled) {
+        const lockTimeoutMs = this.options.protocolMutationLockTimeoutMs ?? 5_000;
+        if (!Number.isInteger(lockTimeoutMs) || lockTimeoutMs < 1 || lockTimeoutMs > 30_000) {
+          throw new Error("PROTOCOL_MUTATION_LOCK_TIMEOUT_INVALID");
+        }
+        await client.query("SELECT set_config('lock_timeout',$1,true)", [`${lockTimeoutMs}ms`]);
+        await acquireOrdinaryMutationExclusion(client);
+      }
+      const replayOperation = currentTrustedReplayOperation();
+      if (replayOperation) await client.query("SELECT set_config('fuse.replay_operation_id',$1,true)", [replayOperation]);
       const result = await operation(client);
       await client.query("COMMIT");
       return result;
