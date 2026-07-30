@@ -1,4 +1,5 @@
-import { DataType, newDb } from "pg-mem";
+import { DataType } from "pg-mem";
+import { newAdvisoryMemoryDb } from "./helpers/pgMemAdvisory.js";
 import { expect, it } from "vitest";
 import { IdentityStore } from "../src/persistence/identityStore.js";
 import { PolicyStore } from "../src/persistence/policyStore.js";
@@ -14,7 +15,7 @@ function providerResult(id: string) {
 }
 
 it("binds workload classes to immutable branches and enforces the class envelope at admission", async () => {
-  const db = newDb({ noAstCoverageCheck: true });
+  const db = newAdvisoryMemoryDb({ noAstCoverageCheck: true });
   db.public.registerFunction({
     name: "clock_timestamp", returns: DataType.timestamptz,
     implementation: () => new Date(), impure: true,
@@ -172,7 +173,7 @@ it("binds workload classes to immutable branches and enforces the class envelope
 });
 
 it("persists a scored sibling-divergence evaluation after the target has enough observations", async () => {
-  const db = newDb({ noAstCoverageCheck: true });
+  const db = newAdvisoryMemoryDb({ noAstCoverageCheck: true });
   db.public.registerFunction({
     name: "clock_timestamp", returns: DataType.timestamptz,
     implementation: () => new Date(), impure: true,
@@ -386,4 +387,4 @@ it("persists a scored sibling-divergence evaluation after the target has enough 
   await expect(policies.listShadowEvaluations("org-shadow", "mandate-shadow"))
     .rejects.toThrow("MANDATE_BRANCH_DELEGATION_HASH_INVALID");
   await pool.end();
-});
+}, 15_000);

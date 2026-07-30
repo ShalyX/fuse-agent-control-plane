@@ -4,6 +4,14 @@
 
 Fuse is a financial control plane for metered AI inference: a parent agent delegates scoped allowances to logical child agents, Fuse reserves worst-case request cost, reconciles real provider token usage, and isolates a runaway branch without stopping the rest.
 
+## Release boundary
+
+Fuse product releases are gated by tests, production dependency checks, independent security review, database migration verification, and deployment smoke tests. They do not depend on a randomness beacon or a paid held-out experiment.
+
+The held-out reliability protocol is optional research evidence. It is disabled by default and can be exposed only by explicitly setting `FUSE_RELIABILITY_PROTOCOL_ENABLED=true` on a database-backed deployment. Expired protocol schedules never block ordinary product operation and cannot be reused for public evidence claims.
+
+Payment orchestration and signer activation remain separately gated. Shipping the control plane does not authorize provider spending, wallet signing, or a paid evidence run.
+
 ## Verified locally
 
 - Hierarchical root/child budget accounting in integer micro-USDC

@@ -1,4 +1,5 @@
-import { DataType, newDb } from "pg-mem";
+import { DataType } from "pg-mem";
+import { newAdvisoryMemoryDb } from "./helpers/pgMemAdvisory.js";
 import { expect, it } from "vitest";
 import type { Pool } from "pg";
 import type { InferenceProvider } from "../src/core/service.js";
@@ -34,7 +35,7 @@ async function setup(options: {
   maxInputTokens?: number;
   workloadClasses?: boolean;
 } = {}) {
-  const db = newDb({ noAstCoverageCheck: true });
+  const db = newAdvisoryMemoryDb({ noAstCoverageCheck: true });
   db.public.registerFunction({
     name: "clock_timestamp", returns: DataType.timestamptz,
     implementation: () => new Date(), impure: true,

@@ -1,4 +1,4 @@
-import { newDb } from "pg-mem";
+import { newAdvisoryMemoryDb } from "./helpers/pgMemAdvisory.js";
 import { describe, expect, it } from "vitest";
 import { IdentityStore } from "../src/persistence/identityStore.js";
 import { createApiCredential, createServiceAccountCredential } from "../src/identity/apiCredentials.js";
@@ -6,7 +6,7 @@ import { ProductionFoundationStore } from "../src/persistence/productionFoundati
 import { PolicyStore } from "../src/persistence/policyStore.js";
 
 async function createStores() {
-  const db = newDb();
+  const db = newAdvisoryMemoryDb();
   const adapter = db.adapters.createPg();
   const pool = new adapter.Pool();
   const audit = new ProductionFoundationStore(pool);
@@ -23,7 +23,7 @@ const context = {
 
 describe("IdentityStore", () => {
   it("initializes a clean identity and audit schema before mutations", async () => {
-    const db = newDb();
+    const db = newAdvisoryMemoryDb();
     const adapter = db.adapters.createPg();
     const pool = new adapter.Pool();
     const identity = new IdentityStore(pool);
@@ -38,7 +38,7 @@ describe("IdentityStore", () => {
   });
 
   it("serializes concurrent identity schema initialization", async () => {
-    const db = newDb({ noAstCoverageCheck: true });
+    const db = newAdvisoryMemoryDb({ noAstCoverageCheck: true });
     const adapter = db.adapters.createPg();
     const pool = new adapter.Pool();
     await Promise.all([
@@ -51,7 +51,7 @@ describe("IdentityStore", () => {
   });
 
   it("migrates legacy global identity keys before policy initialization", async () => {
-    const db = newDb({ noAstCoverageCheck: true });
+    const db = newAdvisoryMemoryDb({ noAstCoverageCheck: true });
     const adapter = db.adapters.createPg();
     const pool = new adapter.Pool();
     await pool.query(`
@@ -184,7 +184,7 @@ describe("IdentityStore", () => {
   });
 
   it("bootstraps an organization, admin service account, and credential atomically", async () => {
-    const db = newDb();
+    const db = newAdvisoryMemoryDb();
     const adapter = db.adapters.createPg();
     const pool = new adapter.Pool();
     const identity = new IdentityStore(pool);

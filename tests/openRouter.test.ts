@@ -62,6 +62,7 @@ it("calls OpenRouter chat completions and uses provider-reported usage", async (
           { role: "system", content: "Be concise" },
           { role: "user", content: "Hello" },
         ],
+        provider: { allow_fallbacks: false },
       }),
     }),
   );
