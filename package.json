@@ -38,6 +38,18 @@
     "evidence:held-out:v2:replay": "tsx scripts/held-out-reliability-v2.ts replay",
     "evidence:held-out:v2:evidence": "tsx scripts/held-out-reliability-v2.ts evidence",
     "evidence:held-out:v2:report": "tsx scripts/held-out-reliability-v2.ts report",
+    "evidence:held-out:v3:doctor": "tsx scripts/held-out-reliability-v3.ts doctor",
+    "evidence:held-out:v3:dry": "tsx scripts/held-out-reliability-v3.ts dry",
+    "evidence:held-out:v3:seal": "tsx scripts/held-out-reliability-v3.ts seal",
+    "evidence:held-out:v3:setup": "tsx scripts/held-out-reliability-v3.ts setup",
+    "evidence:held-out:v3:worker": "tsx scripts/held-out-reliability-v3.ts worker",
+    "evidence:held-out:v3:authorize": "tsx scripts/held-out-reliability-v3.ts authorize",
+    "evidence:held-out:v3:run": "tsx scripts/held-out-reliability-v3.ts run",
+    "evidence:held-out:v3:reconcile": "tsx scripts/held-out-reliability-v3.ts reconcile",
+    "evidence:held-out:v3:settle": "tsx scripts/held-out-reliability-v3.ts settle",
+    "evidence:held-out:v3:replay": "tsx scripts/held-out-reliability-v3.ts replay",
+    "evidence:held-out:v3:evidence": "tsx scripts/held-out-reliability-v3.ts evidence",
+    "evidence:held-out:v3:report": "tsx scripts/held-out-reliability-v3.ts report",
     "check": "npm test && npm run build"
   },
   "dependencies": {

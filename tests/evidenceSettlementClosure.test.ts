@@ -97,6 +97,7 @@ function passingSnapshot() {
     shadowEvidence: requestIds.map((requestId) => ({ requestId })),
     replayAudits: replayIds.map((requestId, index) => ({ requestId, replayNo: index + 1, originalResponseCommitment: `sha256:${"b".repeat(64)}`, replayResponseCommitment: `sha256:${"b".repeat(64)}`, writeSet: [] as string[] })),
     lifecycleEvents: events,
+    laneBacklog: [] as Array<{requestId:string;lane:typeof lanes[number];block:number;callOrdinal:number;state:string;actualScheduledAtMs:number|null}>,
   };
   return { runId, requestIds, replayIds, rows };
 }
@@ -129,6 +130,18 @@ describe("accepted-snapshot closure", () => {
       if (event.priorTerminalAtMs !== null && event.priorTerminalAtMs !== undefined) event.priorTerminalAtMs += 10 * 60_000;
     }
     expect(closure.evaluateSettlementSnapshotCompleteness({ rows: fixture.rows, replayTargetRequestIds: fixture.replayIds }).reasons).toContain("SCHEDULE_LIFECYCLE_INVALID");
+  });
+
+  it("uses the accepted resumed backlog timestamp as schedule authority", () => {
+    const fixture=passingSnapshot();
+    const call=fixture.rows.sealedCalls[0]!;
+    const admission=fixture.rows.lifecycleEvents.find(event=>event.requestId===call.requestId&&event.eventType==="admission_started")!;
+    admission.databaseTimeMs+=10_000;
+    fixture.rows.laneBacklog.push({requestId:call.requestId,lane:call.lane,block:call.block,callOrdinal:call.callOrdinal,
+      state:"terminal",actualScheduledAtMs:admission.databaseTimeMs});
+    expect(closure.evaluateSettlementSnapshotCompleteness({rows:fixture.rows,replayTargetRequestIds:fixture.replayIds}).complete).toBe(true);
+    fixture.rows.laneBacklog[0]!.actualScheduledAtMs=admission.databaseTimeMs-2_000;
+    expect(closure.evaluateSettlementSnapshotCompleteness({rows:fixture.rows,replayTargetRequestIds:fixture.replayIds}).reasons).toContain("SCHEDULE_LIFECYCLE_INVALID");
   });
 
   it("binds the authoritative report to accepted as-of bytes and emits Clopper-Pearson only without early stop", () => {

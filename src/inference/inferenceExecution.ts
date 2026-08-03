@@ -10,13 +10,14 @@ import {
 import type { ShadowEvaluationRecord, StoredPolicyDecision } from "../persistence/policyStore.js";
 import type { StableSuccessfulResponseProjection } from "../reliability/commitments.js";
 
-export type ReliabilityProtocolCoordinates = { runId: string; laneId: string; block: number; callOrdinal: number };
+export type ReliabilityProtocolCoordinates = { runId: string; laneId: string; block: number; callOrdinal: number; requestCommitment?: string };
 const issuedReliabilityContexts = new WeakSet<object>();
 export type ReliabilityProtocolContext = Readonly<ReliabilityProtocolCoordinates> & { readonly __serverReliabilityContext: true };
 /** Server/orchestrator capability. HTTP JSON cannot manufacture an accepted context. */
 export function issueReliabilityProtocolContext(input: ReliabilityProtocolCoordinates): ReliabilityProtocolContext {
   if (!input.runId || !input.laneId || !Number.isInteger(input.block) || input.block < 1 || input.block > 5
-    || !Number.isInteger(input.callOrdinal) || input.callOrdinal < 1 || input.callOrdinal > 5) {
+    || !Number.isInteger(input.callOrdinal) || input.callOrdinal < 1 || input.callOrdinal > 5
+    || (input.requestCommitment!==undefined&&!/^sha256:[a-f0-9]{64}$/.test(input.requestCommitment))) {
     throw new Error("RELIABILITY_PROTOCOL_CONTEXT_INVALID");
   }
   const context = Object.freeze({ ...input, __serverReliabilityContext: true as const });
@@ -64,7 +65,7 @@ export type CompletionPersistenceResult = {
 
 export interface InferenceExecutionStore {
   recordReliabilityAttempt?(input: {
-    runId: string; laneId: string; block: number; requestId: string;
+    runId: string; laneId: string; block: number; requestId: string; requestCommitment?:string;
     reservedCostMicros: bigint; request: {
       method: "POST"; route: "/v1/chat/completions"; organizationId: string;
       credentialId: string; mandateId: string; branchId: string | null;
@@ -115,7 +116,7 @@ export interface InferenceExecutionStore {
     requestFingerprint: string;
     decidedAt: string;
     reliabilityAdmission?: {
-      runId: string; laneId: string; block: number; requestId: string;
+      runId: string; laneId: string; block: number; requestId: string; requestCommitment?:string;
       request: {
         method: "POST"; route: "/v1/chat/completions"; organizationId: string;
         credentialId: string; mandateId: string; branchId: string | null;
@@ -251,6 +252,7 @@ export class InferenceExecutionService {
         inputTokens: input.inputTokens,
         maxOutputTokens: input.maxOutputTokens,
         messages: input.messages,
+        ...(input.reliabilityContext ? { suppressAttributionHeaders: true } : {}),
         ...(input.reliabilityContext && reliabilityToken ? {
           onDispatchPrimitiveEntered: () => this.config.store.markReliabilityDispatchPrimitiveEntered!({
             runId: input.reliabilityContext!.runId, requestId: input.requestId, tokenId: reliabilityToken!.tokenId,

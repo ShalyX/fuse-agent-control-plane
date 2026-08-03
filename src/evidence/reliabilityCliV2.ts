@@ -14,6 +14,7 @@ export interface ReliabilityCliDependencies {
   now?: () => string;
   network?: (...args: unknown[]) => Promise<unknown>;
   readLocal?: (path: string) => Promise<Buffer>;
+  durableRunPredecision?: boolean;
   operations?: Partial<Record<ReliabilityCliCommand, (input: { args: readonly string[]; files: Readonly<Record<string, Buffer>> }) => Promise<Record<string, unknown>>>>;
 }
 
@@ -67,16 +68,40 @@ export async function executeReliabilityCli(args: readonly string[], deps: Relia
     catch { return { ...base, ok: false, errorCode: "PLAN_REQUIRED", providerCalls: 0 }; }
     const authorizationFlag = command === "reconcile" ? "--reconciliation-authorization" : "--operator-authorization";
     const authorization = flag(args, authorizationFlag);
-    if (!authorization) return { ...base, ok: false, errorCode: command === "reconcile" ? "SIGNED_RECONCILIATION_AUTHORIZATION_REQUIRED" : "SIGNED_AUTHORIZATION_REQUIRED", providerCalls: 0 };
+    if (!authorization) {
+      if(command==="run"&&deps.durableRunPredecision&&deps.operations?.run){
+        try{return {...base,ok:true,...await deps.operations.run({args,files:{plan:planBytes}})};}
+        catch(error){return {...base,ok:false,errorCode:error instanceof Error?error.message:"RELIABILITY_OPERATION_FAILED",providerCalls:0};}
+      }
+      return { ...base, ok: false, errorCode: command === "reconcile" ? "SIGNED_RECONCILIATION_AUTHORIZATION_REQUIRED" : "SIGNED_AUTHORIZATION_REQUIRED", providerCalls: 0 };
+    }
     let authorizationBytes: Buffer;
     try { authorizationBytes = await read(authorization); }
-    catch { return { ...base, ok: false, errorCode: "SIGNED_AUTHORIZATION_REQUIRED", providerCalls: 0 }; }
+    catch {
+      if(command==="run"&&deps.durableRunPredecision&&deps.operations?.run){
+        try{return {...base,ok:true,...await deps.operations.run({args,files:{plan:planBytes}})};}
+        catch(error){return {...base,ok:false,errorCode:error instanceof Error?error.message:"RELIABILITY_OPERATION_FAILED",providerCalls:0};}
+      }
+      return { ...base, ok: false, errorCode: "SIGNED_AUTHORIZATION_REQUIRED", providerCalls: 0 };
+    }
     const files: Record<string, Buffer> = { plan: planBytes, authorization: authorizationBytes };
     if (command === "run") {
       const reconciliation = flag(args, "--reconciliation-authorization");
-      if (!reconciliation) return { ...base, ok: false, errorCode: "SIGNED_RECONCILIATION_AUTHORIZATION_REQUIRED", providerCalls: 0 };
+      if (!reconciliation) {
+        if(deps.durableRunPredecision&&deps.operations?.run){
+          try{return {...base,ok:true,...await deps.operations.run({args,files})};}
+          catch(error){return {...base,ok:false,errorCode:error instanceof Error?error.message:"RELIABILITY_OPERATION_FAILED",providerCalls:0};}
+        }
+        return { ...base, ok: false, errorCode: "SIGNED_RECONCILIATION_AUTHORIZATION_REQUIRED", providerCalls: 0 };
+      }
       try { files.reconciliationAuthorization = await read(reconciliation); }
-      catch { return { ...base, ok: false, errorCode: "SIGNED_RECONCILIATION_AUTHORIZATION_REQUIRED", providerCalls: 0 }; }
+      catch {
+        if(deps.durableRunPredecision&&deps.operations?.run){
+          try{return {...base,ok:true,...await deps.operations.run({args,files})};}
+          catch(error){return {...base,ok:false,errorCode:error instanceof Error?error.message:"RELIABILITY_OPERATION_FAILED",providerCalls:0};}
+        }
+        return { ...base, ok: false, errorCode: "SIGNED_RECONCILIATION_AUTHORIZATION_REQUIRED", providerCalls: 0 };
+      }
     }
     const operation = deps.operations?.[command];
     if (!operation) return { ...base, ok: false, errorCode: "RELIABILITY_SERVICE_REQUIRED", providerCalls: 0 };

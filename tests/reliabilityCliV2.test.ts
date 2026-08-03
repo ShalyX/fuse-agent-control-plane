@@ -60,6 +60,17 @@ describe("held-out reliability v2 noninteractive CLI and mandatory no-spend boun
       .toMatchObject({ ok: false, errorCode: "SIGNED_AUTHORIZATION_REQUIRED", providerCalls: 0 });
   });
 
+  it("routes missing run authorizations into the durable predecision handler when explicitly enabled", async()=>{
+    const root=await mkdtemp(join(tmpdir(),"hov3-predecision-cli-"));
+    await writeFile(join(root,"plan.json"),"{}\n");
+    let receivedFiles:Readonly<Record<string,Buffer>>={};
+    const result=await executeReliabilityCli(["run","--allow-provider-network","--plan","plan.json"],{
+      cwd:root,durableRunPredecision:true,operations:{run:async({files})=>{receivedFiles=files;throw new Error("READINESS_PREDECISION_FAILED");}},
+    });
+    expect(result).toMatchObject({ok:false,errorCode:"READINESS_PREDECISION_FAILED"});
+    expect(Object.keys(receivedFiles)).toEqual(["plan"]);
+  });
+
   it("never exposes a payment execution flag or treats HTTP 402 as payable", async () => {
     expect(await executeReliabilityCli(["run", "--allow-payment", "--json"], { cwd: "/nonexistent" }))
       .toMatchObject({ ok: false, errorCode: "PAYMENT_PATH_PROHIBITED", paymentCalls: 0 });

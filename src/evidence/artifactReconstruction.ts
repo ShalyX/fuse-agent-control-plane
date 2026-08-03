@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { readFile, readdir } from "node:fs/promises";
 import { join, relative, sep } from "node:path";
+import { reliabilityArtifactNamespace, schedulerManifestArtifactPath } from "./reliabilityArtifactNamespace.js";
 
 export const RELIABILITY_LANES = ["normal-paced", "high-envelope", "bounded-burst", "restart-resume"] as const;
 export type ReliabilityLane = typeof RELIABILITY_LANES[number];
@@ -21,11 +22,43 @@ export interface ReconstructedReliabilityArtifacts {
   artifactPaths: string[];
   artifactDigests: Record<string, string>;
   claimInventoryAuthority: {
-    source: "docs/held-out-reliability-protocol-v2.md:420,426";
+    source: string;
     claims: "four_lane_claims";
     contradictionDetected: true;
     contradictedLegacyShape: "five_block_claims";
   };
+}
+
+export interface SchedulerManifestBindingRow {
+  requestId: string;
+  lane: string;
+  block: number;
+  state: string;
+  generation: number;
+  manifestPath: string;
+  manifestDigest: string | null;
+  manifestFsynced: boolean;
+}
+
+export async function reconstructSchedulerManifestArtifacts(input: {
+  root: string;
+  runId: string;
+  planFingerprint: string;
+  claims: readonly SchedulerManifestBindingRow[];
+}): Promise<ReconstructedArtifact[]> {
+  return Promise.all(input.claims.map(async claim=>{
+    const path=schedulerManifestArtifactPath(input.runId,claim.requestId);
+    if(claim.manifestPath!==path||!claim.manifestFsynced||!SHA256.test(String(claim.manifestDigest)))
+      throw new Error(`SCHEDULER_MANIFEST_BINDING_INVALID:${claim.requestId}`);
+    const artifact=await readArtifact(input.root,path,input.runId,input.planFingerprint);
+    const sequence=Number(artifact.parsed.sequence);
+    if(artifact.digest!==claim.manifestDigest||artifact.parsed.artifactKind!=="scheduler_manifest"
+      || artifact.parsed.requestId!==claim.requestId||artifact.parsed.laneId!==claim.lane
+      || artifact.parsed.block!==claim.block||artifact.parsed.generation!==claim.generation
+      || sequence!==4||artifact.parsed.state!=="terminal"||claim.state!=="terminal")
+      throw new Error(`SCHEDULER_MANIFEST_AUTHORITY_CONFLICT:${claim.requestId}`);
+    return artifact;
+  }));
 }
 
 function digest(bytes: Buffer): string {
@@ -41,7 +74,8 @@ function asObject(bytes: Buffer, path: string): Record<string, unknown> {
   }
 }
 function validateCommon(parsed: Record<string, unknown>, path: string, runId: string, planFingerprint: string): void {
-  if (parsed.evidenceType !== "held-out-reliability" || parsed.protocolVersion !== 2 || parsed.runId !== runId
+  const namespace = reliabilityArtifactNamespace(runId);
+  if (parsed.evidenceType !== namespace.evidenceType || parsed.protocolVersion !== namespace.protocolVersion || parsed.runId !== runId
     || parsed.planFingerprint !== planFingerprint) throw new Error(`ARTIFACT_IDENTITY_MISMATCH:${path}`);
 }
 async function readArtifact(root: string, path: string, runId: string, planFingerprint: string): Promise<ReconstructedArtifact> {
@@ -80,22 +114,25 @@ export async function reconstructReliabilityArtifacts(input: {
   verifyAuthorization(args: { kind: "operator" | "reconciliation"; bytes: Buffer; parsed: Record<string, unknown>; digest: string }): boolean | Promise<boolean>;
 }): Promise<ReconstructedReliabilityArtifacts> {
   if (!input.runId || !SHA256.test(input.planFingerprint)) throw new Error("ARTIFACT_IDENTITY_INVALID");
+  const namespace = reliabilityArtifactNamespace(input.runId);
+  const artifactRoot = namespace.root;
+  const claimRoot = `evidence/.run-claims/${namespace.evidenceType}`;
   const fixed = [
-    "evidence/held-out-reliability/protocols/held-out-reliability-v2.json",
-    "evidence/held-out-reliability/beacons/drand-6315000.json",
-    `evidence/held-out-reliability/plans/${input.planFingerprint}.json`,
-    `evidence/held-out-reliability/replay-preliminary/${input.runId}.json`,
+    `${artifactRoot}/protocols/${namespace.protocolArtifact}`,
+    `${artifactRoot}/beacons/drand-${namespace.beaconRound}.json`,
+    `${artifactRoot}/plans/${input.planFingerprint}.json`,
+    `${artifactRoot}/replay-preliminary/${input.runId}.json`,
   ];
-  const claimPaths = RELIABILITY_LANES.map((lane) => `evidence/.run-claims/held-out-reliability/${input.runId}/${lane}.claim`);
+  const claimPaths = RELIABILITY_LANES.map((lane) => `${claimRoot}/${input.runId}/${lane}.claim`);
   const manifestPaths = RELIABILITY_LANES.flatMap((lane) => Array.from({ length: 5 }, (_, index) =>
-    `evidence/held-out-reliability/manifests/${input.runId}/${lane}-${index + 1}.json`));
+    `${artifactRoot}/manifests/${input.runId}/${lane}-${index + 1}.json`));
   const authorizationPaths = (["operator", "reconciliation"] as const).flatMap((kind) => [
-    `evidence/held-out-reliability/authorizations/${kind}/${input.runId}.json`,
-    `evidence/held-out-reliability/authorization-receipts/${kind}/${input.runId}.json`,
+    `${artifactRoot}/authorizations/${kind}/${input.runId}.json`,
+    `${artifactRoot}/authorization-receipts/${kind}/${input.runId}.json`,
   ]);
   const incidentPaths = input.incidents.map(({ sequence, eventType }) => {
     if (!Number.isSafeInteger(sequence) || sequence < 1 || !/^[a-z0-9_]+$/.test(eventType)) throw new Error("ARTIFACT_INCIDENT_COORDINATE_INVALID");
-    return `evidence/held-out-reliability/incidents/${input.runId}/${sequence}-${eventType}.json`;
+    return `${artifactRoot}/incidents/${input.runId}/${sequence}-${eventType}.json`;
   });
   if (new Set(incidentPaths).size !== incidentPaths.length
     || [...input.incidents].sort((a, b) => a.sequence - b.sequence).some((row, index) => row.sequence !== index + 1)) {
@@ -104,12 +141,12 @@ export async function reconstructReliabilityArtifacts(input: {
   const expectedPaths = [...fixed, ...claimPaths, ...manifestPaths, ...authorizationPaths, ...incidentPaths].sort();
   const artifacts = await Promise.all(expectedPaths.map((path) => readArtifact(input.root, path, input.runId, input.planFingerprint)));
   const byPath = new Map(artifacts.map((artifact) => [artifact.path, artifact]));
-  const preliminary = byPath.get(`evidence/held-out-reliability/replay-preliminary/${input.runId}.json`)!;
+  const preliminary = byPath.get(`${artifactRoot}/replay-preliminary/${input.runId}.json`)!;
   if (preliminary.parsed.artifactKind !== "replay_report" || preliminary.parsed.passed !== true
     || preliminary.parsed.replayAudits !== 20) throw new Error("ARTIFACT_PRELIMINARY_REPLAY_INVALID");
 
   const claims = RELIABILITY_LANES.map((lane) => {
-    const path = `evidence/.run-claims/held-out-reliability/${input.runId}/${lane}.claim`;
+    const path = `${claimRoot}/${input.runId}/${lane}.claim`;
     const artifact = byPath.get(path)!;
     if (artifact.parsed.artifactKind !== "lane_claim" || artifact.parsed.lane !== lane || artifact.parsed.state !== "terminal")
       throw new Error(`ARTIFACT_CLAIM_INVALID:${path}`);
@@ -117,7 +154,7 @@ export async function reconstructReliabilityArtifacts(input: {
   });
   const manifests = RELIABILITY_LANES.flatMap((lane) => Array.from({ length: 5 }, (_, index) => {
     const block = index + 1;
-    const path = `evidence/held-out-reliability/manifests/${input.runId}/${lane}-${block}.json`;
+    const path = `${artifactRoot}/manifests/${input.runId}/${lane}-${block}.json`;
     const artifact = byPath.get(path)!;
     if (artifact.parsed.artifactKind !== "manifest" || artifact.parsed.lane !== lane || artifact.parsed.block !== block || artifact.parsed.state !== "terminal")
       throw new Error(`ARTIFACT_MANIFEST_INVALID:${path}`);
@@ -127,14 +164,14 @@ export async function reconstructReliabilityArtifacts(input: {
   const signedAuthorizations: ReconstructedReliabilityArtifacts["signedAuthorizations"] = [];
   const authorizationReceipts: ReconstructedReliabilityArtifacts["authorizationReceipts"] = [];
   for (const kind of ["operator", "reconciliation"] as const) {
-    const signedPath = `evidence/held-out-reliability/authorizations/${kind}/${input.runId}.json`;
+    const signedPath = `${artifactRoot}/authorizations/${kind}/${input.runId}.json`;
     const signed = byPath.get(signedPath)!;
     if (signed.parsed.artifactKind !== "authorization" || signed.parsed.kind !== kind || typeof signed.parsed.signature !== "string"
       || !await input.verifyAuthorization({ kind, bytes: signed.bytes, parsed: signed.parsed, digest: signed.digest })) {
       throw new Error(`ARTIFACT_AUTHORIZATION_SIGNATURE_INVALID:${kind}`);
     }
     signedAuthorizations.push({ kind, path: signedPath, digest: signed.digest, signatureVerified: true });
-    const receiptPath = `evidence/held-out-reliability/authorization-receipts/${kind}/${input.runId}.json`;
+    const receiptPath = `${artifactRoot}/authorization-receipts/${kind}/${input.runId}.json`;
     const receipt = byPath.get(receiptPath)!;
     if (receipt.parsed.artifactKind !== "authorization_receipt" || receipt.parsed.kind !== kind || typeof receipt.parsed.status !== "string"
       || !SHA256.test(String(receipt.parsed.presentedArtifactSha256))) throw new Error(`ARTIFACT_RECEIPT_INVALID:${kind}`);
@@ -143,9 +180,9 @@ export async function reconstructReliabilityArtifacts(input: {
   }
 
   const runScoped = [
-    ...await listFiles(input.root, `evidence/.run-claims/held-out-reliability/${input.runId}`),
-    ...await listFiles(input.root, `evidence/held-out-reliability/manifests/${input.runId}`),
-    ...await listFiles(input.root, `evidence/held-out-reliability/incidents/${input.runId}`),
+    ...await listFiles(input.root, `${claimRoot}/${input.runId}`),
+    ...await listFiles(input.root, `${artifactRoot}/manifests/${input.runId}`),
+    ...await listFiles(input.root, `${artifactRoot}/incidents/${input.runId}`),
   ].sort();
   const expectedRunScoped = [...claimPaths, ...manifestPaths, ...incidentPaths].sort();
   if (runScoped.length !== expectedRunScoped.length || runScoped.some((path, index) => path !== expectedRunScoped[index]))
@@ -156,7 +193,9 @@ export async function reconstructReliabilityArtifacts(input: {
     artifactPaths: expectedPaths,
     artifactDigests: Object.fromEntries(artifacts.map((artifact) => [artifact.path, artifact.digest])),
     claimInventoryAuthority: {
-      source: "docs/held-out-reliability-protocol-v2.md:420,426",
+      source: namespace.protocolVersion === 3
+        ? "docs/held-out-reliability-protocol-v3.md:inherited-v2-four-lane-claims"
+        : "docs/held-out-reliability-protocol-v2.md:420,426",
       claims: "four_lane_claims",
       contradictionDetected: true,
       contradictedLegacyShape: "five_block_claims",

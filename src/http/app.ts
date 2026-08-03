@@ -168,7 +168,7 @@ type AppDependencies = {
     runId: string | null; laneId: string | null; block: number | null; requestId: string;
     organizationId: string; agentId: string; credentialId: string; mandateId: string; branchId: string | null;
     workloadClass: string | null; model: string; maxOutputTokens: number; body: unknown;
-  }) => Promise<{ kind: "ordinary" } | { kind?: "reliability"; callOrdinal: number } | null>;
+  }) => Promise<{ kind: "ordinary" } | { kind?: "reliability"; callOrdinal: number; requestCommitment?:string } | null>;
   replayOperationAuthorizer?: (input: {
     operationId: string; organizationId: string; credentialId: string; agentId: string;
     mandateId: string; branchId: string | null; workloadClass: string | null;
@@ -1173,7 +1173,7 @@ export function createFuseApp(dependencies: AppDependencies) {
               }
               reliabilityContext = issueReliabilityProtocolContext({
                 runId: reliabilityRunId, laneId: reliabilityLaneId, block,
-                callOrdinal: authorized.callOrdinal,
+                callOrdinal: authorized.callOrdinal,...(authorized.requestCommitment?{requestCommitment:authorized.requestCommitment}:{}),
               });
             }
           } else if (!replayOperationId && (reliabilityRunId || reliabilityLaneId || reliabilityBlockText)) {

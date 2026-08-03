@@ -1,5 +1,8 @@
+import { createHash } from "node:crypto";
 import { buildAuthoritativeClosureReport, type AuthoritativeClosureReport, type EvidenceClosureRows } from "./evidenceSettlementClosure.js";
 import { reduceAuthoritativeReliabilityEvidence, type AuthoritativeEvidenceInventory, type AuthoritativeEvidenceReport } from "./authoritativeEvidence.js";
+import { canonicalJson } from "./heldOutReliabilityV2.js";
+import { reliabilityArtifactNamespace, reliabilityArtifactPath } from "./reliabilityArtifactNamespace.js";
 
 const SHA256 = /^sha256:[a-f0-9]{64}$/;
 const NONNEGATIVE = /^(0|[1-9][0-9]*)$/;
@@ -7,7 +10,7 @@ const NONNEGATIVE = /^(0|[1-9][0-9]*)$/;
 export const AUTHORITATIVE_SNAPSHOT_INVENTORIES = [
   "sealedCalls", "attempts", "executions", "decisions", "shadowQueue", "shadowEvidence",
   "dispatchTokens", "lifecycleEvents", "replayAudits", "replayCancellations",
-  "protocolControls", "protocolLanes", "blockClaims", "authorizationDecisions", "authorizationOutbox",
+  "protocolControls", "protocolLanes", "blockClaims", "laneBacklog", "authorizationDecisions", "authorizationOutbox",
   "reconciliationAttempts", "reconciliationEvidence", "holds", "incidents", "schedulerClaims", "costRows",
   "artifactBindings",
 ] as const;
@@ -27,6 +30,28 @@ function exactArtifactBindings(bindings: Array<Record<string, unknown>>, expecte
     && new Set(actual.map(([path]) => path)).size === actual.length
     && actual.every(([path, digest], index) => typeof path === "string" && SHA256.test(String(digest))
       && path === expectedEntries[index]?.[0] && digest === expectedEntries[index]?.[1]);
+}
+
+function authorizationOutboxBoundToArtifacts(
+  outbox: Array<Record<string, unknown>>,
+  expected: Readonly<Record<string, string>>,
+): boolean {
+  return (["operator", "reconciliation"] as const).every((kind) => {
+    const row = outbox.find((candidate) => candidate["kind"] === kind);
+    const receipt = row?.["receipt"];
+    if (row?.["published"] !== true || receipt === null || typeof receipt !== "object" || Array.isArray(receipt)) return false;
+    const parsed = receipt as Record<string, unknown>;
+    const runId = parsed["runId"];
+    const presented = parsed["presentedArtifactSha256"];
+    if (typeof runId !== "string" || !runId || !SHA256.test(String(presented))
+      || parsed["artifactKind"] !== "authorization_receipt" || parsed["kind"] !== kind
+      || parsed["status"] !== (kind === "operator" ? "consumed" : "validated")) return false;
+    const receiptEntries = Object.entries(expected).filter(([path]) => path.endsWith(`/authorization-receipts/${kind}/${runId}.json`));
+    const signedEntries = Object.entries(expected).filter(([path]) => path.endsWith(`/authorizations/${kind}/${runId}.json`));
+    const receiptDigest = `sha256:${createHash("sha256").update(`${canonicalJson(receipt)}\n`).digest("hex")}`;
+    return receiptEntries.length === 1 && signedEntries.length === 1
+      && receiptEntries[0]![1] === receiptDigest && signedEntries[0]![1] === presented;
+  });
 }
 
 /**
@@ -52,10 +77,10 @@ export function assertAcceptedSnapshotAuthority(
   }
   const decisions = inventories.get("authorizationDecisions") ?? [];
   if (decisions.length !== 1 || decisions[0]?.["active"] !== true || decisions[0]?.["operatorValid"] !== true
-    || decisions[0]?.["reconciliationValid"] !== true) reasons.push("SNAPSHOT_AUTHORIZATION_INVALID");
+    || decisions[0]?.["reconciliationValid"] !== true || decisions[0]?.["decisionIdValid"] !== true) reasons.push("SNAPSHOT_AUTHORIZATION_INVALID");
   const outbox = inventories.get("authorizationOutbox") ?? [];
-  if (outbox.length !== 2 || !["operator", "reconciliation"].every((kind) =>
-    outbox.some((row) => row["kind"] === kind && row["published"] === true))) reasons.push("SNAPSHOT_AUTHORIZATION_OUTBOX_INVALID");
+  if (outbox.length !== 2 || !authorizationOutboxBoundToArtifacts(outbox, expectedArtifactDigests))
+    reasons.push("SNAPSHOT_AUTHORIZATION_OUTBOX_INVALID");
   const holds = inventories.get("holds") ?? [];
   if (holds.some((row) => row["resolved"] !== true || !Array.isArray(row["heldUnresolved"]) || row["heldUnresolved"].length !== 0))
     reasons.push("SNAPSHOT_HOLD_UNRESOLVED");
@@ -64,14 +89,17 @@ export function assertAcceptedSnapshotAuthority(
   const reconciliationAttempts = inventories.get("reconciliationAttempts") ?? [];
   if (reconciliationAttempts.some((row) => !["terminal", "committed", "canceled_terminal"].includes(String(row["phase"]))))
     reasons.push("SNAPSHOT_RECONCILIATION_NONTERMINAL");
+  const bindings = inventories.get("artifactBindings") ?? [];
+  const bindingByPath=new Map(bindings.map(row=>[String(row["path"]),String(row["digest"])]));
   const claims = inventories.get("schedulerClaims") ?? [];
-  if (claims.some((row) => row["state"] !== "terminal" || !SHA256.test(String(row["manifestDigest"]))))
+  if (claims.some((row) => row["state"] !== "terminal" || row["manifestFsynced"]!==true
+    || !SHA256.test(String(row["manifestDigest"]))
+    || bindingByPath.get(String(row["manifestPath"]))!==String(row["manifestDigest"])))
     reasons.push("SNAPSHOT_CLAIM_INVALID");
   const costs = inventories.get("costRows") ?? [];
   if (costs.length !== 1 || !NONNEGATIVE.test(String(costs[0]?.["knownCostMicros"]))
     || BigInt(String(costs[0]?.["knownCostMicros"] ?? "-1")) > 3_000_000n
     || costs[0]?.["unresolvedExposureMicros"] !== "0") reasons.push("SNAPSHOT_COST_INVALID");
-  const bindings = inventories.get("artifactBindings") ?? [];
   if (!exactArtifactBindings(bindings, expectedArtifactDigests)) reasons.push("SNAPSHOT_ARTIFACT_BINDING_INVALID");
   return { complete: reasons.length === 0, reasons };
 }
@@ -95,14 +123,12 @@ export function planDurableStageTransition(input: {
 }
 
 export function canonicalFinalCommitPath(runId: string): string {
-  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(runId)) throw new Error("RUN_ID_INVALID");
-  return `evidence/held-out-reliability/replay/${runId}.json`;
+  return reliabilityArtifactPath(runId, "replay", `${runId}.json`);
 }
 
 /** Replay is diagnostic until settlement. It must never occupy the canonical commit path. */
 export function preliminaryReplayArtifactPath(runId: string): string {
-  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(runId)) throw new Error("RUN_ID_INVALID");
-  return `evidence/held-out-reliability/replay-preliminary/${runId}.json`;
+  return reliabilityArtifactPath(runId, "replay-preliminary", `${runId}.json`);
 }
 
 export interface UnifiedFinalEvidenceReport extends AuthoritativeClosureReport {
@@ -133,8 +159,8 @@ export function finalEvidenceClosure(input: {
 }
 
 export interface CanonicalFinalCommitMarker {
-  evidenceType: "held-out-reliability";
-  protocolVersion: 2;
+  evidenceType: "held-out-reliability" | "held-out-reliability-v3";
+  protocolVersion: 2 | 3;
   artifactKind: "final_commit";
   state: "committed";
   runId: string;
@@ -161,8 +187,9 @@ export function buildCanonicalFinalCommitMarker(input: {
     || input.settlementJournalCardinality < 1 || Object.values(input.artifactDigests).some((value) => !SHA256.test(value))) {
     throw new Error("FINAL_COMMIT_INPUT_INVALID");
   }
+  const namespace=reliabilityArtifactNamespace(input.runId);
   return {
-    evidenceType: "held-out-reliability", protocolVersion: 2, artifactKind: "final_commit", state: "committed",
+    evidenceType: namespace.evidenceType, protocolVersion: namespace.protocolVersion, artifactKind: "final_commit", state: "committed",
     runId: input.runId, planFingerprint: input.planFingerprint, passed: input.reportPassed,
     settlement: { acceptedSnapshotDigest: input.settlementDigest, journalCardinality: input.settlementJournalCardinality },
     authoritativeInventoryDigest: input.authoritativeInventoryDigest,

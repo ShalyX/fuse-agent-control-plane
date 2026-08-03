@@ -58,7 +58,7 @@ describe("production evidence closure integration", () => {
       sealedCalls: requestIds.map((requestId, index) => ({ requestId, lane: lanes[index % 4], block: Math.floor(index / 20) + 1, callOrdinal: Math.floor((index % 20) / 4) + 1 })),
       attempts: attempts.map((row) => ({ ...row, canceledAfterGateFailure: false })),
       executions: [], decisions: [], dispatchTokens: [], shadowQueue: [], shadowEvidence: [], replayAudits: [], lifecycleEvents: [],
-      replayCancellations: [], protocolControls: [], protocolLanes: [], blockClaims: [], authorizationDecisions: [],
+      replayCancellations: [], protocolControls: [], protocolLanes: [], blockClaims: [], laneBacklog: [], authorizationDecisions: [],
       authorizationOutbox: [], reconciliationAttempts: [], reconciliationEvidence: [], holds: [], incidents: [],
       schedulerClaims: [], costRows: [], artifactBindings: [],
     };

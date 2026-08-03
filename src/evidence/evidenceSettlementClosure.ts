@@ -11,6 +11,9 @@ import type {
 } from "./authoritativeEvidence.js";
 import { RELIABILITY_LANES, type ReliabilityLane } from "./artifactReconstruction.js";
 import { V2_SCHEDULE } from "./heldOutReliabilityV2.js";
+import { V3_SCHEDULE } from "./heldOutReliabilityV3.js";
+
+type ReliabilitySchedule = ReadonlyArray<{ block: number; opensAt: string; launchDeadline: string }>;
 
 const SHA256 = /^sha256:[a-f0-9]{64}$/;
 const USABLE = new Set<AuthoritativeOutcomeState>(["completed_verified", "reconciled_billed_with_response"]);
@@ -34,6 +37,14 @@ export interface LifecycleEventRow {
   blockClaimedAtMs?: number;
   priorTerminalAtMs?: number | null;
 }
+export interface LaneBacklogRow {
+  requestId: string;
+  lane: ReliabilityLane;
+  block: number;
+  callOrdinal: number;
+  state: string;
+  actualScheduledAtMs: number | null;
+}
 export interface EvidenceClosureRows {
   sealedCalls: SealedCallRow[];
   attempts: ClosureAttemptRow[];
@@ -48,6 +59,7 @@ export interface EvidenceClosureRows {
   protocolControls: Array<Record<string, unknown>>;
   protocolLanes: Array<Record<string, unknown>>;
   blockClaims: Array<Record<string, unknown>>;
+  laneBacklog: LaneBacklogRow[];
   authorizationDecisions: Array<Record<string, unknown>>;
   authorizationOutbox: Array<Record<string, unknown>>;
   reconciliationAttempts: Array<Record<string, unknown>>;
@@ -87,12 +99,12 @@ function sealedRegistryValid(rows: EvidenceClosureRows): boolean {
   }
   const sealed = rows.sealedCalls.map((row) => row.requestId);
   const inventories: ReadonlyArray<readonly { requestId: string }[]> = [rows.attempts, rows.executions, rows.decisions,
-    rows.dispatchTokens, rows.shadowQueue, rows.shadowEvidence, rows.replayAudits, rows.lifecycleEvents];
+    rows.dispatchTokens, rows.shadowQueue, rows.shadowEvidence, rows.replayAudits, rows.lifecycleEvents, rows.laneBacklog];
   return inventories.every((inventory) => inventory.every((row) => sealed.includes(row.requestId)))
     && exactIds(rows.attempts.map((row) => row.requestId), sealed);
 }
 
-function lifecycleAndScheduleValid(rows: EvidenceClosureRows): boolean {
+function lifecycleAndScheduleValid(rows: EvidenceClosureRows, schedule: ReliabilitySchedule): boolean {
   const blockClaims = new Map<number, number>();
   for (const call of rows.sealedCalls) {
     const events = rows.lifecycleEvents.filter((row) => row.requestId === call.requestId);
@@ -108,15 +120,19 @@ function lifecycleAndScheduleValid(rows: EvidenceClosureRows): boolean {
     if (admission.length !== 1) return false;
     const event = admission[0]!;
     if (!Number.isFinite(event.blockClaimedAtMs)) return false;
-    const sealedWindow = V2_SCHEDULE[call.block - 1];
+    const sealedWindow = schedule[call.block - 1];
     const opensAtMs = Date.parse(sealedWindow!.opensAt);
     const launchDeadlineMs = Date.parse(sealedWindow!.launchDeadline);
     if (event.blockClaimedAtMs! < opensAtMs || event.blockClaimedAtMs! >= launchDeadlineMs) return false;
     const priorClaim = blockClaims.get(call.block);
     if (priorClaim !== undefined && priorClaim !== event.blockClaimedAtMs) return false;
     blockClaims.set(call.block, event.blockClaimedAtMs!);
+    const resumed=rows.laneBacklog.filter(item=>item.requestId===call.requestId&&item.lane===call.lane
+      &&item.block===call.block&&item.callOrdinal===call.callOrdinal);
+    if(resumed.length>1||resumed.some(item=>item.state!=="terminal"||!Number.isFinite(item.actualScheduledAtMs)))return false;
     const isFirstWindow = call.callOrdinal === 1 || call.lane === "bounded-burst";
-    const scheduled = isFirstWindow ? event.blockClaimedAtMs! + 1_000 : (event.priorTerminalAtMs ?? Number.NaN) + 5_000;
+    const scheduled = resumed.length===1 ? resumed[0]!.actualScheduledAtMs!
+      : isFirstWindow ? event.blockClaimedAtMs! + 1_000 : (event.priorTerminalAtMs ?? Number.NaN) + 5_000;
     if (!Number.isFinite(scheduled) || event.databaseTimeMs < scheduled || event.databaseTimeMs >= scheduled + 1_000) return false;
     const token = one(rows.dispatchTokens, call.requestId);
     const authorized = events.filter((item) => item.eventType === "dispatch_authorized");
@@ -175,12 +191,13 @@ function replayMatrixValid(rows: EvidenceClosureRows, targets: readonly string[]
 export function evaluateSettlementSnapshotCompleteness(input: {
   rows: EvidenceClosureRows;
   replayTargetRequestIds: readonly string[];
+  schedule?: ReliabilitySchedule;
 }): { complete: boolean; reasons: string[] } {
   const reasons: string[] = [];
   if (!sealedRegistryValid(input.rows)) reasons.push("SEALED_REGISTRY_INVALID");
   if (!outcomeMatrixValid(input.rows)) reasons.push("SNAPSHOT_OUTCOME_MATRIX_INVALID");
   if (!replayMatrixValid(input.rows, input.replayTargetRequestIds)) reasons.push("SNAPSHOT_REPLAY_MATRIX_INVALID");
-  if (!lifecycleAndScheduleValid(input.rows)) reasons.push("SCHEDULE_LIFECYCLE_INVALID");
+  if (!lifecycleAndScheduleValid(input.rows, input.schedule ?? V2_SCHEDULE)) reasons.push("SCHEDULE_LIFECYCLE_INVALID");
   return { complete: reasons.length === 0, reasons };
 }
 
@@ -205,7 +222,8 @@ export function buildAuthoritativeClosureReport(input: {
   acceptedSnapshot: { digest: string; databaseStartedAtMs: number };
   settlement: { passed: boolean; acceptedSnapshotDigest: string };
 }): AuthoritativeClosureReport {
-  const completeness = evaluateSettlementSnapshotCompleteness({ rows: input.rows, replayTargetRequestIds: input.replayTargetRequestIds });
+  const schedule = input.runId.startsWith("hov3-") ? V3_SCHEDULE : V2_SCHEDULE;
+  const completeness = evaluateSettlementSnapshotCompleteness({ rows: input.rows, replayTargetRequestIds: input.replayTargetRequestIds, schedule });
   const reasons = [...completeness.reasons];
   const currentDigest = authoritativeSnapshotDigest(input.rows as unknown as Readonly<Record<string, readonly unknown[]>>);
   if (!input.settlement.passed || input.acceptedSnapshot.digest !== input.settlement.acceptedSnapshotDigest
