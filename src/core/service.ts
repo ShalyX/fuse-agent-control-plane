@@ -11,6 +11,8 @@ export type CompletionRequest = {
   messages: Array<{ role: string; content: string }>;
   /** Reliability-v2 transport boundary hook. Implementations must await it immediately before entering the HTTP primitive. */
   onDispatchPrimitiveEntered?: () => Promise<void>;
+  /** Protocol-bound requests omit mutable OpenRouter attribution headers. */
+  suppressAttributionHeaders?: boolean;
 };
 
 export interface ProviderResult {

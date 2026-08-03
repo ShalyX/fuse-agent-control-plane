@@ -8,7 +8,7 @@ import {
   buildResponseCommitment,
   type StableSuccessfulResponseProjection,
 } from "../src/reliability/commitments.js";
-import { currentTrustedReplayOperation } from "../src/reliability/replayOperationContext.js";
+import { currentTrustedReplayOperation, withTrustedReplayOperation } from "../src/reliability/replayOperationContext.js";
 import {
   installReplayAuditTriggers,
   verifyReplayAuditTriggerCatalog,
@@ -19,6 +19,7 @@ import {
   acquireReplayExclusion,
 } from "../src/reliability/protocolMutationExclusion.js";
 import { ReliabilityProtocolStore } from "../src/reliability/protocolStore.js";
+import { RELIABILITY_V2_PROFILE } from "../src/reliability/protocolProfile.js";
 import * as protocolStoreModule from "../src/reliability/protocolStore.js";
 import { PolicyStore } from "../src/persistence/policyStore.js";
 import { OpenRouterTransportError } from "../src/providers/openRouter.js";
@@ -37,6 +38,8 @@ const body = {
   messages: [{ role: "user" as const, content: "hello" }],
 };
 
+const canonicalReplayOperationId = `replay-${"a".repeat(64)}`;
+
 function completed(input: ControlledInferenceInput) {
   return {
     status: "completed" as const,
@@ -51,7 +54,7 @@ function completed(input: ControlledInferenceInput) {
   };
 }
 
-function replayRequest(app: ReturnType<typeof createFuseApp>, operationId = "replay-1234567890abcdef") {
+function replayRequest(app: ReturnType<typeof createFuseApp>, operationId = canonicalReplayOperationId) {
   return request(app).post("/v1/chat/completions")
     .set("Authorization", "Bearer authenticated-agent")
     .set("Idempotency-Key", "request-1")
@@ -62,6 +65,16 @@ function replayRequest(app: ReturnType<typeof createFuseApp>, operationId = "rep
 }
 
 describe("durable replay authorization inventory", () => {
+  it("rejects every noncanonical replay operation identifier", () => {
+    for (const operationId of [
+      `replay-${"A".repeat(64)}`,
+      `replay-${"a".repeat(63)}`,
+      `replay-${"a".repeat(65)}`,
+      `replay-${"a".repeat(32)}-${"b".repeat(31)}`,
+    ]) expect(() => withTrustedReplayOperation(operationId, () => undefined)).toThrow("REPLAY_OPERATION_ID_INVALID");
+    expect(withTrustedReplayOperation(canonicalReplayOperationId, () => currentTrustedReplayOperation())).toBe(canonicalReplayOperationId);
+  });
+
   it("persists authorization-bound ordinals with one-shot state and run-wide cap", () => {
     expect(RELIABILITY_SCHEMA_SQL).toContain("CREATE TABLE IF NOT EXISTS reliability_replay_authorizations");
     expect(RELIABILITY_SCHEMA_SQL).toContain("CHECK(replay_ordinal BETWEEN 1 AND 20)");
@@ -77,6 +90,13 @@ describe("durable replay authorization inventory", () => {
     const expectedInventory = protocolStoreModule.buildReplayAuthorizationInventory({ runId: "run-1", authorizationSha256, requestIds });
     const database = { query: vi.fn(async (sql: string, values?: unknown[]) => {
       statements.push({ sql, values });
+      if (sql.includes("FROM reliability_protocol_controls") && sql.includes("FOR UPDATE")) {
+        return { rows: [{ state: "active", durable_stage: "fresh_terminal", plan_fingerprint: "sha256:test", failure_sequence: "0",
+          reconciliation_credential_id: null, nonusable_allowance_owner: null,
+          protocol_version: RELIABILITY_V2_PROFILE.protocolVersion, evidence_type: RELIABILITY_V2_PROFILE.evidenceType,
+          plan_schema_version: RELIABILITY_V2_PROFILE.planSchemaVersion, mapping_version: RELIABILITY_V2_PROFILE.mappingVersion,
+          profile_fingerprint: RELIABILITY_V2_PROFILE.profileFingerprint }] };
+      }
       if (sql.includes("FROM reliability_authorization_decisions") && sql.includes("FOR UPDATE")) {
         return { rows: [{ decision_id: "11111111-1111-5111-a111-111111111111", operator_published: true, reconciliation_published: true, durable_stage: "fresh_terminal" }] };
       }
@@ -120,6 +140,13 @@ describe("durable replay authorization inventory", () => {
 
   it("refuses replay registration before the durable fresh-terminal stage", async () => {
     const database = { query: vi.fn(async (sql: string) => {
+      if (sql.includes("FROM reliability_protocol_controls") && sql.includes("FOR UPDATE")) {
+        return { rows: [{ state: "active", durable_stage: "fresh_terminal", plan_fingerprint: "sha256:test", failure_sequence: "0",
+          reconciliation_credential_id: null, nonusable_allowance_owner: null,
+          protocol_version: RELIABILITY_V2_PROFILE.protocolVersion, evidence_type: RELIABILITY_V2_PROFILE.evidenceType,
+          plan_schema_version: RELIABILITY_V2_PROFILE.planSchemaVersion, mapping_version: RELIABILITY_V2_PROFILE.mappingVersion,
+          profile_fingerprint: RELIABILITY_V2_PROFILE.profileFingerprint }] };
+      }
       if (sql.includes("FROM reliability_authorization_decisions") && sql.includes("FOR UPDATE")) {
         return { rows: [{ decision_id: "11111111-1111-5111-a111-111111111111", operator_published: true, reconciliation_published: true, durable_stage: "running" }] };
       }
@@ -193,7 +220,7 @@ describe("authenticated replay operation trust boundary", () => {
     expect(response.body).toEqual(stable);
     expect(ordinaryExecute).not.toHaveBeenCalled();
     expect(replayExecute).toHaveBeenCalledWith(expect.objectContaining({
-      operationId: "replay-1234567890abcdef", organizationId: "org-1",
+      operationId: canonicalReplayOperationId, organizationId: "org-1",
       credentialId: "credential-1", agentId: "agent-1", requestId: "request-1",
       mandateId: "mandate-1", branchId: "branch-1", workloadClass: "reliability.normal", body,
     }));
@@ -219,11 +246,11 @@ describe("authenticated replay operation trust boundary", () => {
 
     expect(response.status).toBe(200);
     expect(authorize).toHaveBeenCalledWith(expect.objectContaining({
-      operationId: "replay-1234567890abcdef", organizationId: "org-1",
+      operationId: canonicalReplayOperationId, organizationId: "org-1",
       credentialId: "credential-1", agentId: "agent-1", idempotencyKey: "request-1",
       mandateId: "mandate-1", branchId: "branch-1", workloadClass: "reliability.normal", body,
     }));
-    expect(observed).toEqual(["replay-1234567890abcdef"]);
+    expect(observed).toEqual([canonicalReplayOperationId]);
     expect(currentTrustedReplayOperation()).toBeUndefined();
   });
 
@@ -314,6 +341,13 @@ describe("protocol-wide mutation exclusion", () => {
     const protocolSql: string[] = [];
     const protocolClient = { query: vi.fn(async (sql: string) => {
       protocolSql.push(sql);
+      if (sql.includes("FROM reliability_protocol_controls") && sql.includes("FOR UPDATE")) {
+        return { rows: [{ state: "active", durable_stage: "running", plan_fingerprint: "sha256:test", failure_sequence: "0",
+          reconciliation_credential_id: null, nonusable_allowance_owner: null,
+          protocol_version: RELIABILITY_V2_PROFILE.protocolVersion, evidence_type: RELIABILITY_V2_PROFILE.evidenceType,
+          plan_schema_version: RELIABILITY_V2_PROFILE.planSchemaVersion, mapping_version: RELIABILITY_V2_PROFILE.mappingVersion,
+          profile_fingerprint: RELIABILITY_V2_PROFILE.profileFingerprint }] };
+      }
       if (sql.includes("SELECT receipt_kind,receipt")) return { rows: [{ receipt_kind: "operator", receipt: {} }] };
       return { rows: [] };
     }), release: vi.fn() };

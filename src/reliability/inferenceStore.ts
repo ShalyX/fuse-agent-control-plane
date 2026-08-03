@@ -21,7 +21,7 @@ export class ReliabilityInferenceExecutionStore implements InferenceExecutionSto
     const result=await atomic.call(this.policy,{...input,estimatedCostAtomic:reservedCostMicros},async(client,admission)=>{
       if(admission.status!=="execute")return;
       if(admission.reservedCostAtomic!==reservedCostMicros)throw new Error("SEALED_RESERVATION_CONFLICT");
-      await this.protocol.recordAttemptOnClient(client as never,{runId:reliability.runId,requestId:reliability.requestId,laneId:reliability.laneId,block:reliability.block,reservedCostMicros,requestCommitment:buildRequestCommitment(reliability.request)});
+      await this.protocol.recordAttemptOnClient(client as never,{runId:reliability.runId,requestId:reliability.requestId,laneId:reliability.laneId,block:reliability.block,reservedCostMicros,requestCommitment:reliability.requestCommitment??buildRequestCommitment(reliability.request)});
     });
     return result.status==="execute"?{...result,protocolAdmissionCommitted:true}:result;
   };
@@ -40,7 +40,7 @@ export class ReliabilityInferenceExecutionStore implements InferenceExecutionSto
     await this.protocol.recordAttempt({
       runId: input.runId, requestId: input.requestId, laneId: input.laneId, block: input.block,
       reservedCostMicros: input.reservedCostMicros,
-      requestCommitment: buildRequestCommitment(input.request),
+      requestCommitment: input.requestCommitment??buildRequestCommitment(input.request),
     });
   }
   authorizeReliabilityDispatch: NonNullable<InferenceExecutionStore["authorizeReliabilityDispatch"]> = (input) =>

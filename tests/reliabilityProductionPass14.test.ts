@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import * as operational from "../src/reliability/operationalV2.js";
 import * as protocol from "../src/reliability/protocolStore.js";
 import { RELIABILITY_SCHEMA_SQL } from "../src/reliability/reliabilitySchema.js";
+import { RELIABILITY_V2_PROFILE } from "../src/reliability/protocolProfile.js";
 import * as runner from "../scripts/held-out-reliability-v2.js";
 
 const sha = `sha256:${"a".repeat(64)}`;
@@ -79,7 +80,14 @@ describe("reliability v2 operational blockers", () => {
     const client = {
       query: async (statement: string) => {
         queried.push(statement);
-        if (statement.includes("FROM reliability_protocol_controls")) return { rows: [{ state: "active", plan_fingerprint: sha }] };
+        if (statement.includes("FROM reliability_protocol_controls")) return { rows: [{
+          state: "active", plan_fingerprint: sha, failure_sequence: "0",
+          protocol_version: RELIABILITY_V2_PROFILE.protocolVersion,
+          evidence_type: RELIABILITY_V2_PROFILE.evidenceType,
+          plan_schema_version: RELIABILITY_V2_PROFILE.planSchemaVersion,
+          mapping_version: RELIABILITY_V2_PROFILE.mappingVersion,
+          profile_fingerprint: RELIABILITY_V2_PROFILE.profileFingerprint,
+        }] };
         if (statement.includes("FROM reliability_authorization_decisions")) return { rows: [{ ok: 1 }] };
         if (statement.includes("FROM reliability_sealed_calls")) return { rows: [{ count: "100" }] };
         if (statement.includes("FROM reliability_block_claims") && statement.includes("FOR UPDATE")) {
@@ -100,7 +108,14 @@ describe("reliability v2 operational blockers", () => {
     const holdMemberValues: unknown[][] = [];
     const client = {
       query: async (statement: string, values?: unknown[]) => {
-        if (statement.includes("FROM reliability_protocol_controls")) return { rows: [{ state: "active" }] };
+        if (statement.includes("FROM reliability_protocol_controls")) return { rows: [{
+          state: "active", plan_fingerprint: sha,
+          protocol_version: RELIABILITY_V2_PROFILE.protocolVersion,
+          evidence_type: RELIABILITY_V2_PROFILE.evidenceType,
+          plan_schema_version: RELIABILITY_V2_PROFILE.planSchemaVersion,
+          mapping_version: RELIABILITY_V2_PROFILE.mappingVersion,
+          profile_fingerprint: RELIABILITY_V2_PROFILE.profileFingerprint,
+        }] };
         if (statement.includes("FROM reliability_protocol_lanes")) return { rows: [{ state: "ready" }] };
         if (statement.startsWith("SELECT 1 FROM reliability_protocol_attempts")) return { rows: [{ ok: 1 }] };
         if (statement.includes("FROM reliability_protocol_holds") && statement.includes("resolved_at IS NULL")) return { rows: [] };

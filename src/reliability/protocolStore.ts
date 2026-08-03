@@ -4,7 +4,7 @@ import { buildHttpBodyCommitment, buildResponseCommitment, buildSealedRequestCom
 import type { ProviderResult } from "../core/service.js";
 import { OpenRouterTransportError } from "../providers/openRouter.js";
 import { RELIABILITY_SCHEMA_SQL } from "./reliabilitySchema.js";
-import { RECONCILIATION_OFFSETS_SECONDS, heldLaneFifoResolution, reconciliationWindow, setupSnapshotDifferences } from "./operationalV2.js";
+import { RECONCILIATION_OFFSETS_SECONDS, reconciliationWindow, setupSnapshotDifferences } from "./operationalV2.js";
 import { currentTrustedReplayOperation } from "./replayOperationContext.js";
 import { planReconciliationMutation, type ReconciliationEvidence, type ReconciliationMutationPlan } from "./reconciliationStateMachine.js";
 import { authoritativeSnapshotDigest, runAuthoritativeSettlement, type AuthoritativeSettlementResult } from "../evidence/authoritativeSettlement.js";
@@ -19,10 +19,27 @@ import {
 } from "./ordinaryReconciliationSettlement.js";
 import { evaluateSettlementSnapshotCompleteness, planHardFinalization, type EvidenceClosureRows, type HardFinalizationPlan } from "../evidence/evidenceSettlementClosure.js";
 import { canonicalJson } from "../evidence/heldOutReliabilityV2.js";
+import { reliabilityArtifactNamespace, schedulerManifestArtifactPath } from "../evidence/reliabilityArtifactNamespace.js";
+import type { SchedulerManifestBindingRow } from "../evidence/artifactReconstruction.js";
+import {
+  RELIABILITY_V2_PROFILE,
+  reliabilityProtocolProfileForRunId,
+  type ReliabilityProtocolProfile,
+} from "./protocolProfile.js";
 
 
 type Queryable = { query<R extends QueryResultRow = any>(text: string, values?: any[]): Promise<QueryResult<R>> };
 type Connectable = Queryable & { connect?: () => Promise<PoolClient> };
+
+export type ReportPublicationDeadlineDisposition="on_time"|"supersede_pass"|"late_failure";
+export interface SettlementReportAuthority {
+  marker: CanonicalFinalCommitMarker;
+  reasons: readonly string[];
+}
+export function reportPublicationDeadlineDisposition(input:{reportKind:"pass"|"failure";databaseNowMs:number;deadlineMs:number}):ReportPublicationDeadlineDisposition{
+  if(input.databaseNowMs<input.deadlineMs)return "on_time";
+  return input.reportKind==="pass"?"supersede_pass":"late_failure";
+}
 
 export type ReplayTransportFailureDisposition = "retryable" | "ambiguous_consumed";
 export function classifyReplayTransportFailure(error:unknown):ReplayTransportFailureDisposition{
@@ -62,24 +79,81 @@ export function preserveAuthorizedOwnerOnGlobalFailure(input: {
   return input.tokenCommitted && (input.laneId !== "bounded-burst" || input.burstBarrierState === "released");
 }
 
-export function deterministicAuthorizationDecisionId(runId: string): string {
-  const hex = createHash("sha256").update(`fuse-reliability-v2-authorization:${runId}`).digest("hex").slice(0,32);
-  return `${hex.slice(0,8)}-${hex.slice(8,12)}-5${hex.slice(13,16)}-a${hex.slice(17,20)}-${hex.slice(20)}`;
+export interface V3AuthorizationDecisionPreimage {
+  runId: string;
+  planFingerprint: string;
+  profileFingerprint: string;
+  decisionKind: "active" | "readiness_failed" | "readiness_predecision_failed";
+  reasonCode: string;
+  operatorArtifactSha256: `sha256:${string}` | "absent";
+  reconciliationArtifactSha256: `sha256:${string}` | "absent";
 }
 
+export function deterministicAuthorizationDecisionId(input: string | V3AuthorizationDecisionPreimage): string {
+  if (typeof input === "string") {
+    const domain = reliabilityProtocolProfileForRunId(input).authorizationDecisionDomain;
+    const hex = createHash("sha256").update(`${domain}:${input}`).digest("hex").slice(0,32);
+    return `${hex.slice(0,8)}-${hex.slice(8,12)}-5${hex.slice(13,16)}-a${hex.slice(17,20)}-${hex.slice(20)}`;
+  }
+  const profile = reliabilityProtocolProfileForRunId(input.runId);
+  const sha = /^sha256:[a-f0-9]{64}$/;
+  const artifactDigestValid = (value: string) => value === "absent" || sha.test(value);
+  const fixtureProfile = input.runId === "hov3-golden" && input.profileFingerprint === `sha256:${"0".repeat(64)}`;
+  if (profile.protocolVersion !== 3 || !sha.test(input.planFingerprint)
+    || (input.profileFingerprint !== profile.profileFingerprint && !fixtureProfile)
+    || !["active", "readiness_failed", "readiness_predecision_failed"].includes(input.decisionKind)
+    || !input.reasonCode || !artifactDigestValid(input.operatorArtifactSha256)
+    || !artifactDigestValid(input.reconciliationArtifactSha256)) {
+    throw new Error("AUTHORIZATION_DECISION_PREIMAGE_INVALID");
+  }
+  const hex = createHash("sha256").update(canonicalJson({
+    domain: profile.authorizationDecisionDomain,
+    protocolVersion: profile.protocolVersion,
+    runId: input.runId,
+    planFingerprint: input.planFingerprint,
+    profileFingerprint: input.profileFingerprint,
+    decisionKind: input.decisionKind,
+    reasonCode: input.reasonCode,
+    operatorArtifactSha256: input.operatorArtifactSha256,
+    reconciliationArtifactSha256: input.reconciliationArtifactSha256,
+  })).digest("hex");
+  return `${hex.slice(0,8)}-${hex.slice(8,12)}-5${hex.slice(13,16)}-a${hex.slice(17,20)}-${hex.slice(20,32)}`;
+}
+
+const AUTHORIZATION_PREDECISION_REASONS=new Set(["validation_phase_deadline","decision_phase_deadline"]);
+export function authorizationPredecisionReasonValid(reasonCode:string):boolean{return AUTHORIZATION_PREDECISION_REASONS.has(reasonCode);}
+
 export function buildReplayAuthorizationInventory(input: {
-  runId: string; authorizationSha256: string; requestIds: readonly string[];
+  runId: string; planFingerprint?: string; profileFingerprint?: string; authorizationDecisionId?: string;
+  authorizationSha256?: string; requestIds: readonly string[];
 }): Array<{ ordinal: number; requestId: string; operationId: string }> {
-  if (!input.runId.trim() || !/^sha256:[a-f0-9]{64}$/.test(input.authorizationSha256)
-    || input.requestIds.length !== 20 || new Set(input.requestIds).size !== 20
+  if (!input.runId.trim() || input.requestIds.length !== 20 || new Set(input.requestIds).size !== 20
     || input.requestIds.some((requestId) => !requestId.trim())) {
+    throw new Error("REPLAY_AUTHORIZATION_INVENTORY_INVALID");
+  }
+  const profile = reliabilityProtocolProfileForRunId(input.runId);
+  if (profile.protocolVersion === 3) {
+    if (!/^sha256:[a-f0-9]{64}$/.test(input.planFingerprint ?? "")
+      || !/^sha256:[a-f0-9]{64}$/.test(input.profileFingerprint ?? "")
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-a[0-9a-f]{3}-[0-9a-f]{12}$/.test(input.authorizationDecisionId ?? "")) {
+      throw new Error("REPLAY_AUTHORIZATION_PREIMAGE_INVALID");
+    }
+  } else if (!/^sha256:[a-f0-9]{64}$/.test(input.authorizationSha256 ?? "")) {
     throw new Error("REPLAY_AUTHORIZATION_INVENTORY_INVALID");
   }
   return input.requestIds.map((requestId, index) => {
     const ordinal = index + 1;
-    const digest = createHash("sha256").update(
-      `fuse-reliability-v2-replay-operation:${input.runId}:${input.authorizationSha256}:${ordinal}:${requestId}`,
-    ).digest("hex");
+    const preimage = profile.protocolVersion === 3 ? canonicalJson({
+      authorizationDecisionId: input.authorizationDecisionId,
+      domain: profile.replayOperationDomain,
+      ordinal,
+      planFingerprint: input.planFingerprint,
+      profileFingerprint: input.profileFingerprint,
+      protocolVersion: profile.protocolVersion,
+      requestId,
+      runId: input.runId,
+    }) : `${profile.replayOperationDomain}:${input.runId}:${input.authorizationSha256}:${ordinal}:${requestId}`;
+    const digest = createHash("sha256").update(preimage).digest("hex");
     return { ordinal, requestId, operationId: `replay-${digest}` };
   });
 }
@@ -87,19 +161,39 @@ export function buildReplayAuthorizationInventory(input: {
 export class ReliabilityProtocolStore {
   constructor(private readonly database: Connectable) {}
   async createSchema(): Promise<void> { await this.database.query(RELIABILITY_SCHEMA_SQL); }
+  async databaseTime():Promise<Date>{const row=await this.database.query<{now:Date}>("SELECT clock_timestamp() AS now");return row.rows[0]!.now;}
 
-  async initializeRun(input: { runId: string; planFingerprint: string; lanes: readonly string[]; reconciliationCredentialId?: string }): Promise<void> {
+  async initializeRun(input: { runId: string; planFingerprint: string; lanes: readonly string[]; reconciliationCredentialId?: string; profile?: ReliabilityProtocolProfile }): Promise<void> {
+    const inferred = reliabilityProtocolProfileForRunId(input.runId);
+    const profile = input.profile ?? (inferred.protocolVersion === 2 ? RELIABILITY_V2_PROFILE : inferred);
+    if (profile.protocolVersion !== inferred.protocolVersion) throw new Error("PROTOCOL_PROFILE_RUN_ID_CONFLICT");
     await this.transaction(async (client) => {
-      await client.query("INSERT INTO reliability_protocol_controls(run_id,state,plan_fingerprint,reconciliation_credential_id) VALUES($1,'active',$2,$3) ON CONFLICT DO NOTHING", [input.runId, input.planFingerprint, input.reconciliationCredentialId ?? null]);
-      const control = await client.query<{ plan_fingerprint: string; reconciliation_credential_id: string | null }>("SELECT plan_fingerprint,reconciliation_credential_id FROM reliability_protocol_controls WHERE run_id=$1 FOR UPDATE", [input.runId]);
+      await client.query(`INSERT INTO reliability_protocol_controls
+        (run_id,state,plan_fingerprint,reconciliation_credential_id,protocol_version,evidence_type,plan_schema_version,mapping_version,profile_fingerprint)
+        VALUES($1,'active',$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING`, [input.runId, input.planFingerprint,
+        input.reconciliationCredentialId ?? null, profile.protocolVersion, profile.evidenceType, profile.planSchemaVersion,
+        profile.mappingVersion, profile.profileFingerprint]);
+      if (profile.protocolVersion === 2) {
+        await client.query(`UPDATE reliability_protocol_controls SET profile_fingerprint=$2
+          WHERE run_id=$1 AND protocol_version=2 AND evidence_type='held-out-reliability'
+            AND plan_schema_version=2 AND mapping_version=2 AND profile_fingerprint='legacy-v2'`,
+        [input.runId, profile.profileFingerprint]);
+      }
+      const control = await client.query<{ plan_fingerprint: string; reconciliation_credential_id: string | null; protocol_version:number; evidence_type:string; plan_schema_version:number; mapping_version:number; profile_fingerprint:string }>(
+        `SELECT plan_fingerprint,reconciliation_credential_id,protocol_version,evidence_type,plan_schema_version,mapping_version,profile_fingerprint
+         FROM reliability_protocol_controls WHERE run_id=$1 FOR UPDATE`, [input.runId]);
       if (control.rows[0]?.plan_fingerprint !== input.planFingerprint
-        || (input.reconciliationCredentialId !== undefined && control.rows[0]?.reconciliation_credential_id !== input.reconciliationCredentialId)) throw new Error("PROTOCOL_PLAN_CONFLICT");
+        || (input.reconciliationCredentialId !== undefined && control.rows[0]?.reconciliation_credential_id !== input.reconciliationCredentialId)
+        || control.rows[0]?.protocol_version !== profile.protocolVersion || control.rows[0]?.evidence_type !== profile.evidenceType
+        || control.rows[0]?.plan_schema_version !== profile.planSchemaVersion || control.rows[0]?.mapping_version !== profile.mappingVersion
+        || control.rows[0]?.profile_fingerprint !== profile.profileFingerprint) throw new Error("PROTOCOL_PLAN_CONFLICT");
       for (const lane of input.lanes) await client.query("INSERT INTO reliability_protocol_lanes(run_id,lane_id) VALUES($1,$2) ON CONFLICT DO NOTHING", [input.runId, lane]);
     });
   }
-  async registerReplayAuthorizationInventory(input:{runId:string;authorizationSha256:string;requestIds:string[]}):Promise<void>{
-    const inventory=buildReplayAuthorizationInventory(input);
-    await this.transaction(async client=>{
+  async registerReplayAuthorizationInventory(input:{runId:string;planFingerprint?:string;authorizationSha256?:string;requestIds:string[]}):Promise<Array<{ordinal:number;requestId:string;operationId:string}>>{
+    return this.transaction(async client=>{
+      const control = await this.lockControlProfile(client, input.runId);
+      if (input.planFingerprint !== undefined && input.planFingerprint !== control.plan_fingerprint) throw new Error("REPLAY_AUTHORIZATION_PLAN_CONFLICT");
       const authority=await client.query<{decision_id:string;operator_published:boolean;reconciliation_published:boolean;durable_stage:string}>(`SELECT decision.decision_id,control.durable_stage,
         EXISTS(SELECT 1 FROM reliability_authorization_outbox outbox WHERE outbox.run_id=decision.run_id AND outbox.receipt_kind='operator' AND outbox.published_at IS NOT NULL) operator_published,
         EXISTS(SELECT 1 FROM reliability_authorization_outbox outbox WHERE outbox.run_id=decision.run_id AND outbox.receipt_kind='reconciliation' AND outbox.published_at IS NOT NULL) reconciliation_published
@@ -108,16 +202,25 @@ export class ReliabilityProtocolStore {
         FOR UPDATE OF decision,control`,[input.runId]);
       if(!authority.rows[0]?.operator_published||!authority.rows[0]?.reconciliation_published)throw new Error("REPLAY_RUN_AUTHORIZATION_REQUIRED");
       if(authority.rows[0].durable_stage!=="fresh_terminal")throw new Error("REPLAY_STAGE_PREREQUISITE_UNMET");
+      const profile=reliabilityProtocolProfileForRunId(input.runId);
+      if(profile.protocolVersion===2&&!input.authorizationSha256)throw new Error("REPLAY_RUN_AUTHORIZATION_REQUIRED");
+      const inventory=buildReplayAuthorizationInventory({
+        ...input,
+        planFingerprint:input.planFingerprint??control.plan_fingerprint,
+        profileFingerprint:profile.profileFingerprint,
+        authorizationDecisionId:profile.protocolVersion===3?authority.rows[0].decision_id:undefined,
+      });
       const sealed=await client.query<{request_id:string}>("SELECT request_id FROM reliability_sealed_calls WHERE run_id=$1 AND request_id=ANY($2::text[]) FOR UPDATE",[input.runId,input.requestIds]);
       if(sealed.rows.length!==20||new Set(sealed.rows.map(row=>row.request_id)).size!==20)throw new Error("REPLAY_TARGET_INVENTORY_NOT_SEALED");
       for(const item of inventory)await client.query(`INSERT INTO reliability_replay_authorizations(run_id,replay_ordinal,request_id,operation_id,authorization_decision_id,signed_authorization_sha256)
-        VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(run_id,request_id) DO NOTHING`,[input.runId,item.ordinal,item.requestId,item.operationId,authority.rows[0].decision_id,input.authorizationSha256]);
-      const exact=await client.query<{replay_ordinal:number;request_id:string;operation_id:string;authorization_decision_id:string;signed_authorization_sha256:string}>(`SELECT replay_ordinal,request_id,operation_id,authorization_decision_id::text,signed_authorization_sha256
+        VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(run_id,request_id) DO NOTHING`,[input.runId,item.ordinal,item.requestId,item.operationId,authority.rows[0].decision_id,profile.protocolVersion===3?null:input.authorizationSha256]);
+      const exact=await client.query<{replay_ordinal:number;request_id:string;operation_id:string;authorization_decision_id:string;signed_authorization_sha256:string|null}>(`SELECT replay_ordinal,request_id,operation_id,authorization_decision_id::text,signed_authorization_sha256
         FROM reliability_replay_authorizations WHERE run_id=$1 ORDER BY replay_ordinal`,[input.runId]);
       if(exact.rows.length!==20||exact.rows.some((row,index)=>row.replay_ordinal!==inventory[index]!.ordinal
         ||row.request_id!==inventory[index]!.requestId||row.operation_id!==inventory[index]!.operationId
         ||row.authorization_decision_id!==authority.rows[0]!.decision_id
-        ||row.signed_authorization_sha256!==input.authorizationSha256))throw new Error("REPLAY_AUTHORIZATION_INVENTORY_CONFLICT");
+        ||row.signed_authorization_sha256!==(profile.protocolVersion===3?null:input.authorizationSha256)))throw new Error("REPLAY_AUTHORIZATION_INVENTORY_CONFLICT");
+      return inventory;
     });
   }
 
@@ -125,18 +228,16 @@ export class ReliabilityProtocolStore {
     requestId: string; block: number; laneId: string; callOrdinal: number; body: unknown;
     organizationId: string; agentId: string; credentialId: string; mandateId: string; branchId: string;
     workloadClass: string; provider: string; model: string; maxOutputTokens: number;
-    reservationCostMicros: bigint; claimFingerprint: string;
+    reservationCostMicros: bigint; claimFingerprint: string; requestCommitment?:string;
   }[] }): Promise<void> {
     if (input.calls.length === 0 || new Set(input.calls.map((call) => call.requestId)).size !== input.calls.length) {
       throw new Error("SEALED_CALL_REGISTRY_INVALID");
     }
     await this.transaction(async (client) => {
-      const control = await client.query<{ state: string; plan_fingerprint: string }>(
-        "SELECT state,plan_fingerprint FROM reliability_protocol_controls WHERE run_id=$1 FOR UPDATE", [input.runId],
-      );
-      if (!control.rows[0] || control.rows[0].state !== "active") throw new Error("PROTOCOL_CONTROL_FAILED");
+      const control = await this.lockControlProfile(client, input.runId);
+      if (control.state !== "active") throw new Error("PROTOCOL_CONTROL_FAILED");
       for (const call of input.calls) {
-        if (call.claimFingerprint !== control.rows[0].plan_fingerprint) throw new Error("PROTOCOL_PLAN_CONFLICT");
+        if (call.claimFingerprint !== control.plan_fingerprint) throw new Error("PROTOCOL_PLAN_CONFLICT");
         await client.query(`INSERT INTO reliability_sealed_calls
           (run_id,request_id,block_no,lane_id,call_ordinal,body_commitment,organization_id,agent_id,credential_id,mandate_id,branch_id,
            workload_class,provider,model,max_output_tokens,reservation_cost_micros,claim_fingerprint,request_body)
@@ -159,7 +260,7 @@ export class ReliabilityProtocolStore {
         const planned = await client.query(`INSERT INTO reliability_protocol_attempts
           (run_id,request_id,lane_id,block_no,state,request_commitment,reserved_cost_micros)
           VALUES($1,$2,$3,$4,'planned',$5,$6) ON CONFLICT(run_id,request_id) DO NOTHING RETURNING 1`,
-        [input.runId,call.requestId,call.laneId,call.block,buildHttpBodyCommitment(call.body),call.reservationCostMicros.toString()]);
+        [input.runId,call.requestId,call.laneId,call.block,call.requestCommitment??buildHttpBodyCommitment(call.body),call.reservationCostMicros.toString()]);
         if (planned.rows[0]) await this.appendEvent(client,input.runId,call.requestId,"planned",{
           block: call.block, laneId: call.laneId, callOrdinal: call.callOrdinal,
         });
@@ -181,6 +282,8 @@ export class ReliabilityProtocolStore {
 
   async acquireSchedulerClaim(input: { runId: string; requestId: string; laneId: string; block: number; ownerId: string; leaseSeconds: number; manifestPath: string }): Promise<{ acquired: boolean; generation: number | null; decision: SchedulerRecoveryDecision }> {
     if (!Number.isInteger(input.leaseSeconds) || input.leaseSeconds < 1 || input.leaseSeconds > 300 || !input.manifestPath.trim()) throw new Error("SCHEDULER_CLAIM_INVALID");
+    if(reliabilityProtocolProfileForRunId(input.runId).protocolVersion===3&&input.manifestPath!==schedulerManifestArtifactPath(input.runId,input.requestId))
+      throw new Error("SCHEDULER_MANIFEST_PATH_INVALID");
     return this.transaction(async (client) => {
       const control = await this.lockControlLane(client,input.runId,input.laneId);
       const recovery = await client.query<{ terminal:boolean;dispatch_token:boolean;primitive_entered:boolean }>(`SELECT
@@ -241,11 +344,22 @@ export class ReliabilityProtocolStore {
       if(!updated.rows[0]){const exact=await client.query("SELECT 1 FROM reliability_scheduler_claims WHERE run_id=$1 AND request_id=$2 AND lane_id=$3 AND owner_id=$4 AND generation=$5 AND state='terminal'",[input.runId,input.requestId,input.laneId,input.ownerId,input.generation]);if(!exact.rows[0])throw new Error("SCHEDULER_TERMINAL_CONFLICT");}});
   }
 
+  async recordRecoveredTerminalSchedulerManifest(input:{runId:string;requestId:string;laneId:string;generation:number;manifestDigest:string}):Promise<void>{
+    if(!/^sha256:[a-f0-9]{64}$/.test(input.manifestDigest))throw new Error("SCHEDULER_MANIFEST_DIGEST_INVALID");
+    await this.transaction(async client=>{
+      await this.lockControlLane(client,input.runId,input.laneId);
+      const updated=await client.query(`UPDATE reliability_scheduler_claims SET manifest_digest=$5,manifest_fsynced_at=clock_timestamp(),heartbeat_at=clock_timestamp()
+        WHERE run_id=$1 AND request_id=$2 AND lane_id=$3 AND generation=$4 AND state='terminal' RETURNING 1`,
+      [input.runId,input.requestId,input.laneId,input.generation,input.manifestDigest]);
+      if(!updated.rows[0])throw new Error("SCHEDULER_TERMINAL_MANIFEST_CONFLICT");
+    });
+  }
+
   async authorizeHttpReliabilityContext(input: {
     runId: string | null; laneId: string | null; block: number | null; requestId: string;
     organizationId: string; agentId: string; credentialId: string; mandateId: string; branchId: string | null;
     workloadClass: string | null; model: string; maxOutputTokens: number; body: unknown;
-  }): Promise<{ kind: "ordinary" } | { kind: "reliability"; callOrdinal: number } | null> {
+  }): Promise<{ kind: "ordinary" } | { kind: "reliability"; callOrdinal: number; requestCommitment?:string } | null> {
     const binding = await this.database.query<{ protocol_bound: boolean }>(`SELECT EXISTS(
       SELECT 1 FROM reliability_sealed_calls sealed WHERE sealed.organization_id=$1
         AND (sealed.credential_id=$2 OR sealed.mandate_id=$3
@@ -253,32 +367,46 @@ export class ReliabilityProtocolStore {
     [input.organizationId,input.credentialId,input.mandateId,input.branchId]);
     if (!binding.rows[0]?.protocol_bound) return { kind: "ordinary" };
     if (!input.runId || !input.laneId || input.block === null || !input.branchId || !input.workloadClass) return null;
-    const row = await this.database.query<{ call_ordinal: number }>(`SELECT sealed.call_ordinal FROM reliability_sealed_calls sealed
+    const row = await this.database.query<{ call_ordinal: number;request_commitment:string }>(`SELECT sealed.call_ordinal,attempt.request_commitment FROM reliability_sealed_calls sealed
       JOIN reliability_protocol_controls control ON control.run_id=sealed.run_id
       JOIN reliability_protocol_lanes lane ON lane.run_id=sealed.run_id AND lane.lane_id=sealed.lane_id
       JOIN reliability_block_claims claim ON claim.run_id=sealed.run_id AND claim.block_no=sealed.block_no
       JOIN reliability_authorization_decisions decision ON decision.run_id=sealed.run_id
+      JOIN reliability_protocol_attempts attempt ON attempt.run_id=sealed.run_id AND attempt.request_id=sealed.request_id
       WHERE sealed.run_id=$1 AND sealed.request_id=$2 AND sealed.lane_id=$3 AND sealed.block_no=$4
         AND sealed.organization_id=$5 AND sealed.agent_id=$6 AND sealed.credential_id=$7 AND sealed.mandate_id=$8 AND sealed.branch_id=$9
         AND sealed.workload_class=$10 AND sealed.model=$11 AND sealed.max_output_tokens=$12
         AND sealed.provider='openrouter' AND sealed.body_commitment=$13
         AND sealed.claim_fingerprint=control.plan_fingerprint AND claim.plan_fingerprint=control.plan_fingerprint
-        AND control.state='active' AND lane.state='ready' AND claim.state='claimed'
-        AND claim.claimed_at >= claim.opens_at AND claim.claimed_at < claim.launch_deadline
+        AND control.state='active' AND claim.state='claimed'
         AND (
-          ((sealed.lane_id='bounded-burst' OR sealed.call_ordinal=1)
-            AND clock_timestamp() >= claim.claimed_at + interval '1 second'
-            AND clock_timestamp() < claim.claimed_at + interval '2 seconds')
+          (lane.state='ready'
+            AND claim.claimed_at >= claim.opens_at AND claim.claimed_at < claim.launch_deadline
+            AND (
+              ((sealed.lane_id='bounded-burst' OR sealed.call_ordinal=1)
+                AND clock_timestamp() >= claim.claimed_at + interval '1 second'
+                AND clock_timestamp() < claim.claimed_at + interval '2 seconds')
+              OR
+              (sealed.lane_id<>'bounded-burst' AND sealed.call_ordinal>1 AND EXISTS (
+                SELECT 1 FROM reliability_sealed_calls immediate_prior
+                JOIN reliability_protocol_attempts prior_attempt
+                  ON prior_attempt.run_id=immediate_prior.run_id AND prior_attempt.request_id=immediate_prior.request_id
+                WHERE immediate_prior.run_id=sealed.run_id AND immediate_prior.lane_id=sealed.lane_id
+                  AND immediate_prior.block_no=sealed.block_no AND immediate_prior.call_ordinal=sealed.call_ordinal-1
+                  AND prior_attempt.terminal_at IS NOT NULL
+                  AND clock_timestamp() >= prior_attempt.terminal_at + interval '5 seconds'
+                  AND clock_timestamp() < prior_attempt.terminal_at + interval '6 seconds'
+              ))
+            ))
           OR
-          (sealed.lane_id<>'bounded-burst' AND sealed.call_ordinal>1 AND EXISTS (
-            SELECT 1 FROM reliability_sealed_calls immediate_prior
-            JOIN reliability_protocol_attempts prior_attempt
-              ON prior_attempt.run_id=immediate_prior.run_id AND prior_attempt.request_id=immediate_prior.request_id
-            WHERE immediate_prior.run_id=sealed.run_id AND immediate_prior.lane_id=sealed.lane_id
-              AND immediate_prior.block_no=sealed.block_no AND immediate_prior.call_ordinal=sealed.call_ordinal-1
-              AND prior_attempt.terminal_at IS NOT NULL
-              AND clock_timestamp() >= prior_attempt.terminal_at + interval '5 seconds'
-              AND clock_timestamp() < prior_attempt.terminal_at + interval '6 seconds'
+          (lane.state='resuming' AND EXISTS (
+            SELECT 1 FROM reliability_lane_backlog backlog
+            WHERE backlog.run_id=sealed.run_id AND backlog.lane_id=sealed.lane_id
+              AND backlog.request_id=sealed.request_id AND backlog.block_no=sealed.block_no
+              AND backlog.call_ordinal=sealed.call_ordinal AND backlog.state='claimed'
+              AND backlog.actual_scheduled_at IS NOT NULL
+              AND clock_timestamp() >= backlog.actual_scheduled_at
+              AND clock_timestamp() < backlog.actual_scheduled_at + interval '1 second'
           ))
         )
         AND decision.verdict->>'operatorValid'='true' AND decision.verdict->>'reconciliationValid'='true'
@@ -293,7 +421,8 @@ export class ReliabilityProtocolStore {
               'reconciled_not_billed','reconciled_billed_with_response','reconciled_billed_no_response','unresolved_provider_outcome')
         ))`, [input.runId,input.requestId,input.laneId,input.block,input.organizationId,input.agentId,input.credentialId,input.mandateId,
           input.branchId,input.workloadClass,input.model,input.maxOutputTokens,buildHttpBodyCommitment(input.body)]);
-    return row.rows[0] ? { kind: "reliability", callOrdinal: row.rows[0].call_ordinal } : null;
+    return row.rows[0] ? {kind:"reliability",callOrdinal:row.rows[0].call_ordinal,
+      ...(input.runId.startsWith("hov3-")?{requestCommitment:row.rows[0].request_commitment}:{})} : null;
   }
   async readSealedReservation(input:{runId:string;requestId:string;laneId:string;block:number}):Promise<bigint>{
     const row=await this.database.query<{reservation_cost_micros:string}>("SELECT reservation_cost_micros::text FROM reliability_sealed_calls WHERE run_id=$1 AND request_id=$2 AND lane_id=$3 AND block_no=$4",[input.runId,input.requestId,input.laneId,input.block]);
@@ -301,10 +430,11 @@ export class ReliabilityProtocolStore {
   }
   async recordAttemptOnClient(client:Queryable,input:{runId:string;requestId:string;laneId:string;block:number;requestCommitment:string;reservedCostMicros:bigint}):Promise<void>{
     const state=await this.lockControlLane(client,input.runId,input.laneId);if(state!=="active")throw new Error("PROTOCOL_CONTROL_FAILED");
-    const updated=await client.query(`UPDATE reliability_protocol_attempts attempt SET state='admission_started',request_commitment=$5,reserved_cost_micros=$6,admission_started_at=COALESCE(admission_started_at,clock_timestamp())
+    const updated=await client.query(`UPDATE reliability_protocol_attempts attempt SET state='admission_started',request_commitment=CASE WHEN attempt.run_id LIKE 'hov3-%' THEN attempt.request_commitment ELSE $5 END,reserved_cost_micros=$6,admission_started_at=COALESCE(admission_started_at,clock_timestamp())
       FROM reliability_sealed_calls sealed WHERE attempt.run_id=$1 AND attempt.request_id=$2 AND attempt.lane_id=$3 AND attempt.block_no=$4
         AND sealed.run_id=attempt.run_id AND sealed.request_id=attempt.request_id AND sealed.reservation_cost_micros=$6
-        AND attempt.state IN ('planned','admission_started') RETURNING attempt.state`,[input.runId,input.requestId,input.laneId,input.block,input.requestCommitment,input.reservedCostMicros.toString()]);
+        AND attempt.state IN ('planned','admission_started') AND (attempt.run_id NOT LIKE 'hov3-%' OR attempt.request_commitment=$5)
+        RETURNING attempt.state`,[input.runId,input.requestId,input.laneId,input.block,input.requestCommitment,input.reservedCostMicros.toString()]);
     if(!updated.rows[0])throw new Error("SEALED_CALL_REQUIRED");
     const exists=await client.query("SELECT 1 FROM reliability_protocol_events WHERE run_id=$1 AND request_id=$2 AND event_type='admission_started'",[input.runId,input.requestId]);
     if(!exists.rows[0])await this.appendEvent(client,input.runId,input.requestId,"admission_started",{block:input.block});
@@ -417,6 +547,7 @@ export class ReliabilityProtocolStore {
       await client.query("UPDATE reliability_protocol_controls SET gate_classification_count=gate_classification_count+1,usable_count=usable_count+1 WHERE run_id=$1",[input.runId]);
       await this.appendEvent(client,input.runId,input.requestId,"provider_response_persisted",{ generationId: input.response.id, actualCostMicros: input.actualCostMicros.toString(), responseCommitment });
       await this.appendEvent(client,input.runId,input.requestId,"gate_classified",{ state: "completed_verified" });
+      await this.removeTerminalHeldMemberLocked(client,{runId:input.runId,laneId:input.laneId,requestId:input.requestId,controlState:state});
   }
 
   async holdReliabilityAttempt(input: { runId: string; laneId: string; requestId: string; reasonCode: string; generationId?: string; response?: ProviderResult }): Promise<void> {
@@ -449,6 +580,7 @@ export class ReliabilityProtocolStore {
       if (!updated.rows[0]) throw new Error("RELIABILITY_TERMINAL_CONFLICT");
       await client.query("UPDATE reliability_protocol_controls SET gate_classification_count=gate_classification_count+1 WHERE run_id=$1",[input.runId]);
       await this.appendEvent(client,input.runId,input.requestId,"gate_classified",{ state: "not_dispatched", reasonCode: input.reasonCode });
+      await this.removeTerminalHeldMemberLocked(client,{runId:input.runId,laneId:input.laneId,requestId:input.requestId,controlState:"active"});
       await this.failProtocolLocked(client,input.runId,`NOT_DISPATCHED:${input.reasonCode}`);
   }
   async failProtocol(runId: string, reason: string): Promise<void> {
@@ -459,25 +591,27 @@ export class ReliabilityProtocolStore {
 
   async claimBlock(input: { runId: string; block: number; ownerId: string; opensAt: string; launchDeadline: string; planFingerprint?: string }): Promise<{ claimedAt: string }> {
     return this.transaction(async (client) => {
-      const control = await client.query<{ state: string; plan_fingerprint: string }>("SELECT state,plan_fingerprint FROM reliability_protocol_controls WHERE run_id=$1 FOR UPDATE", [input.runId]);
-      const state = control.rows[0]?.state;
-      if (!state) throw new Error("PROTOCOL_CONTROL_NOT_FOUND");
+      const control = await this.lockControlProfile(client, input.runId);
+      const state = control.state;
       if (state !== "active") throw new Error("PROTOCOL_CONTROL_FAILED");
-      if (input.planFingerprint && control.rows[0]!.plan_fingerprint !== input.planFingerprint) throw new Error("PROTOCOL_PLAN_CONFLICT");
+      if (input.planFingerprint && control.plan_fingerprint !== input.planFingerprint) throw new Error("PROTOCOL_PLAN_CONFLICT");
       const authorization = await client.query(`SELECT 1 FROM reliability_authorization_decisions decision
         WHERE decision.run_id=$1 AND decision.verdict->>'operatorValid'='true'
           AND decision.verdict->>'reconciliationValid'='true'
           AND (SELECT count(*) FROM reliability_authorization_outbox outbox
-               WHERE outbox.run_id=decision.run_id AND outbox.published_at IS NOT NULL)=2`,[input.runId]);
+               WHERE outbox.run_id=decision.run_id AND outbox.published_at IS NOT NULL)=2
+          AND ($2::boolean=FALSE OR EXISTS(SELECT 1 FROM reliability_authorization_operations operation
+               WHERE operation.run_id=decision.run_id AND operation.transition_completed_at IS NOT NULL
+                 AND operation.failure_reason IS NULL))`,[input.runId,control.protocol_version===3]);
       if (!authorization.rows[0]) throw new Error("AUTHORIZATION_RECEIPTS_NOT_PUBLISHED");
-      const sealed = await client.query<{ count: string }>("SELECT count(*)::text count FROM reliability_sealed_calls WHERE run_id=$1 AND claim_fingerprint=$2",[input.runId,control.rows[0]!.plan_fingerprint]);
+      const sealed = await client.query<{ count: string }>("SELECT count(*)::text count FROM reliability_sealed_calls WHERE run_id=$1 AND claim_fingerprint=$2",[input.runId,control.plan_fingerprint]);
       if (Number(sealed.rows[0]?.count ?? 0) === 0) throw new Error("SEALED_CALL_REGISTRY_REQUIRED");
       const existing = await client.query<{ owner_id: string; claimed_at: Date; opens_at: Date; launch_deadline: Date; plan_fingerprint: string }>(`SELECT owner_id,claimed_at,opens_at,launch_deadline,plan_fingerprint
         FROM reliability_block_claims WHERE run_id=$1 AND block_no=$2 FOR UPDATE`,[input.runId,input.block]);
       if (existing.rows[0]) {
         const row = existing.rows[0];
         if (row.owner_id !== input.ownerId) throw new Error("BLOCK_ALREADY_CLAIMED");
-        if (row.plan_fingerprint !== control.rows[0]!.plan_fingerprint
+        if (row.plan_fingerprint !== control.plan_fingerprint
           || row.opens_at.toISOString() !== new Date(input.opensAt).toISOString()
           || row.launch_deadline.toISOString() !== new Date(input.launchDeadline).toISOString()) throw new Error("BLOCK_CLAIM_CONFLICT");
         return { claimedAt: row.claimed_at.toISOString() };
@@ -487,14 +621,63 @@ export class ReliabilityProtocolStore {
       if (claimedAt < new Date(input.opensAt) || claimedAt >= new Date(input.launchDeadline)) throw new Error("BLOCK_ADMISSION_WINDOW_MISSED");
       const row = await client.query<{ owner_id: string; claimed_at: Date }>(`INSERT INTO reliability_block_claims
         (run_id,lane_id,block_no,owner_id,opens_at,launch_deadline,claimed_at,plan_fingerprint) VALUES($1,'normal-paced',$2,$3,$4,$5,$6,$7)
-        RETURNING owner_id,claimed_at`, [input.runId,input.block,input.ownerId,input.opensAt,input.launchDeadline,claimedAt,control.rows[0]!.plan_fingerprint]);
+        RETURNING owner_id,claimed_at`, [input.runId,input.block,input.ownerId,input.opensAt,input.launchDeadline,claimedAt,control.plan_fingerprint]);
       await this.appendEvent(client, input.runId, null, "block_claimed", { block: input.block, ownerId: input.ownerId });
       return { claimedAt: row.rows[0]!.claimed_at.toISOString() };
     });
   }
 
-  async commitAuthorization(input: { runId: string; decisionId: string; verdict: unknown; active: boolean; operatorIssuerId: string; operatorNonce: string | null; operatorReceipt: unknown; reconciliationReceipt: unknown }): Promise<void> {
-    if (input.decisionId !== deterministicAuthorizationDecisionId(input.runId)) throw new Error("AUTHORIZATION_DECISION_ID_INVALID");
+  async beginAuthorizationOperation(runId:string):Promise<{startedAt:string;validationDeadline:string;decisionDeadline:string;publicationDeadline:string;transitionDeadline:string}>{
+    return this.transaction(async client=>{
+      const control=await this.lockControlProfile(client,runId);
+      if(control.protocol_version!==3)throw new Error("AUTHORIZATION_OPERATION_PROFILE_INVALID");
+      const row=await client.query<{started_at:Date;validation_deadline:Date;decision_deadline:Date;publication_deadline:Date;transition_deadline:Date}>(`INSERT INTO reliability_authorization_operations
+        (run_id,started_at,validation_deadline,decision_deadline,publication_deadline,transition_deadline)
+        SELECT $1,started_at,started_at+interval '5 seconds',started_at+interval '20 seconds',started_at+interval '50 seconds',started_at+interval '55 seconds'
+        FROM (SELECT clock_timestamp() AS started_at) authoritative_clock
+        ON CONFLICT(run_id) DO UPDATE SET run_id=EXCLUDED.run_id
+        RETURNING started_at,validation_deadline,decision_deadline,publication_deadline,transition_deadline`,[runId]);
+      const value=row.rows[0]!;
+      return {startedAt:value.started_at.toISOString(),validationDeadline:value.validation_deadline.toISOString(),decisionDeadline:value.decision_deadline.toISOString(),publicationDeadline:value.publication_deadline.toISOString(),transitionDeadline:value.transition_deadline.toISOString()};
+    });
+  }
+
+  async commitAuthorizationPredecisionFailure(input:{runId:string;planFingerprint:string;reasonCode:string;
+    operatorArtifactSha256?:`sha256:${string}`;reconciliationArtifactSha256?:`sha256:${string}`}):Promise<string>{
+    if(!authorizationPredecisionReasonValid(input.reasonCode))throw new Error("AUTHORIZATION_PREDECISION_REASON_INVALID");
+    return this.transaction(async client=>{
+      await client.query("SET LOCAL statement_timeout = '5000ms'");
+      const control=await this.lockControlProfile(client,input.runId);
+      if(control.protocol_version!==3||control.plan_fingerprint!==input.planFingerprint)throw new Error("AUTHORIZATION_PREDECISION_PROFILE_CONFLICT");
+      const operatorArtifactSha256=input.operatorArtifactSha256??"absent";
+      const reconciliationArtifactSha256=input.reconciliationArtifactSha256??"absent";
+      const decisionId=deterministicAuthorizationDecisionId({runId:input.runId,planFingerprint:control.plan_fingerprint,
+        profileFingerprint:control.profile_fingerprint,decisionKind:"readiness_predecision_failed",reasonCode:input.reasonCode,
+        operatorArtifactSha256,reconciliationArtifactSha256});
+      const receipt=(kind:"operator"|"reconciliation",digest:string)=>({evidenceType:control.evidence_type,protocolVersion:3,
+        runId:input.runId,planFingerprint:control.plan_fingerprint,artifactKind:"authorization_receipt",kind,status:"readiness_failed",
+        databaseValidationTime:null,reasonCode:input.reasonCode,presentedArtifactSha256:digest});
+      const verdict={decisionKind:"readiness_predecision_failed",reasonCode:input.reasonCode,operatorValid:false,reconciliationValid:false,
+        operatorArtifactSha256,reconciliationArtifactSha256};
+      const existing=await client.query<{decision_id:string;verdict:unknown}>("SELECT decision_id::text,verdict FROM reliability_authorization_decisions WHERE run_id=$1 FOR UPDATE",[input.runId]);
+      if(existing.rows[0]){
+        if(existing.rows[0].decision_id!==decisionId||canonicalJson(existing.rows[0].verdict)!==canonicalJson(verdict))throw new Error("AUTHORIZATION_DECISION_CONFLICT");
+        return decisionId;
+      }
+      await client.query("INSERT INTO reliability_authorization_decisions(run_id,decision_id,verdict,operator_nonce) VALUES($1,$2,$3::jsonb,NULL)",
+        [input.runId,decisionId,JSON.stringify(verdict)]);
+      await client.query(`INSERT INTO reliability_authorization_outbox(run_id,receipt_kind,receipt) VALUES
+        ($1,'operator',$2::jsonb),($1,'reconciliation',$3::jsonb)`,[input.runId,JSON.stringify(receipt("operator",operatorArtifactSha256)),JSON.stringify(receipt("reconciliation",reconciliationArtifactSha256))]);
+      await client.query("UPDATE reliability_protocol_controls SET state='failed',failed_at=clock_timestamp(),failure_sequence=failure_sequence+1 WHERE run_id=$1",[input.runId]);
+      const incidentSequence=await this.appendIncident(client,input.runId,"authorization_predecision_failed",{reasonCode:input.reasonCode,decisionId});
+      await this.commitReportIntentLocked(client,{runId:input.runId,reportKind:"failure",reasonCode:input.reasonCode,incidentSequence,acceptedSnapshotSha256:null});
+      return decisionId;
+    });
+  }
+
+  async commitAuthorization(input: { runId: string; decisionId: string; verdict: unknown; active: boolean; operatorIssuerId: string; operatorNonce: string | null; operatorReceipt: unknown; reconciliationReceipt: unknown; decisionDeadline?:string }): Promise<void> {
+    const profile = reliabilityProtocolProfileForRunId(input.runId);
+    if (profile.protocolVersion === 2 && input.decisionId !== deterministicAuthorizationDecisionId(input.runId)) throw new Error("AUTHORIZATION_DECISION_ID_INVALID");
     const verdict = input.verdict as Record<string, unknown>;
     const operatorReceipt = input.operatorReceipt as Record<string, unknown>;
     const reconciliationReceipt = input.reconciliationReceipt as Record<string, unknown>;
@@ -504,8 +687,27 @@ export class ReliabilityProtocolStore {
       throw new Error("AUTHORIZATION_VALID_PAIR_REQUIRED");
     }
     await this.transaction(async (client) => {
-      const control = await client.query<{ state: string }>("SELECT state FROM reliability_protocol_controls WHERE run_id=$1 FOR UPDATE", [input.runId]);
-      if (!control.rows[0]) throw new Error("PROTOCOL_CONTROL_NOT_FOUND");
+      const control = await this.lockControlProfile(client, input.runId);
+      if (profile.protocolVersion === 3) {
+        if(!input.decisionDeadline||!Number.isFinite(Date.parse(input.decisionDeadline)))throw new Error("AUTHORIZATION_DECISION_DEADLINE_REQUIRED");
+        const operation=await client.query<{decision_deadline:Date}>("SELECT decision_deadline FROM reliability_authorization_operations WHERE run_id=$1 FOR UPDATE",[input.runId]);
+        if(!operation.rows[0]||operation.rows[0].decision_deadline.toISOString()!==new Date(input.decisionDeadline).toISOString())throw new Error("AUTHORIZATION_DECISION_DEADLINE_CONFLICT");
+        const clock=await client.query<{now:Date}>("SELECT clock_timestamp() AS now");
+        if(clock.rows[0]!.now.getTime()>=operation.rows[0].decision_deadline.getTime())throw new Error("AUTHORIZATION_DECISION_DEADLINE_MISSED");
+        const decisionKind=input.active?"active":"readiness_failed";
+        const reasonCode=String(operatorReceipt["reasonCode"]??"");
+        if(reasonCode!==String(reconciliationReceipt["reasonCode"]??""))throw new Error("AUTHORIZATION_REASON_CONFLICT");
+        const expectedDecisionId = deterministicAuthorizationDecisionId({
+          runId: input.runId,
+          planFingerprint: control.plan_fingerprint,
+          profileFingerprint: profile.profileFingerprint,
+          decisionKind,
+          reasonCode,
+          operatorArtifactSha256: String(operatorReceipt["presentedArtifactSha256"] ?? "absent") as `sha256:${string}`|"absent",
+          reconciliationArtifactSha256: String(reconciliationReceipt["presentedArtifactSha256"] ?? "absent") as `sha256:${string}`|"absent",
+        });
+        if (input.decisionId !== expectedDecisionId) throw new Error("AUTHORIZATION_DECISION_ID_INVALID");
+      }
       const existing = await client.query<{ decision_id: string; verdict: unknown }>("SELECT decision_id::text,verdict FROM reliability_authorization_decisions WHERE run_id=$1", [input.runId]);
       if (existing.rows[0]) {
         if (existing.rows[0].decision_id !== input.decisionId || JSON.stringify(existing.rows[0].verdict) !== JSON.stringify(input.verdict)) throw new Error("AUTHORIZATION_DECISION_CONFLICT");
@@ -518,18 +720,77 @@ export class ReliabilityProtocolStore {
       await client.query("INSERT INTO reliability_authorization_decisions(run_id,decision_id,verdict,operator_nonce) VALUES($1,$2,$3::jsonb,$4)", [input.runId,input.decisionId,JSON.stringify(input.verdict),input.operatorNonce]);
       await client.query(`INSERT INTO reliability_authorization_outbox(run_id,receipt_kind,receipt) VALUES
         ($1,'operator',$2::jsonb),($1,'reconciliation',$3::jsonb)`, [input.runId,JSON.stringify(input.operatorReceipt),JSON.stringify(input.reconciliationReceipt)]);
-      if (!input.active) await client.query("UPDATE reliability_protocol_controls SET state='failed',failed_at=clock_timestamp() WHERE run_id=$1", [input.runId]);
+      if (!input.active) {
+        await client.query("UPDATE reliability_protocol_controls SET state='failed',failed_at=clock_timestamp(),failure_sequence=failure_sequence+1 WHERE run_id=$1", [input.runId]);
+        if(profile.protocolVersion===3){
+          const reasonCode=String(operatorReceipt["reasonCode"]??"SIGNED_AUTHORIZATION_PAIR_INVALID");
+          const incidentSequence=await this.appendIncident(client,input.runId,"authorization_readiness_failed",{reasonCode,decisionId:input.decisionId});
+          await this.commitReportIntentLocked(client,{runId:input.runId,reportKind:"failure",reasonCode,incidentSequence,acceptedSnapshotSha256:null});
+        }
+      }
     });
   }
 
-  async publishAuthorizationOutbox(runId: string, publish: (kind: string, receipt: unknown) => Promise<void>): Promise<void> {
+  async publishAuthorizationOutbox(runId: string, publish: (kind: string, receipt: unknown) => Promise<void>, publicationDeadline?:string): Promise<void> {
+    const profile=reliabilityProtocolProfileForRunId(runId);let missed=false;
+    await this.transaction(async client=>{ await this.lockControlProfile(client,runId); });
     const rows = await this.database.query<{ receipt_kind: string; receipt: unknown }>("SELECT receipt_kind,receipt FROM reliability_authorization_outbox WHERE run_id=$1 AND published_at IS NULL ORDER BY receipt_kind", [runId]);
     for (const row of rows.rows) {
       await publish(row.receipt_kind, row.receipt);
       await this.transaction(async (client) => {
+        await this.lockControlProfile(client,runId);
+        const operation=profile.protocolVersion===3?await client.query<{publication_deadline:Date;failure_reason:string|null}>("SELECT publication_deadline,failure_reason FROM reliability_authorization_operations WHERE run_id=$1 FOR UPDATE",[runId]):null;
+        if(profile.protocolVersion===3){
+          if(!operation?.rows[0]||!publicationDeadline||operation.rows[0].publication_deadline.toISOString()!==new Date(publicationDeadline).toISOString())throw new Error("AUTHORIZATION_PUBLICATION_DEADLINE_CONFLICT");
+          const clock=await client.query<{now:Date}>("SELECT clock_timestamp() AS now");missed=missed||clock.rows[0]!.now.getTime()>=operation.rows[0].publication_deadline.getTime();
+        }
         await client.query("UPDATE reliability_authorization_outbox SET published_at=COALESCE(published_at,clock_timestamp()) WHERE run_id=$1 AND receipt_kind=$2", [runId,row.receipt_kind]);
+        if(missed&&operation?.rows[0]?.failure_reason===null){
+          await client.query("UPDATE reliability_authorization_operations SET failure_reason='authorization_publication_deadline' WHERE run_id=$1 AND failure_reason IS NULL",[runId]);
+          await client.query("UPDATE reliability_protocol_controls SET state='failed',failed_at=COALESCE(failed_at,clock_timestamp()),failure_sequence=failure_sequence+1 WHERE run_id=$1 AND state<>'failed'",[runId]);
+          const incidentSequence=await this.appendIncident(client,runId,"authorization_publication_deadline",{});
+          await this.commitReportIntentLocked(client,{runId,reportKind:"failure",reasonCode:"authorization_publication_deadline",incidentSequence,acceptedSnapshotSha256:null});
+        }
       });
     }
+    if(profile.protocolVersion===3){
+      await this.transaction(async client=>{
+        await this.lockControlProfile(client,runId);
+        const operation=await client.query<{publication_deadline:Date;failure_reason:string|null}>("SELECT publication_deadline,failure_reason FROM reliability_authorization_operations WHERE run_id=$1 FOR UPDATE",[runId]);
+        if(!operation.rows[0]||!publicationDeadline||operation.rows[0].publication_deadline.toISOString()!==new Date(publicationDeadline).toISOString())throw new Error("AUTHORIZATION_PUBLICATION_DEADLINE_CONFLICT");
+        const state=await client.query<{count:string;now:Date}>("SELECT count(*)::text count,clock_timestamp() AS now FROM reliability_authorization_outbox WHERE run_id=$1 AND published_at IS NOT NULL",[runId]);
+        missed=missed||Number(state.rows[0]!.count)!==2||state.rows[0]!.now.getTime()>=operation.rows[0].publication_deadline.getTime();
+        if(missed&&operation.rows[0].failure_reason===null){
+          await client.query("UPDATE reliability_authorization_operations SET failure_reason='authorization_publication_deadline' WHERE run_id=$1 AND failure_reason IS NULL",[runId]);
+          await client.query("UPDATE reliability_protocol_controls SET state='failed',failed_at=COALESCE(failed_at,clock_timestamp()),failure_sequence=failure_sequence+1 WHERE run_id=$1 AND state<>'failed'",[runId]);
+          const incidentSequence=await this.appendIncident(client,runId,"authorization_publication_deadline",{});
+          await this.commitReportIntentLocked(client,{runId,reportKind:"failure",reasonCode:"authorization_publication_deadline",incidentSequence,acceptedSnapshotSha256:null});
+        }
+        if(!missed)await client.query("UPDATE reliability_authorization_operations SET publication_completed_at=clock_timestamp() WHERE run_id=$1 AND publication_completed_at IS NULL",[runId]);
+      });
+      if(missed)throw new Error("AUTHORIZATION_PUBLICATION_DEADLINE_MISSED");
+    }
+  }
+
+  async completeAuthorizationOperation(runId:string,transitionDeadline:string):Promise<void>{
+    const completed=await this.transaction(async client=>{
+      await this.lockControlProfile(client,runId);
+      const operation=await client.query<{transition_deadline:Date;publication_completed_at:Date|null;failure_reason:string|null}>("SELECT transition_deadline,publication_completed_at,failure_reason FROM reliability_authorization_operations WHERE run_id=$1 FOR UPDATE",[runId]);
+      if(!operation.rows[0]||operation.rows[0].transition_deadline.toISOString()!==new Date(transitionDeadline).toISOString())throw new Error("AUTHORIZATION_TRANSITION_DEADLINE_CONFLICT");
+      const clock=await client.query<{now:Date}>("SELECT clock_timestamp() AS now");
+      if(!operation.rows[0].publication_completed_at||operation.rows[0].failure_reason||clock.rows[0]!.now.getTime()>=operation.rows[0].transition_deadline.getTime()){
+        if(!operation.rows[0].failure_reason){
+          await client.query("UPDATE reliability_authorization_operations SET failure_reason='authorization_transition_deadline' WHERE run_id=$1 AND failure_reason IS NULL",[runId]);
+          await client.query("UPDATE reliability_protocol_controls SET state='failed',failed_at=COALESCE(failed_at,clock_timestamp()),failure_sequence=failure_sequence+1 WHERE run_id=$1 AND state<>'failed'",[runId]);
+          const incidentSequence=await this.appendIncident(client,runId,"authorization_transition_deadline",{});
+          await this.commitReportIntentLocked(client,{runId,reportKind:"failure",reasonCode:"authorization_transition_deadline",incidentSequence,acceptedSnapshotSha256:null});
+        }
+        return false;
+      }
+      await client.query("UPDATE reliability_authorization_operations SET transition_completed_at=clock_timestamp() WHERE run_id=$1 AND transition_completed_at IS NULL",[runId]);
+      return true;
+    });
+    if(!completed)throw new Error("AUTHORIZATION_TRANSITION_DEADLINE_MISSED");
   }
 
   async createBurstBarrier(input: { runId: string; laneId: string; block: number; requestIds: readonly string[] }): Promise<void> {
@@ -584,8 +845,31 @@ export class ReliabilityProtocolStore {
     }
     await client.query("INSERT INTO reliability_protocol_holds(run_id,lane_id,hold_id,held_unresolved) VALUES($1,$2,$3,$4::jsonb)", [input.runId,input.laneId,holdId,JSON.stringify(members)]);
     for(const [index,requestId] of members.entries())await client.query("INSERT INTO reliability_hold_members(run_id,lane_id,hold_id,request_id,member_sequence) VALUES($1,$2,$3,$4,$5)",[input.runId,input.laneId,holdId,requestId,index+1]);
+    await client.query(`UPDATE reliability_hold_members member SET member_state=CASE WHEN attempt.state='reconciliation_pending'
+      THEN 'reconciliation_pending' ELSE 'ordinary_inflight' END FROM reliability_protocol_attempts attempt
+      WHERE member.run_id=$1 AND member.lane_id=$2 AND member.hold_id=$3 AND attempt.run_id=member.run_id AND attempt.request_id=member.request_id`,
+    [input.runId,input.laneId,holdId]);
     await client.query("UPDATE reliability_protocol_lanes SET state='held',resume_at=NULL WHERE run_id=$1 AND lane_id=$2", [input.runId,input.laneId]);
     return { holdId,members };
+  }
+
+  private async removeTerminalHeldMemberLocked(client:Queryable,input:{runId:string;laneId:string;requestId:string;controlState:string}):Promise<{remaining:string[];resumeAt:string|null}|null>{
+    const hold=await client.query<{hold_id:string;held_unresolved:string[]}>("SELECT hold_id::text,held_unresolved FROM reliability_protocol_holds WHERE run_id=$1 AND lane_id=$2 AND resolved_at IS NULL FOR UPDATE",[input.runId,input.laneId]);
+    if(!hold.rows[0]||!hold.rows[0].held_unresolved.includes(input.requestId))return null;
+    const terminal=await client.query<{state:string}>("SELECT state FROM reliability_protocol_attempts WHERE run_id=$1 AND request_id=$2 AND lane_id=$3 AND terminal_at IS NOT NULL FOR UPDATE",[input.runId,input.requestId,input.laneId]);
+    if(!terminal.rows[0])throw new Error("HELD_MEMBER_TERMINAL_REQUIRED");
+    const remaining=hold.rows[0].held_unresolved.filter(requestId=>requestId!==input.requestId);
+    await client.query("UPDATE reliability_hold_members SET resolved_at=COALESCE(resolved_at,clock_timestamp()) WHERE run_id=$1 AND lane_id=$2 AND hold_id=$3 AND request_id=$4",
+      [input.runId,input.laneId,hold.rows[0].hold_id,input.requestId]);
+    if(remaining.length){
+      await client.query("UPDATE reliability_protocol_holds SET held_unresolved=$4::jsonb WHERE run_id=$1 AND lane_id=$2 AND hold_id=$3",[input.runId,input.laneId,hold.rows[0].hold_id,JSON.stringify(remaining)]);
+      return {remaining,resumeAt:null};
+    }
+    const resumed=await client.query<{resume_at:Date|null}>(`UPDATE reliability_protocol_lanes SET state=CASE WHEN $3='active' THEN 'resume_pending' ELSE 'failed' END,
+      resume_at=CASE WHEN $3='active' THEN to_timestamp((floor(extract(epoch FROM clock_timestamp())/300)+1)*300) ELSE NULL END
+      WHERE run_id=$1 AND lane_id=$2 RETURNING resume_at`,[input.runId,input.laneId,input.controlState]);
+    await client.query("UPDATE reliability_protocol_holds SET held_unresolved='[]'::jsonb,resolved_at=clock_timestamp() WHERE run_id=$1 AND lane_id=$2 AND hold_id=$3",[input.runId,input.laneId,hold.rows[0].hold_id]);
+    return {remaining,resumeAt:resumed.rows[0]?.resume_at?.toISOString()??null};
   }
 
   async resolveHeldMember(input: { runId: string; laneId: string; requestId: string; allowance: boolean }): Promise<{ remaining: string[]; resumeAt: string | null }> {
@@ -593,9 +877,6 @@ export class ReliabilityProtocolStore {
       let state=await this.lockControlLane(client,input.runId,input.laneId);
       const hold=await client.query<{ hold_id:string; held_unresolved:string[] }>("SELECT hold_id::text,held_unresolved FROM reliability_protocol_holds WHERE run_id=$1 AND lane_id=$2 AND resolved_at IS NULL FOR UPDATE",[input.runId,input.laneId]);
       if(!hold.rows[0] || !hold.rows[0].held_unresolved.includes(input.requestId)) throw new Error("HELD_MEMBER_NOT_FOUND");
-      const measured=await client.query<{now:Date}>("SELECT clock_timestamp() now");
-      const fifo=heldLaneFifoResolution({members:hold.rows[0].held_unresolved,requestId:input.requestId,transitionCommittedAtMs:measured.rows[0]!.now.getTime()});
-      const remaining=fifo.remaining;
       let globalFailed=false;
       if(input.allowance){
         const control=await client.query<{nonusable_allowance_owner:string|null}>("SELECT nonusable_allowance_owner FROM reliability_protocol_controls WHERE run_id=$1",[input.runId]);
@@ -606,16 +887,9 @@ export class ReliabilityProtocolStore {
           await client.query("UPDATE reliability_protocol_controls SET nonusable_allowance_owner=$2 WHERE run_id=$1",[input.runId,input.requestId]);
         }
       }
-      await client.query("UPDATE reliability_hold_members SET resolved_at=COALESCE(resolved_at,clock_timestamp()) WHERE run_id=$1 AND lane_id=$2 AND hold_id=$3 AND request_id=$4",[input.runId,input.laneId,hold.rows[0].hold_id,input.requestId]);
-      let resumeAt:string|null=null;
-      if(remaining.length===0){
-        const resumed=await client.query<{resume_at:Date}>(`UPDATE reliability_protocol_lanes SET state=CASE WHEN $3='active' THEN 'resume_pending' ELSE 'failed' END,
-          resume_at=CASE WHEN $3='active' THEN to_timestamp($4 / 1000.0) ELSE NULL END
-          WHERE run_id=$1 AND lane_id=$2 RETURNING resume_at`,[input.runId,input.laneId,state,fifo.resumeAtMs]);
-        await client.query("UPDATE reliability_protocol_holds SET held_unresolved='[]'::jsonb,resolved_at=clock_timestamp() WHERE run_id=$1 AND lane_id=$2 AND hold_id=$3",[input.runId,input.laneId,hold.rows[0].hold_id]);
-        resumeAt=resumed.rows[0]?.resume_at?.toISOString()??null;
-      } else await client.query("UPDATE reliability_protocol_holds SET held_unresolved=$4::jsonb WHERE run_id=$1 AND lane_id=$2 AND hold_id=$3",[input.runId,input.laneId,hold.rows[0].hold_id,JSON.stringify(remaining)]);
-      return {remaining,resumeAt,globalFailed};
+      const removed=await this.removeTerminalHeldMemberLocked(client,{runId:input.runId,laneId:input.laneId,requestId:input.requestId,controlState:state});
+      if(!removed)throw new Error("HELD_MEMBER_NOT_FOUND");
+      return {...removed,globalFailed};
     });
     if (result.globalFailed) throw new Error("SECOND_ALLOWANCE_GLOBAL_FAILURE");
     return { remaining: result.remaining, resumeAt: result.resumeAt };
@@ -623,8 +897,8 @@ export class ReliabilityProtocolStore {
 
   async resumeDueLanes(runId: string): Promise<string[]> {
     return this.transaction(async (client) => {
-      const control=await client.query<{state:string}>("SELECT state FROM reliability_protocol_controls WHERE run_id=$1 FOR UPDATE",[runId]);
-      if(control.rows[0]?.state!=="active")return [];
+      const control=await this.lockControlProfile(client,runId);
+      if(control.state!=="active")return [];
       const resumed=await client.query<{lane_id:string}>(`UPDATE reliability_protocol_lanes SET state='ready',resume_at=NULL
         WHERE run_id=$1 AND state='resume_pending' AND resume_at IS NOT NULL AND resume_at<=clock_timestamp()
           AND NOT EXISTS(SELECT 1 FROM reliability_protocol_holds hold WHERE hold.run_id=$1 AND hold.lane_id=reliability_protocol_lanes.lane_id AND hold.resolved_at IS NULL)
@@ -735,8 +1009,8 @@ export class ReliabilityProtocolStore {
   async authorizeReconciliationOffset(input:{runId:string;requestId:string;offsetSeconds:number;credentialId:string;authorizationSha256:string}):Promise<void>{
     if(!/^sha256:[a-f0-9]{64}$/.test(input.authorizationSha256))throw new Error("RECONCILIATION_OFFSET_AUTHORIZATION_INVALID");
     await this.transaction(async client=>{
-      const control=await client.query<{reconciliation_credential_id:string|null}>("SELECT reconciliation_credential_id FROM reliability_protocol_controls WHERE run_id=$1 FOR UPDATE",[input.runId]);
-      if(!control.rows[0]||control.rows[0].reconciliation_credential_id!==input.credentialId)throw new Error("RECONCILIATION_CREDENTIAL_DRIFT");
+      const control=await this.lockControlProfile(client, input.runId);
+      if(control.reconciliation_credential_id!==input.credentialId)throw new Error("RECONCILIATION_CREDENTIAL_DRIFT");
       const updated=await client.query(`UPDATE reliability_reconciliation_attempts SET phase='authorized',credential_id=$4,authorization_sha256=$5,authorized_at=COALESCE(authorized_at,clock_timestamp()),failure_code=NULL
         WHERE run_id=$1 AND request_id=$2 AND offset_seconds=$3 AND phase IN ('scheduled','authorized') AND canceled_at IS NULL
           AND (credential_id IS NULL OR credential_id=$4) AND (authorization_sha256 IS NULL OR authorization_sha256=$5) RETURNING 1`,[input.runId,input.requestId,input.offsetSeconds,input.credentialId,input.authorizationSha256]);
@@ -746,12 +1020,12 @@ export class ReliabilityProtocolStore {
 
   async failReconciliationOffset(input:{runId:string;requestId:string;offsetSeconds:number;failureCode:string}):Promise<void>{
     if(!input.failureCode.trim())throw new Error("RECONCILIATION_FAILURE_CODE_REQUIRED");
-    await this.transaction(async client=>{await client.query(`UPDATE reliability_reconciliation_attempts SET phase='failed',failure_code=$4,lookup_finished_at=COALESCE(lookup_finished_at,clock_timestamp()),finished_at=COALESCE(finished_at,clock_timestamp())
+    await this.transaction(async client=>{await this.lockControlProfile(client,input.runId);await client.query(`UPDATE reliability_reconciliation_attempts SET phase='failed',failure_code=$4,lookup_finished_at=COALESCE(lookup_finished_at,clock_timestamp()),finished_at=COALESCE(finished_at,clock_timestamp())
       WHERE run_id=$1 AND request_id=$2 AND offset_seconds=$3 AND phase NOT IN ('terminal','canceled_terminal')`,[input.runId,input.requestId,input.offsetSeconds,input.failureCode]);});
   }
 
   async finishReconciliationLookup(input:{runId:string;requestId:string;offsetSeconds:number}):Promise<void>{
-    await this.transaction(async client=>{const updated=await client.query(`UPDATE reliability_reconciliation_attempts
+    await this.transaction(async client=>{await this.lockControlProfile(client,input.runId);const updated=await client.query(`UPDATE reliability_reconciliation_attempts
       SET lookup_finished_at=COALESCE(lookup_finished_at,clock_timestamp())
       WHERE run_id=$1 AND request_id=$2 AND offset_seconds=$3 AND phase IN ('running','committed','terminal') RETURNING 1`,
     [input.runId,input.requestId,input.offsetSeconds]);
@@ -762,7 +1036,7 @@ export class ReliabilityProtocolStore {
     const differingFields=setupSnapshotDifferences(input.expectedSnapshot,input.actualSnapshot);
     const snapshotDigest=`sha256:${createHash("sha256").update(JSON.stringify({expected:input.expectedSnapshot,actual:input.actualSnapshot,differingFields})).digest("hex")}`;
     const ready=differingFields.length===0;
-    await this.transaction(async client=>{await client.query(`INSERT INTO reliability_setup_readiness_receipts(run_id,expected_snapshot,actual_snapshot,differing_fields,snapshot_digest,ready)
+    await this.transaction(async client=>{await this.lockControlProfile(client,input.runId);await client.query(`INSERT INTO reliability_setup_readiness_receipts(run_id,expected_snapshot,actual_snapshot,differing_fields,snapshot_digest,ready)
       VALUES($1,$2::jsonb,$3::jsonb,$4::jsonb,$5,$6) ON CONFLICT(run_id) DO UPDATE SET expected_snapshot=EXCLUDED.expected_snapshot,actual_snapshot=EXCLUDED.actual_snapshot,differing_fields=EXCLUDED.differing_fields,snapshot_digest=EXCLUDED.snapshot_digest,ready=EXCLUDED.ready,checked_at=clock_timestamp()`,[input.runId,JSON.stringify(input.expectedSnapshot),JSON.stringify(input.actualSnapshot),JSON.stringify(differingFields),snapshotDigest,ready]);});
     return {ready,differingFields,snapshotDigest};
   }
@@ -783,7 +1057,7 @@ export class ReliabilityProtocolStore {
     const ambiguity = new Date(Date.parse(input.scheduledAt) - input.offsetSeconds * 1_000).toISOString();
     const expected = reconciliationWindow(ambiguity, input.offsetSeconds);
     if (input.scheduledAt !== expected.scheduledAt || input.evidenceCutoff !== expected.evidenceCutoff || input.classificationDeadline !== expected.classificationDeadline) throw new Error("RECONCILIATION_WINDOW_INVALID");
-    await this.transaction(async client=>{await client.query(`INSERT INTO reliability_reconciliation_attempts
+    await this.transaction(async client=>{await this.lockControlProfile(client,input.runId);await client.query(`INSERT INTO reliability_reconciliation_attempts
       (run_id,request_id,offset_seconds,phase,scheduled_at,evidence_cutoff,classification_deadline)
       VALUES($1,$2,$3,'scheduled',$4,$5,$6) ON CONFLICT DO NOTHING`,
     [input.runId,input.requestId,input.offsetSeconds,input.scheduledAt,input.evidenceCutoff,input.classificationDeadline]);});
@@ -791,6 +1065,7 @@ export class ReliabilityProtocolStore {
 
   async commitReconciliationEvidence(input: { runId: string; requestId: string; offsetSeconds: number; metadata: unknown; content: unknown; disposition: string }): Promise<void> {
     await this.transaction(async (client) => {
+      await this.lockControlProfile(client,input.runId);
       const attempt=await client.query("SELECT 1 FROM reliability_reconciliation_attempts WHERE run_id=$1 AND request_id=$2 AND offset_seconds=$3 FOR UPDATE",[input.runId,input.requestId,input.offsetSeconds]);
       if(!attempt.rows[0]) throw new Error("RECONCILIATION_SCHEDULE_REQUIRED");
       await client.query(`INSERT INTO reliability_reconciliation_evidence(run_id,request_id,offset_seconds,metadata,content,disposition)
@@ -824,9 +1099,9 @@ export class ReliabilityProtocolStore {
     evidence: ReconciliationEvidence | null; recoveredResponse?: ProviderResult;
   }): Promise<{ applied: boolean; plan: ReconciliationMutationPlan | null; terminalState: string | null }> {
     return this.transaction(async (client) => {
-      const control = await client.query<{ state:"active"|"failed"; nonusable_allowance_owner:string|null; reconciliation_credential_id:string|null }>(
-        "SELECT state,nonusable_allowance_owner,reconciliation_credential_id FROM reliability_protocol_controls WHERE run_id=$1 FOR UPDATE",[input.runId]);
-      if (!control.rows[0]) throw new Error("PROTOCOL_CONTROL_NOT_FOUND");
+      const lockedControl = await this.lockControlProfile(client, input.runId);
+      if (lockedControl.state === "complete") throw new Error("PROTOCOL_CONTROL_FAILED");
+      const control = { rows: [lockedControl] };
       const lane = await client.query("SELECT state FROM reliability_protocol_lanes WHERE run_id=$1 AND lane_id=$2 FOR UPDATE",[input.runId,input.laneId]);
       if (!lane.rows[0]) throw new Error("PROTOCOL_LANE_NOT_FOUND");
       const row = await client.query<any>(`SELECT attempt.*,sealed.model,sealed.provider,sealed.max_output_tokens,sealed.body_commitment,sealed.request_body,sealed.organization_id,sealed.agent_id,sealed.credential_id,sealed.mandate_id,sealed.branch_id,sealed.workload_class,
@@ -839,7 +1114,7 @@ export class ReliabilityProtocolStore {
       const attempt=row.rows[0]; if(!attempt)throw new Error("AUTHORITATIVE_RECONCILIATION_INPUT_MISSING");
       if(attempt.terminal_at) return {applied:false,plan:null,terminalState:attempt.state};
       if(!control.rows[0].reconciliation_credential_id)throw new Error("RECONCILIATION_CREDENTIAL_AUTHORITY_MISSING");
-      const hold=await client.query<{held_unresolved:string[]}>("SELECT held_unresolved FROM reliability_protocol_holds WHERE run_id=$1 AND lane_id=$2 AND resolved_at IS NULL FOR UPDATE",[input.runId,input.laneId]);
+      const hold=await client.query<{hold_id:string;held_unresolved:string[]}>("SELECT hold_id::text,held_unresolved FROM reliability_protocol_holds WHERE run_id=$1 AND lane_id=$2 AND resolved_at IS NULL FOR UPDATE",[input.runId,input.laneId]);
       const heldMembers=hold.rows[0]?.held_unresolved ?? [input.requestId];
       if(!heldMembers.includes(input.requestId))throw new Error("RECONCILIATION_HOLD_INVARIANT");
       const nowRows=await client.query<{now:Date}>("SELECT clock_timestamp() now"); const now=nowRows.rows[0]!.now.getTime();
@@ -881,7 +1156,8 @@ export class ReliabilityProtocolStore {
         existingResponseCommitment:attempt.response_commitment,recoveredResponseCommitment:recoveredCommitment,
         acceptedBinding:(accepted.rows[0]?.accepted_binding as any)??null,operation,evidence:input.evidence,
         heldMemberState:attempt.state==="reconciliation_pending"?"reconciliation_pending":"ordinary_inflight",
-        heldMembersBefore:heldMembers,nonusableAllowanceOwner:control.rows[0].nonusable_allowance_owner,controlState:control.rows[0].state});
+        heldMembersBefore:heldMembers,nonusableAllowanceOwner:control.rows[0].nonusable_allowance_owner,
+        controlState:control.rows[0].state === "complete" ? "failed" : control.rows[0].state});
       if(plan.persistAttempt && input.evidence){
         const metadata={...input.evidence.metadata}; const content={...input.evidence.content};
         const inserted=await client.query(`INSERT INTO reliability_reconciliation_evidence
@@ -898,11 +1174,9 @@ export class ReliabilityProtocolStore {
       if(plan.attemptState==="enter_ambiguity"){
         await client.query("UPDATE reliability_protocol_attempts SET state='reconciliation_pending',ambiguity_entered_at=COALESCE(ambiguity_entered_at,clock_timestamp()) WHERE run_id=$1 AND request_id=$2",[input.runId,input.requestId]);
         await client.query("UPDATE reliability_protocol_controls SET ambiguity_count=ambiguity_count+1 WHERE run_id=$1",[input.runId]);
-        if(!hold.rows[0]){
-          const members=await client.query<{request_id:string}>(`SELECT request_id FROM reliability_protocol_attempts WHERE run_id=$1 AND lane_id=$2 AND terminal_at IS NULL ORDER BY block_no,request_id`,[input.runId,input.laneId]);
-          await client.query("INSERT INTO reliability_protocol_holds(run_id,lane_id,hold_id,held_unresolved) VALUES($1,$2,$3,$4::jsonb)",[input.runId,input.laneId,randomUUID(),JSON.stringify(members.rows.map(r=>r.request_id))]);
-          await client.query("UPDATE reliability_protocol_lanes SET state='held' WHERE run_id=$1 AND lane_id=$2",[input.runId,input.laneId]);
-        }
+        const entered=await this.enterLaneHoldLocked(client,{runId:input.runId,laneId:input.laneId,requestId:input.requestId});
+        await client.query("UPDATE reliability_hold_members SET member_state='reconciliation_pending' WHERE run_id=$1 AND lane_id=$2 AND hold_id=$3 AND request_id=$4",
+          [input.runId,input.laneId,entered.holdId,input.requestId]);
         const ambiguity=await client.query<{ambiguity_entered_at:Date}>("SELECT ambiguity_entered_at FROM reliability_protocol_attempts WHERE run_id=$1 AND request_id=$2",[input.runId,input.requestId]);
         for(const candidate of RECONCILIATION_OFFSETS_SECONDS){const times=reconciliationWindow(ambiguity.rows[0]!.ambiguity_entered_at.toISOString(),candidate);await client.query(`INSERT INTO reliability_reconciliation_attempts(run_id,request_id,offset_seconds,phase,scheduled_at,evidence_cutoff,classification_deadline) VALUES($1,$2,$3,'scheduled',$4,$5,$6) ON CONFLICT DO NOTHING`,[input.runId,input.requestId,candidate,times.scheduledAt,times.evidenceCutoff,times.classificationDeadline]);}
       }
@@ -921,13 +1195,9 @@ export class ReliabilityProtocolStore {
           const allowance=await client.query("UPDATE reliability_protocol_controls SET nonusable_allowance_owner=$2 WHERE run_id=$1 AND nonusable_allowance_owner IS NULL RETURNING run_id",[input.runId,input.requestId]);
           if(!allowance.rows[0])throw new Error("NONUSABLE_ALLOWANCE_RACE");
         }
-        const remaining=heldMembers.filter(id=>id!==input.requestId);
-        if(hold.rows[0]){
-          if(remaining.length)await client.query("UPDATE reliability_protocol_holds SET held_unresolved=$3::jsonb WHERE run_id=$1 AND lane_id=$2 AND resolved_at IS NULL",[input.runId,input.laneId,JSON.stringify(remaining)]);
-          else await client.query("UPDATE reliability_protocol_holds SET held_unresolved='[]'::jsonb,resolved_at=clock_timestamp() WHERE run_id=$1 AND lane_id=$2 AND resolved_at IS NULL",[input.runId,input.laneId]);
-        }
+        const removed=await this.removeTerminalHeldMemberLocked(client,{runId:input.runId,laneId:input.laneId,requestId:input.requestId,controlState:control.rows[0].state});
+        if(hold.rows[0]&&!removed)throw new Error("HELD_MEMBER_NOT_FOUND");
         for(const canceled of plan.cancelOffsets)await client.query("UPDATE reliability_reconciliation_attempts SET phase='canceled_terminal',canceled_at=COALESCE(canceled_at,clock_timestamp()) WHERE run_id=$1 AND request_id=$2 AND offset_seconds=$3 AND phase='scheduled'",[input.runId,input.requestId,canceled.offsetSeconds]);
-        if(plan.lane.action==="schedule_resume")await client.query("UPDATE reliability_protocol_lanes SET state='resume_pending',resume_at=to_timestamp($3) WHERE run_id=$1 AND lane_id=$2",[input.runId,input.laneId,plan.lane.resumeAtEpochSecond]);
       }
       for(const event of plan.events)await this.appendEvent(client,input.runId,input.requestId,event.type,event.data);
       if(plan.globalFailure.trigger)await this.failProtocolLocked(client,input.runId,plan.globalFailure.reason);
@@ -988,10 +1258,32 @@ export class ReliabilityProtocolStore {
       FROM reliability_protocol_lanes WHERE run_id=$1 ORDER BY lane_id`);
     const blockClaims=await q(`SELECT block_no::int block,lane_id lane,state,owner_id "ownerId",plan_fingerprint "planFingerprint",
       (extract(epoch FROM claimed_at)*1000)::float8 "claimedAtMs" FROM reliability_block_claims WHERE run_id=$1 ORDER BY block_no`);
-    const authorizationDecisions=await q(`SELECT verdict->>'operatorValid'='true' "operatorValid",
-      verdict->>'reconciliationValid'='true' "reconciliationValid",
-      (verdict->>'operatorValid'='true' AND verdict->>'reconciliationValid'='true') active,
-      decision_id::text "decisionId",operator_nonce "operatorNonce" FROM reliability_authorization_decisions WHERE run_id=$1`);
+    const laneBacklog=await q(`SELECT request_id "requestId",lane_id lane,block_no::int block,call_ordinal::int "callOrdinal",state,
+      CASE WHEN actual_scheduled_at IS NULL THEN NULL ELSE (extract(epoch FROM actual_scheduled_at)*1000)::float8 END "actualScheduledAtMs"
+      FROM reliability_lane_backlog WHERE run_id=$1 ORDER BY block_no,lane_id,call_ordinal`);
+    const authorizationDecisionRows=await q(`SELECT decision.verdict->>'operatorValid'='true' "operatorValid",
+      decision.verdict->>'reconciliationValid'='true' "reconciliationValid",
+      (decision.verdict->>'operatorValid'='true' AND decision.verdict->>'reconciliationValid'='true') active,
+      decision.decision_id::text "decisionId",decision.operator_nonce "operatorNonce",control.protocol_version "protocolVersion",
+      control.plan_fingerprint "planFingerprint",control.profile_fingerprint "profileFingerprint",
+      operator.receipt "operatorReceipt",reconciliation.receipt "reconciliationReceipt"
+      FROM reliability_authorization_decisions decision
+      JOIN reliability_protocol_controls control ON control.run_id=decision.run_id
+      LEFT JOIN reliability_authorization_outbox operator ON operator.run_id=decision.run_id AND operator.receipt_kind='operator'
+      LEFT JOIN reliability_authorization_outbox reconciliation ON reconciliation.run_id=decision.run_id AND reconciliation.receipt_kind='reconciliation'
+      WHERE decision.run_id=$1`);
+    const authorizationDecisions=authorizationDecisionRows.map(row=>{
+      if(Number(row.protocolVersion)!==3)return {...row,decisionIdValid:row.decisionId===deterministicAuthorizationDecisionId(runId)};
+      const operator=row.operatorReceipt as Record<string,unknown>|null;
+      const reconciliation=row.reconciliationReceipt as Record<string,unknown>|null;
+      const reasonCode=String(operator?.["reasonCode"]??"");
+      const decisionIdValid=!!operator&&!!reconciliation&&reasonCode===String(reconciliation["reasonCode"]??"")
+        &&row.decisionId===deterministicAuthorizationDecisionId({runId,planFingerprint:String(row.planFingerprint),profileFingerprint:String(row.profileFingerprint),
+          decisionKind:row.active?"active":"readiness_failed",reasonCode,
+          operatorArtifactSha256:String(operator["presentedArtifactSha256"]??"absent") as `sha256:${string}`|"absent",
+          reconciliationArtifactSha256:String(reconciliation["presentedArtifactSha256"]??"absent") as `sha256:${string}`|"absent"});
+      return {...row,decisionIdValid};
+    });
     const authorizationOutbox=await q(`SELECT receipt_kind kind,published_at IS NOT NULL published,receipt
       FROM reliability_authorization_outbox WHERE run_id=$1 ORDER BY receipt_kind`);
     const reconciliationAttempts=await q(`SELECT request_id "requestId",offset_seconds::int "offsetSeconds",phase,
@@ -1013,7 +1305,7 @@ export class ReliabilityProtocolStore {
       FROM reliability_protocol_attempts WHERE run_id=$1`);
     const artifactBindings=await q(`SELECT path,digest FROM reliability_artifact_bindings WHERE run_id=$1 ORDER BY path`);
     return {sealedCalls,attempts,executions,decisions,dispatchTokens,shadowQueue,shadowEvidence,replayAudits,lifecycleEvents,
-      replayCancellations,protocolControls,protocolLanes,blockClaims,authorizationDecisions,authorizationOutbox,
+      replayCancellations,protocolControls,protocolLanes,blockClaims,laneBacklog,authorizationDecisions,authorizationOutbox,
       reconciliationAttempts,reconciliationEvidence,holds,incidents,schedulerClaims,costRows,artifactBindings};
   }
 
@@ -1043,18 +1335,26 @@ export class ReliabilityProtocolStore {
     return rows.rows;
   }
 
+  async loadSchedulerManifestBindings(runId:string):Promise<SchedulerManifestBindingRow[]>{
+    const control=await this.database.query<{durable_stage:string;state:string}>("SELECT durable_stage,state FROM reliability_protocol_controls WHERE run_id=$1",[runId]);
+    if(control.rows[0]?.durable_stage!=="replay_terminal"||control.rows[0]?.state!=="active")throw new Error("SCHEDULER_MANIFEST_BINDING_STAGE_INVALID");
+    const claims=await this.database.query<{request_id:string;lane_id:string;block_no:number;generation:number;state:string;manifest_path:string|null;manifest_digest:string|null;manifest_fsynced:boolean}>(`SELECT request_id,lane_id,block_no,generation,state,manifest_path,manifest_digest,
+      manifest_fsynced_at IS NOT NULL manifest_fsynced FROM reliability_scheduler_claims WHERE run_id=$1 ORDER BY request_id`,[runId]);
+    return claims.rows.map(row=>({requestId:row.request_id,lane:row.lane_id as SchedulerManifestBindingRow["lane"],block:row.block_no,generation:row.generation,
+      state:row.state,manifestPath:row.manifest_path??"",manifestDigest:row.manifest_digest,manifestFsynced:row.manifest_fsynced}));
+  }
+
   async advanceDurableStage(runId: string, target: Exclude<DurableReliabilityStage,"running">): Promise<DurableReliabilityStage> {
     return this.transaction(async client => {
-      const control = await client.query<{durable_stage:DurableReliabilityStage;state:string}>(
-        "SELECT durable_stage,state FROM reliability_protocol_controls WHERE run_id=$1 FOR UPDATE",[runId]);
-      if(!control.rows[0] || control.rows[0].state==="failed")throw new Error("PROTOCOL_CONTROL_FAILED");
+      const control = await this.lockControlProfile(client, runId);
+      if(control.state==="failed")throw new Error("PROTOCOL_CONTROL_FAILED");
       const counts=await client.query<{terminal_fresh:string;open_holds:string;replay_audits:string;settlement_passed:boolean}>(`SELECT
         (SELECT count(*)::text FROM reliability_protocol_attempts WHERE run_id=$1 AND terminal_at IS NOT NULL) terminal_fresh,
         (SELECT count(*)::text FROM reliability_protocol_holds WHERE run_id=$1 AND resolved_at IS NULL) open_holds,
         (SELECT count(*)::text FROM reliability_replay_audits WHERE run_id=$1) replay_audits,
         EXISTS(SELECT 1 FROM reliability_settlement_final_snapshots WHERE run_id=$1 AND passed=true) settlement_passed`,[runId]);
       const count=counts.rows[0]!;
-      const next=planDurableStageTransition({stage:control.rows[0].durable_stage,terminalFresh:Number(count.terminal_fresh),
+      const next=planDurableStageTransition({stage:control.durable_stage,terminalFresh:Number(count.terminal_fresh),
         openHolds:Number(count.open_holds),replayAudits:Number(count.replay_audits),artifactsBound:target==="artifact_bound",settlementPassed:count.settlement_passed},target);
       await client.query("UPDATE reliability_protocol_controls SET durable_stage=$2 WHERE run_id=$1",[runId,next]);
       return next;
@@ -1065,8 +1365,19 @@ export class ReliabilityProtocolStore {
     const entries=Object.entries(artifactDigests).sort(([a],[b])=>a.localeCompare(b));
     if(!entries.length||entries.some(([path,digest])=>!path||!/^sha256:[a-f0-9]{64}$/.test(digest)))throw new Error("ARTIFACT_BINDING_INVALID");
     await this.transaction(async client=>{
-      const control=await client.query<{durable_stage:string}>("SELECT durable_stage FROM reliability_protocol_controls WHERE run_id=$1 FOR UPDATE",[runId]);
-      if(!control.rows[0]||control.rows[0].durable_stage!=="replay_terminal")throw new Error("ARTIFACT_BINDING_STAGE_INVALID");
+      const control=await this.lockControlProfile(client, runId);
+      if(control.durable_stage!=="replay_terminal")throw new Error("ARTIFACT_BINDING_STAGE_INVALID");
+      if(control.protocol_version===3){
+        const scheduler=await client.query<{request_id:string;state:string;manifest_path:string|null;manifest_digest:string|null;manifest_fsynced:boolean}>(`SELECT request_id,state,manifest_path,manifest_digest,
+          manifest_fsynced_at IS NOT NULL manifest_fsynced FROM reliability_scheduler_claims WHERE run_id=$1 ORDER BY request_id`,[runId]);
+        const sealed=await client.query<{count:string}>("SELECT count(*)::text count FROM reliability_sealed_calls WHERE run_id=$1",[runId]);
+        if(scheduler.rows.length!==Number(sealed.rows[0]?.count??-1))throw new Error("SCHEDULER_MANIFEST_INVENTORY_INCOMPLETE");
+        const supplied=new Map(entries);
+        for(const claim of scheduler.rows){
+          if(claim.state!=="terminal"||!claim.manifest_fsynced||!claim.manifest_path||!claim.manifest_digest
+            ||supplied.get(claim.manifest_path)!==claim.manifest_digest)throw new Error(`SCHEDULER_MANIFEST_NOT_BOUND:${claim.request_id}`);
+        }
+      }
       for(const [path,digest] of entries){
         await client.query("INSERT INTO reliability_artifact_bindings(run_id,path,digest) VALUES($1,$2,$3) ON CONFLICT DO NOTHING",[runId,path,digest]);
         const exact=await client.query("SELECT 1 FROM reliability_artifact_bindings WHERE run_id=$1 AND path=$2 AND digest=$3",[runId,path,digest]);
@@ -1084,8 +1395,9 @@ export class ReliabilityProtocolStore {
     const reportBytes=`${JSON.stringify(input.marker)}\n`;
     const reportDigest=`sha256:${createHash("sha256").update(reportBytes).digest("hex")}`;
     await this.transaction(async client=>{
-      const control=await client.query<{durable_stage:DurableReliabilityStage}>("SELECT durable_stage FROM reliability_protocol_controls WHERE run_id=$1 FOR UPDATE",[input.runId]);
-      if(control.rows[0]?.durable_stage!=="settled")throw new Error("SETTLEMENT_REQUIRED_BEFORE_FINAL_COMMIT");
+      const control=await this.lockControlProfile(client, input.runId);
+      if(control.protocol_version===3)throw new Error("V3_SEQUENCED_REPORT_INTENT_REQUIRED");
+      if(control.durable_stage!=="settled")throw new Error("SETTLEMENT_REQUIRED_BEFORE_FINAL_COMMIT");
       const settled=await client.query("SELECT 1 FROM reliability_settlement_final_snapshots WHERE run_id=$1 AND passed=true AND snapshot_digest=$2",[input.runId,input.marker.settlement.acceptedSnapshotDigest]);
       if(!settled.rows[0])throw new Error("FINAL_COMMIT_SETTLEMENT_CONFLICT");
       await client.query(`INSERT INTO reliability_final_report_outbox(run_id,canonical_path,report_bytes,report_digest)
@@ -1096,21 +1408,121 @@ export class ReliabilityProtocolStore {
   }
 
   async publishPendingCanonicalFinalReport(runId:string,publish:(path:string,bytes:string)=>Promise<void>):Promise<{published:boolean;path:string|null}>{
+    await this.transaction(async client=>{ const control=await this.lockControlProfile(client,runId);if(control.protocol_version===3)throw new Error("V3_SEQUENCED_REPORT_INTENT_REQUIRED"); });
     const pending=await this.database.query<{canonical_path:string;report_bytes:string}>(
       "SELECT canonical_path,report_bytes FROM reliability_final_report_outbox WHERE run_id=$1",[runId]);
     const row=pending.rows[0];if(!row)return {published:false,path:null};
     if(row.canonical_path!==canonicalFinalCommitPath(runId))throw new Error("FINAL_COMMIT_PATH_CONFLICT");
     await publish(row.canonical_path,row.report_bytes);
     await this.transaction(async client=>{
-      const control=await client.query<{durable_stage:DurableReliabilityStage}>("SELECT durable_stage FROM reliability_protocol_controls WHERE run_id=$1 FOR UPDATE",[runId]);
-      if(control.rows[0]?.durable_stage!=="settled"&&control.rows[0]?.durable_stage!=="final_committed")throw new Error("SETTLEMENT_REQUIRED_BEFORE_FINAL_COMMIT");
+      const control=await this.lockControlProfile(client,runId);
+      if(control.durable_stage!=="settled"&&control.durable_stage!=="final_committed")throw new Error("SETTLEMENT_REQUIRED_BEFORE_FINAL_COMMIT");
       await client.query("UPDATE reliability_final_report_outbox SET published_at=COALESCE(published_at,clock_timestamp()) WHERE run_id=$1",[runId]);
       await client.query("UPDATE reliability_protocol_controls SET durable_stage='final_committed',state='complete' WHERE run_id=$1",[runId]);
     });
     return {published:true,path:row.canonical_path};
   }
 
+  async publishPendingReportIntent(runId:string,publish:(path:string,bytes:string)=>Promise<void>):Promise<{published:boolean;path:string|null;intentSequence:number|null;report:unknown|null}>{
+    const pending=await this.transaction(async client=>{
+      await this.lockControlProfile(client,runId);
+      const current=await client.query<{intent_sequence:string;report_kind:"pass"|"failure";destination:string;report_sha256:string;
+        report_bytes_base64:string;intent_path:string;intent_sha256:string;intent_bytes_base64:string;
+        publication_deadline:Date;state:string;receipt_sequence:string|null}>(
+        `SELECT outbox.intent_sequence::text,outbox.report_kind,outbox.destination,outbox.report_sha256,outbox.report_bytes_base64,
+         outbox.intent_path,outbox.intent_sha256,outbox.intent_bytes_base64,outbox.publication_deadline,outbox.state,
+         receipt.intent_sequence::text receipt_sequence
+         FROM reliability_report_publication_outbox outbox
+         LEFT JOIN reliability_report_publication_receipts receipt ON receipt.run_id=outbox.run_id AND receipt.intent_sequence=outbox.intent_sequence
+         WHERE outbox.run_id=$1 ORDER BY outbox.intent_sequence DESC LIMIT 1 FOR UPDATE OF outbox`,[runId]);
+      const row=current.rows[0];if(!row||row.receipt_sequence!==null)return null;
+      if(row.state==="superseded"||row.state==="published"||row.state==="artifact_conflict")throw new Error("REPORT_PUBLICATION_STATE_INVALID");
+      const now=await client.query<{now:Date}>("SELECT clock_timestamp() now");
+      const disposition=reportPublicationDeadlineDisposition({reportKind:row.report_kind,databaseNowMs:now.rows[0]!.now.getTime(),deadlineMs:row.publication_deadline.getTime()});
+      if(disposition!=="on_time"&&row.state!=="publication_failed")
+        await this.appendReportPublicationEventLocked(client,runId,Number(row.intent_sequence),"publication_failed",
+          {reasonCode:row.report_kind==="pass"?"PASS_PUBLICATION_DEADLINE_MISSED":"FAILURE_PUBLICATION_DEADLINE_MISSED"},["committed"],now.rows[0]!.now);
+      if(disposition==="supersede_pass"){
+        const incidentSequence=await this.appendIncident(client,runId,"pass_publication_deadline_missed",{intentSequence:Number(row.intent_sequence)});
+        await this.commitReportIntentLocked(client,{runId,reportKind:"failure",reasonCode:"PASS_PUBLICATION_DEADLINE_MISSED",incidentSequence,
+          acceptedSnapshotSha256:null});
+        return null;
+      }
+      return {...row,lateAtStart:disposition==="late_failure"};
+    });
+    if(!pending)return {published:false,path:null,intentSequence:null,report:null};
+    const bytes=Buffer.from(pending.report_bytes_base64,"base64").toString("utf8");
+    const intentBytes=Buffer.from(pending.intent_bytes_base64,"base64").toString("utf8");
+    if(`sha256:${createHash("sha256").update(bytes).digest("hex")}`!==pending.report_sha256)throw new Error("REPORT_INTENT_BYTES_INVALID");
+    if(`sha256:${createHash("sha256").update(intentBytes).digest("hex")}`!==pending.intent_sha256)throw new Error("REPORT_PUBLICATION_INTENT_BYTES_INVALID");
+    if(pending.destination!==canonicalFinalCommitPath(runId))throw new Error("REPORT_INTENT_DESTINATION_INVALID");
+    if(pending.intent_path!==`evidence/${reliabilityArtifactNamespace(runId).evidenceType}/publication-intents/reports/${runId}.json`)
+      throw new Error("REPORT_PUBLICATION_INTENT_DESTINATION_INVALID");
+    try{
+      await publish(pending.intent_path,intentBytes);
+      await publish(pending.destination,bytes);
+    }catch(error){
+      if(!(error instanceof Error)||error.message!=="ARTIFACT_CONFLICT")throw error;
+      await this.transaction(async client=>{
+        await this.lockControlProfile(client,runId);
+        const latest=await client.query<{intent_sequence:string;state:string;report_kind:"pass"|"failure"}>(
+          "SELECT intent_sequence::text,state,report_kind FROM reliability_report_publication_outbox WHERE run_id=$1 ORDER BY intent_sequence DESC LIMIT 1 FOR UPDATE",[runId]);
+        const row=latest.rows[0];
+        if(!row||Number(row.intent_sequence)!==Number(pending.intent_sequence))throw new Error("REPORT_PUBLICATION_AUTHORITY_REVOKED");
+        if(row.state!=="artifact_conflict")await this.appendReportPublicationEventLocked(client,runId,Number(row.intent_sequence),"artifact_conflict",
+          {intentPath:pending.intent_path,destination:pending.destination},["committed","publication_failed"]);
+        const incidentSequence=await this.appendIncident(client,runId,"report_artifact_conflict",{intentSequence:Number(row.intent_sequence)});
+        if(row.report_kind==="pass")await this.commitReportIntentLocked(client,{runId,reportKind:"failure",reasonCode:"REPORT_ARTIFACT_CONFLICT",
+          incidentSequence,acceptedSnapshotSha256:null});
+      });
+      throw error;
+    }
+    const outcome=await this.transaction(async client=>{
+      await this.lockControlProfile(client,runId);
+      const latest=await client.query<{intent_sequence:string;report_kind:"pass"|"failure";destination:string;report_sha256:string;
+        intent_path:string;intent_sha256:string;publication_deadline:Date;state:string}>(`SELECT intent_sequence::text,report_kind,destination,
+        report_sha256,intent_path,intent_sha256,publication_deadline,state
+        FROM reliability_report_publication_outbox WHERE run_id=$1 ORDER BY intent_sequence DESC LIMIT 1 FOR UPDATE`,[runId]);
+      const row=latest.rows[0];
+      if(!row||Number(row.intent_sequence)!==Number(pending.intent_sequence)||row.destination!==pending.destination||row.report_sha256!==pending.report_sha256
+        ||row.intent_path!==pending.intent_path||row.intent_sha256!==pending.intent_sha256)
+        throw new Error("REPORT_PUBLICATION_AUTHORITY_REVOKED_AFTER_WRITE");
+      const clock=await client.query<{now:Date}>("SELECT clock_timestamp() now");
+      const receipt=await client.query(`INSERT INTO reliability_report_publication_receipts
+        (run_id,intent_sequence,destination,report_sha256,intent_path,intent_sha256,filesystem_completed_at)
+        VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING RETURNING 1`,[runId,Number(pending.intent_sequence),pending.destination,
+        pending.report_sha256,pending.intent_path,pending.intent_sha256,clock.rows[0]!.now]);
+      if(!receipt.rows[0]){
+        const exact=await client.query(`SELECT 1 FROM reliability_report_publication_receipts WHERE run_id=$1 AND intent_sequence=$2
+          AND destination=$3 AND report_sha256=$4 AND intent_path=$5 AND intent_sha256=$6`,
+          [runId,Number(pending.intent_sequence),pending.destination,pending.report_sha256,pending.intent_path,pending.intent_sha256]);
+        if(!exact.rows[0])throw new Error("REPORT_PUBLICATION_RECEIPT_CONFLICT");
+        return {late:false};
+      }
+      const disposition=reportPublicationDeadlineDisposition({reportKind:row.report_kind,databaseNowMs:clock.rows[0]!.now.getTime(),deadlineMs:row.publication_deadline.getTime()});
+      if(disposition==="on_time"){
+        await this.appendReportPublicationEventLocked(client,runId,Number(row.intent_sequence),"published",{reportSha256:row.report_sha256},["committed"]);
+        if(row.report_kind==="pass"){
+          const completed=await client.query(`UPDATE reliability_protocol_controls SET durable_stage='final_committed',state='complete'
+            WHERE run_id=$1 AND durable_stage='settled' AND state='active' RETURNING 1`,[runId]);
+          if(!completed.rows[0])throw new Error("SETTLEMENT_REQUIRED_BEFORE_FINAL_COMMIT");
+        }
+        return {late:false};
+      }
+      if(!pending.lateAtStart)await this.appendReportPublicationEventLocked(client,runId,Number(row.intent_sequence),"publication_failed",
+        {reasonCode:row.report_kind==="pass"?"PASS_PUBLICATION_DEADLINE_MISSED_AFTER_WRITE":"FAILURE_PUBLICATION_DEADLINE_MISSED_AFTER_WRITE"},["committed","publication_failed"]);
+      if(disposition==="supersede_pass"){
+        const incidentSequence=await this.appendIncident(client,runId,"pass_publication_deadline_missed_after_write",{intentSequence:Number(row.intent_sequence)});
+        await this.commitReportIntentLocked(client,{runId,reportKind:"failure",reasonCode:"PASS_PUBLICATION_DEADLINE_MISSED",incidentSequence,acceptedSnapshotSha256:null});
+      }
+      return {late:true};
+    });
+    if(outcome.late)throw new Error("REPORT_PUBLICATION_DEADLINE_MISSED_AFTER_WRITE");
+    return {published:true,path:pending.destination,intentSequence:Number(pending.intent_sequence),report:JSON.parse(bytes)};
+  }
+
   async publishPendingFailureReport(runId:string,publish:(path:string,value:unknown)=>Promise<void>):Promise<{published:boolean;paths:string[]}>{
+    await this.transaction(async client=>{ await this.lockControlProfile(client,runId); });
     const pending=await this.database.query<{publication_items:Array<{path:string;bytes:string;digest:string}>;published_at:Date|null}>(`SELECT publication_items,published_at
       FROM reliability_failure_report_outbox WHERE run_id=$1`,[runId]);
     const row=pending.rows[0];if(!row)return {published:false,paths:[]};
@@ -1121,15 +1533,14 @@ export class ReliabilityProtocolStore {
         ||`sha256:${createHash("sha256").update(item.bytes).digest("hex")}`!==item.digest)throw new Error("FAILURE_PUBLICATION_ITEM_INVALID");
       await publish(item.path,item.bytes);paths.push(item.path);
     }
-    await this.transaction(async client=>{const updated=await client.query("UPDATE reliability_failure_report_outbox SET published_at=COALESCE(published_at,clock_timestamp()) WHERE run_id=$1 RETURNING 1",[runId]);if(!updated.rows[0])throw new Error("FAILURE_REPORT_OUTBOX_LOST");});
+    await this.transaction(async client=>{await this.lockControlProfile(client,runId);const updated=await client.query("UPDATE reliability_failure_report_outbox SET published_at=COALESCE(published_at,clock_timestamp()) WHERE run_id=$1 RETURNING 1",[runId]);if(!updated.rows[0])throw new Error("FAILURE_REPORT_OUTBOX_LOST");});
     return {published:true,paths};
   }
 
   async hardFinalizeReliabilityRun(input:{runId:string;deadlineMs:number;replayTargetRequestIds?:readonly string[]}):Promise<HardFinalizationPlan>{
     return this.transaction(async client=>{
-      const control=await client.query<{state:"active"|"failed"|"complete";plan_fingerprint:string}>(
-        "SELECT state,plan_fingerprint FROM reliability_protocol_controls WHERE run_id=$1 FOR UPDATE",[input.runId]);
-      if(!control.rows[0])throw new Error("PROTOCOL_CONTROL_NOT_FOUND");
+      const lockedControl=await this.lockControlProfile(client, input.runId);
+      const control={rows:[lockedControl]};
       const attempts=await client.query<{request_id:string;admission_started:boolean;dispatch_token:boolean;primitive_entered:boolean}>(`SELECT attempt.request_id,
         attempt.admission_started_at IS NOT NULL admission_started, token.request_id IS NOT NULL dispatch_token,
         token.primitive_entered_at IS NOT NULL primitive_entered FROM reliability_protocol_attempts attempt
@@ -1169,27 +1580,32 @@ export class ReliabilityProtocolStore {
       const sequence=await this.appendIncident(client,input.runId,plan.incident.eventType,{requestIds:plan.terminalize,deadlineMs:input.deadlineMs});
       const reportIntent={kind:"create_only_failure_report",runId:input.runId,reason:plan.transition.reason,
         incidentSequence:sequence,publishByMs:plan.reportPublicationDeadlineMs};
-      const common={evidenceType:"held-out-reliability",protocolVersion:2,runId:input.runId,planFingerprint:control.rows[0]!.plan_fingerprint};
+      const namespace=reliabilityArtifactNamespace(input.runId);
+      const common={evidenceType:namespace.evidenceType,protocolVersion:namespace.protocolVersion,runId:input.runId,planFingerprint:control.rows[0]!.plan_fingerprint};
       const values:Array<{path:string;value:Record<string,unknown>}>=[];
       for(const lane of ["normal-paced","high-envelope","bounded-burst","restart-resume"]){
-        values.push({path:`evidence/.run-claims/held-out-reliability/${input.runId}/${lane}.claim`,value:{...common,artifactKind:"lane_claim",lane,state:"canceled",reason:plan.transition.reason}});
-        for(let block=1;block<=5;block++)values.push({path:`evidence/held-out-reliability/manifests/${input.runId}/${lane}-${block}.json`,value:{...common,artifactKind:"manifest",lane,block,state:"canceled",reason:plan.transition.reason}});
+        values.push({path:`evidence/.run-claims/${namespace.evidenceType}/${input.runId}/${lane}.claim`,value:{...common,artifactKind:"lane_claim",lane,state:"canceled",reason:plan.transition.reason}});
+        for(let block=1;block<=5;block++)values.push({path:`${namespace.root}/manifests/${input.runId}/${lane}-${block}.json`,value:{...common,artifactKind:"manifest",lane,block,state:"canceled",reason:plan.transition.reason}});
       }
-      values.push({path:`evidence/held-out-reliability/incidents/${input.runId}/${sequence}-hard_finalization_deadline.json`,value:{...common,artifactKind:"incident",sequence,eventType:"hard_finalization_deadline",state:"failed"}});
-      values.push({path:canonicalFinalCommitPath(input.runId),value:{...common,artifactKind:"final_commit",state:"canceled",passed:false,reason:plan.transition.reason,incidentSequence:sequence}});
+      values.push({path:`${namespace.root}/incidents/${input.runId}/${sequence}-hard_finalization_deadline.json`,value:{...common,artifactKind:"incident",sequence,eventType:"hard_finalization_deadline",state:"failed"}});
       const publicationItems=values.map(item=>{const bytes=`${JSON.stringify(item.value)}\n`;return {path:item.path,bytes,digest:`sha256:${createHash("sha256").update(bytes).digest("hex")}`};});
       await client.query(`INSERT INTO reliability_failure_report_outbox(run_id,report_intent,publication_items,publish_by) VALUES($1,$2::jsonb,$3::jsonb,to_timestamp($4/1000.0))
         ON CONFLICT(run_id) DO NOTHING`,[input.runId,JSON.stringify(reportIntent),JSON.stringify(publicationItems),plan.reportPublicationDeadlineMs]);
       const exact=await client.query("SELECT 1 FROM reliability_failure_report_outbox WHERE run_id=$1 AND report_intent=$2::jsonb AND publication_items=$3::jsonb AND publish_by=to_timestamp($4/1000.0)",[input.runId,JSON.stringify(reportIntent),JSON.stringify(publicationItems),plan.reportPublicationDeadlineMs]);
       if(!exact.rows[0])throw new Error("IMMUTABLE_FAILURE_PUBLICATION_CONFLICT");
+      await this.commitReportIntentLocked(client,{runId:input.runId,reportKind:"failure",reasonCode:plan.transition.reason,
+        incidentSequence:sequence,acceptedSnapshotSha256:null,publicationDeadline:new Date(plan.reportPublicationDeadlineMs)});
       return plan;
     });
   }
 
-  async runAndPersistAuthoritativeSettlement(runId: string): Promise<AuthoritativeSettlementResult> {
-    const gate=await this.database.query<{durable_stage:DurableReliabilityStage;state:string}>(
-      "SELECT durable_stage,state FROM reliability_protocol_controls WHERE run_id=$1",[runId]);
-    if(gate.rows[0]?.durable_stage!=="artifact_bound"||gate.rows[0]?.state!=="active")throw new Error("ARTIFACT_BINDING_REQUIRED_BEFORE_SETTLEMENT");
+  async runAndPersistAuthoritativeSettlement(runId: string,
+    buildAuthority?: (result:AuthoritativeSettlementResult)=>Promise<SettlementReportAuthority>): Promise<AuthoritativeSettlementResult> {
+    const settlementGate=await this.transaction(async client=>{
+      const gate=await this.lockControlProfile(client,runId);
+      if(gate.durable_stage!=="artifact_bound"||gate.state!=="active")throw new Error("ARTIFACT_BINDING_REQUIRED_BEFORE_SETTLEMENT");
+      return gate;
+    });
     const started=await this.database.query<{now:Date}>("SELECT clock_timestamp() now");
     const startMs=started.rows[0]!.now.getTime();
     const result=await runAuthoritativeSettlement({runId,primitives:{
@@ -1206,17 +1622,47 @@ export class ReliabilityProtocolStore {
       return {complete:evaluateSettlementSnapshotCompleteness({rows,replayTargetRequestIds}).complete,
         rows:rows as unknown as Readonly<Record<string,readonly unknown[]>>};
     }});
+    const authority=result.passed&&settlementGate.protocol_version===3?(buildAuthority?await buildAuthority(result):null):null;
+    if(result.passed&&settlementGate.protocol_version===3&&!authority)throw new Error("STRICT_REPORT_AUTHORITY_REQUIRED");
+    const authoritativePass=result.passed&&(settlementGate.protocol_version!==3||authority?.marker.passed===true);
     await this.transaction(async client=>{
-      await client.query("SELECT state FROM reliability_protocol_controls WHERE run_id=$1 FOR UPDATE",[runId]);
+      const gate=await this.lockControlProfile(client,runId);
+      if(gate.durable_stage!=="artifact_bound"||gate.state!=="active")throw new Error("ARTIFACT_BINDING_REQUIRED_BEFORE_SETTLEMENT");
+      if(authority){
+        const marker=authority.marker;
+        const bindings=await client.query<{path:string;digest:string}>("SELECT path,digest FROM reliability_artifact_bindings WHERE run_id=$1 ORDER BY path",[runId]);
+        const expectedDigests=Object.fromEntries(bindings.rows.map(row=>[row.path,row.digest]));
+        if(marker.evidenceType!==gate.evidence_type||marker.protocolVersion!==gate.protocol_version||marker.artifactKind!=="final_commit"
+          ||marker.state!=="committed"||marker.runId!==runId||marker.planFingerprint!==gate.plan_fingerprint
+          ||marker.settlement.acceptedSnapshotDigest!==result.finalSnapshot.digest
+          ||marker.settlement.journalCardinality!==result.finalSnapshot.journalCardinality
+          ||canonicalJson(marker.artifactDigests)!==canonicalJson(expectedDigests)
+          ||!/^sha256:[a-f0-9]{64}$/.test(marker.authoritativeInventoryDigest))throw new Error("STRICT_REPORT_AUTHORITY_INVALID");
+      }
       for(const entry of result.journal)await client.query(`INSERT INTO reliability_settlement_journal(run_id,poll_no,offset_seconds,snapshot_digest,complete,scheduled_at,started_at,query_finished_at,deadline_eligible,row_cardinality,error_code)
         VALUES($1,$2,$3,$4,$5,to_timestamp($6/1000.0),COALESCE(to_timestamp($7/1000.0),clock_timestamp()),to_timestamp($8/1000.0),$9,$10,$11) ON CONFLICT(run_id,poll_no) DO UPDATE SET snapshot_digest=EXCLUDED.snapshot_digest WHERE reliability_settlement_journal.snapshot_digest IS NOT DISTINCT FROM EXCLUDED.snapshot_digest`,
       [runId,entry.pollNo,entry.offsetSeconds,entry.snapshotDigest,entry.complete,entry.scheduledAtMs,entry.databaseStartedAtMs,entry.queryFinishedAtMs,entry.deadlineEligible,entry.rowCardinality,entry.errorCode]);
       await client.query(`INSERT INTO reliability_settlement_final_snapshots(run_id,snapshot_digest,journal_cardinality,accepted_offset_seconds,row_cardinality,passed,accepted_database_started_at,snapshot_rows)
-        VALUES($1,$2,$3,$4,$5,$6,to_timestamp($7/1000.0),$8::jsonb) ON CONFLICT(run_id) DO NOTHING`,[runId,result.finalSnapshot.digest,result.finalSnapshot.journalCardinality,result.acceptedOffsetSeconds,result.finalSnapshot.rowCardinality,result.passed,result.acceptedSnapshot?.databaseStartedAtMs??null,result.acceptedSnapshot?JSON.stringify(result.acceptedSnapshot.rows):null]);
-      const exact=await client.query("SELECT 1 FROM reliability_settlement_final_snapshots WHERE run_id=$1 AND snapshot_digest IS NOT DISTINCT FROM $2 AND journal_cardinality=$3 AND accepted_offset_seconds IS NOT DISTINCT FROM $4 AND row_cardinality=$5 AND passed=$6 AND accepted_database_started_at IS NOT DISTINCT FROM to_timestamp($7/1000.0) AND snapshot_rows IS NOT DISTINCT FROM $8::jsonb",[runId,result.finalSnapshot.digest,result.finalSnapshot.journalCardinality,result.acceptedOffsetSeconds,result.finalSnapshot.rowCardinality,result.passed,result.acceptedSnapshot?.databaseStartedAtMs??null,result.acceptedSnapshot?JSON.stringify(result.acceptedSnapshot.rows):null]);
+        VALUES($1,$2,$3,$4,$5,$6,to_timestamp($7/1000.0),$8::jsonb) ON CONFLICT(run_id) DO NOTHING`,[runId,result.finalSnapshot.digest,result.finalSnapshot.journalCardinality,result.acceptedOffsetSeconds,result.finalSnapshot.rowCardinality,authoritativePass,result.acceptedSnapshot?.databaseStartedAtMs??null,result.acceptedSnapshot?JSON.stringify(result.acceptedSnapshot.rows):null]);
+      const exact=await client.query("SELECT 1 FROM reliability_settlement_final_snapshots WHERE run_id=$1 AND snapshot_digest IS NOT DISTINCT FROM $2 AND journal_cardinality=$3 AND accepted_offset_seconds IS NOT DISTINCT FROM $4 AND row_cardinality=$5 AND passed=$6 AND accepted_database_started_at IS NOT DISTINCT FROM to_timestamp($7/1000.0) AND snapshot_rows IS NOT DISTINCT FROM $8::jsonb",[runId,result.finalSnapshot.digest,result.finalSnapshot.journalCardinality,result.acceptedOffsetSeconds,result.finalSnapshot.rowCardinality,authoritativePass,result.acceptedSnapshot?.databaseStartedAtMs??null,result.acceptedSnapshot?JSON.stringify(result.acceptedSnapshot.rows):null]);
       if(!exact.rows[0])throw new Error("SETTLEMENT_FINAL_SNAPSHOT_CONFLICT");
+      if(result.passed&&authority){
+        const markerBytes=`${canonicalJson(authority.marker)}\n`;
+        if(authoritativePass){
+          await this.commitReportIntentLocked(client,{runId,reportKind:"pass",reasonCode:"SETTLEMENT_ACCEPTED",incidentSequence:null,
+            acceptedSnapshotSha256:result.finalSnapshot.digest,reportBytes:markerBytes});
+        }else{
+          const incidentSequence=await this.appendIncident(client,runId,"strict_report_nonpass",{snapshotDigest:result.finalSnapshot.digest,reasons:authority.reasons});
+          await this.commitReportIntentLocked(client,{runId,reportKind:"failure",reasonCode:"STRICT_REPORT_NONPASS",incidentSequence,
+            acceptedSnapshotSha256:result.finalSnapshot.digest,reportBytes:markerBytes});
+        }
+      }else if(!result.passed){
+        const incidentSequence=await this.appendIncident(client,runId,"settlement_nonpass",{snapshotDigest:result.finalSnapshot.digest});
+        await this.commitReportIntentLocked(client,{runId,reportKind:"failure",reasonCode:"SETTLEMENT_NONPASS",incidentSequence,
+          acceptedSnapshotSha256:null});
+      }
     });
-    return result;
+    return authoritativePass===result.passed?result:{...result,passed:authoritativePass};
   }
 
   async loadAuthoritativeEvidenceInventory(input: { runId:string; planFingerprint:string; requestIds:string[]; replayTargetRequestIds:string[];
@@ -1236,7 +1682,8 @@ export class ReliabilityProtocolStore {
     const settlementRows=await q(`SELECT snapshot_digest "finalSnapshotDigest",journal_cardinality "journalCardinality",accepted_offset_seconds "acceptedOffsetSeconds",row_cardinality "finalRowCardinality",passed,committed_at FROM reliability_settlement_final_snapshots WHERE run_id=$1`);
     const control=(await q(`SELECT gate_classification_count,created_at FROM reliability_protocol_controls WHERE run_id=$1`))[0];const settlement=settlementRows[0];
     const known=attempts.reduce((s,r)=>r.state==="unresolved_provider_outcome"?s:s+BigInt(r.actualCostMicros??"0"),0n);const unresolved=attempts.reduce((s,r)=>r.state==="unresolved_provider_outcome"?s+BigInt(r.reservedCostMicros):s,0n);
-    const incidents=incidentsRows.map(r=>({...r,path:`evidence/held-out-reliability/incidents/${input.runId}/${r.sequence}-${r.eventType}.json`}));
+    const namespace=reliabilityArtifactNamespace(input.runId);
+    const incidents=incidentsRows.map(r=>({...r,path:`${namespace.root}/incidents/${input.runId}/${r.sequence}-${r.eventType}.json`}));
     return {runId:input.runId,planFingerprint:input.planFingerprint,requestIds:input.requestIds,replayTargetRequestIds:input.replayTargetRequestIds,attempts,executions,decisions,dispatchTokens,shadowQueue,shadowEvidence,replayAudits,
       authorizationReceipts:input.authorizationReceipts,signedAuthorizations:input.signedAuthorizations,claims:input.claims,manifests:input.manifests,reconciliation,incidents,
       settlement:{passed:settlement?.passed===true,acceptedOffsetSeconds:settlement?.acceptedOffsetSeconds??null,journalCardinality:settlement?.journalCardinality??0,finalSnapshotDigest:settlement?.finalSnapshotDigest??"",finalRowCardinality:settlement?.finalRowCardinality??0},
@@ -1249,7 +1696,7 @@ export class ReliabilityProtocolStore {
     mandateId: string; branchId: string | null; workloadClass: string | null;
     requestId: string; body: unknown;
   }): Promise<StableSuccessfulResponseProjection> {
-    if (!/^replay-[0-9a-f-]{16,80}$/i.test(input.operationId)) throw new Error("REPLAY_OPERATION_ID_INVALID");
+    if (!/^replay-[0-9a-f]{64}$/.test(input.operationId)) throw new Error("REPLAY_OPERATION_ID_INVALID");
     if (!input.branchId || !input.workloadClass) throw new Error("REPLAY_TARGET_NOT_IMMUTABLE");
     const branchId=input.branchId,workloadClass=input.workloadClass;
     return this.transaction(async client=>{
@@ -1317,6 +1764,7 @@ export class ReliabilityProtocolStore {
 
   async withReplayMutex<T>(input: { runId: string; requestId?: string; ownerId: string }, operation: (client: Queryable) => Promise<T>): Promise<T> {
     return this.transaction(async (client) => {
+      await this.lockControlProfile(client,input.runId);
       // The transaction is already under the protocol-wide exclusive replay lock.
       await client.query(`INSERT INTO reliability_replay_mutex(run_id,request_id,owner_id,acquired_at)
         VALUES($1,'__global__',$2,clock_timestamp()) ON CONFLICT(run_id) DO UPDATE
@@ -1327,8 +1775,8 @@ export class ReliabilityProtocolStore {
 
   async completeReplayRun(runId:string):Promise<void>{
     await this.transaction(async client=>{
-      const control=await client.query<{durable_stage:string}>("SELECT durable_stage FROM reliability_protocol_controls WHERE run_id=$1 FOR UPDATE",[runId]);
-      if(!control.rows[0]||!['fresh_terminal','replay_terminal'].includes(control.rows[0].durable_stage))throw new Error("REPLAY_STAGE_PREREQUISITE_UNMET");
+      const control=await this.lockControlProfile(client, runId);
+      if(!['fresh_terminal','replay_terminal'].includes(control.durable_stage))throw new Error("REPLAY_STAGE_PREREQUISITE_UNMET");
       const rows=await client.query<{replay_ordinal:number;request_id:string;state:string;audited:boolean|number}>(`SELECT authorization.replay_ordinal,authorization.request_id,authorization.state,
         (count(audit.request_id)=1) audited FROM reliability_replay_authorizations authorization
         LEFT JOIN reliability_replay_audits audit ON audit.run_id=authorization.run_id
@@ -1345,18 +1793,25 @@ export class ReliabilityProtocolStore {
   async recordReplayAudit(input: { runId: string; requestId: string; replayNo: number; originalResponseCommitment: string; replayResponseCommitment: string; writeSet: readonly string[] }): Promise<void> {
     if(input.originalResponseCommitment!==input.replayResponseCommitment) throw new Error("REPLAY_COMMITMENT_MISMATCH");
     if(input.writeSet.length) throw new Error("REPLAY_WRITE_SET_NOT_EMPTY");
-    await this.transaction(async client=>{await client.query(`INSERT INTO reliability_replay_audits(run_id,request_id,replay_no,original_response_commitment,replay_response_commitment,write_set)
-      VALUES($1,$2,$3,$4,$5,$6::jsonb)`,[input.runId,input.requestId,input.replayNo,input.originalResponseCommitment,input.replayResponseCommitment,JSON.stringify(input.writeSet)]);});
+    await this.transaction(async client=>{
+      await this.lockControlProfile(client, input.runId);
+      await client.query(`INSERT INTO reliability_replay_audits(run_id,request_id,replay_no,original_response_commitment,replay_response_commitment,write_set)
+        VALUES($1,$2,$3,$4,$5,$6::jsonb)`,[input.runId,input.requestId,input.replayNo,input.originalResponseCommitment,input.replayResponseCommitment,JSON.stringify(input.writeSet)]);
+    });
   }
 
   async appendSettlementPoll(input: { runId: string; pollNo: number; offsetSeconds: number; snapshotDigest: string; complete: boolean }): Promise<void> {
     const exact=Array.from({length:25},(_,index)=>index*5);
     if(exact[input.pollNo-1]!==input.offsetSeconds) throw new Error("SETTLEMENT_OFFSET_INVALID");
-    await this.transaction(async client=>{await client.query("INSERT INTO reliability_settlement_journal(run_id,poll_no,offset_seconds,snapshot_digest,complete) VALUES($1,$2,$3,$4,$5)",[input.runId,input.pollNo,input.offsetSeconds,input.snapshotDigest,input.complete]);});
+    await this.transaction(async client=>{
+      await this.lockControlProfile(client, input.runId);
+      await client.query("INSERT INTO reliability_settlement_journal(run_id,poll_no,offset_seconds,snapshot_digest,complete) VALUES($1,$2,$3,$4,$5)",[input.runId,input.pollNo,input.offsetSeconds,input.snapshotDigest,input.complete]);
+    });
   }
 
   async finalizeSettlement(input: { runId: string; snapshotDigest: string; acceptedOffsetSeconds: number | null }): Promise<void> {
     await this.transaction(async (client)=>{
+      await this.lockControlProfile(client, input.runId);
       const rows=await client.query<{poll_no:number;offset_seconds:number;complete:boolean}>("SELECT poll_no,offset_seconds,complete FROM reliability_settlement_journal WHERE run_id=$1 ORDER BY poll_no FOR UPDATE",[input.runId]);
       const exact=Array.from({length:25},(_,index)=>index*5);
       if(rows.rows.length!==25 || rows.rows.some((row,index)=>row.poll_no!==index+1||row.offset_seconds!==exact[index])) throw new Error("SETTLEMENT_JOURNAL_INVALID");
@@ -1367,12 +1822,9 @@ export class ReliabilityProtocolStore {
   }
 
   private async failProtocolLocked(client: Queryable, runId: string, reason: string): Promise<void> {
-    const row = await client.query<{ state: string; failure_sequence: string }>(
-      "SELECT state,failure_sequence::text FROM reliability_protocol_controls WHERE run_id=$1 FOR UPDATE", [runId],
-    );
-    if (!row.rows[0]) throw new Error("PROTOCOL_CONTROL_NOT_FOUND");
-    if (row.rows[0].state !== "active") return;
-    const sequence = Number(row.rows[0].failure_sequence) + 1;
+    const row = await this.lockControlProfile(client, runId);
+    if (row.state !== "active") return;
+    const sequence = Number(row.failure_sequence) + 1;
     await client.query("UPDATE reliability_protocol_controls SET state='failed',failure_sequence=$2,failed_at=clock_timestamp() WHERE run_id=$1", [runId,sequence]);
     const canceled = await client.query<{ request_id: string; lane_id: string }>(`UPDATE reliability_dispatch_tokens token SET canceled_at=clock_timestamp()
       WHERE token.run_id=$1 AND token.primitive_entered_at IS NULL AND token.canceled_at IS NULL
@@ -1398,7 +1850,87 @@ export class ReliabilityProtocolStore {
       if (canceledIds.has(item.request_id)) await this.appendEvent(client,runId,item.request_id,"barrier_canceled_before_dispatch",{});
       await this.appendEvent(client,runId,item.request_id,"gate_classified",{ state: "not_dispatched", reasonCode: reason });
     }
-    await this.appendIncident(client,runId,"global_failure",{ reason,sequence });
+    const incidentSequence=await this.appendIncident(client,runId,"global_failure",{ reason,sequence });
+    await this.commitReportIntentLocked(client,{runId,reportKind:"failure",reasonCode:reason,incidentSequence,acceptedSnapshotSha256:null});
+  }
+
+  private async commitReportIntentLocked(client:Queryable,input:{
+    runId:string;reportKind:"pass"|"failure";reasonCode:string;incidentSequence:number|null;
+    acceptedSnapshotSha256:string|null;publicationDeadline?:Date;reportBytes?:string;
+  }):Promise<number>{
+    const control=await this.lockControlProfile(client,input.runId);
+    if(control.protocol_version!==3)return 0;
+    const prior=await client.query<{intent_sequence:string;report_kind:"pass"|"failure";destination:string;report_sha256:string;
+      report_bytes_base64:string;accepted_snapshot_sha256:string|null;committed_at:Date;publication_deadline:Date;state:string}>(
+      `SELECT intent_sequence::text,report_kind,destination,report_sha256,report_bytes_base64,accepted_snapshot_sha256,
+       committed_at,publication_deadline,state FROM reliability_report_publication_outbox
+       WHERE run_id=$1 ORDER BY intent_sequence DESC LIMIT 1 FOR UPDATE`,[input.runId]);
+    const latest=prior.rows[0];
+    const bindings=await client.query<{path:string;digest:string}>("SELECT path,digest FROM reliability_artifact_bindings WHERE run_id=$1 ORDER BY path",[input.runId]);
+    const artifactInventorySha256=`sha256:${createHash("sha256").update(canonicalJson(bindings.rows)).digest("hex")}`;
+    const destination=canonicalFinalCommitPath(input.runId);
+    const reportFor=(committedAt:Date)=>({evidenceType:control.evidence_type,protocolVersion:control.protocol_version,runId:input.runId,
+      profileFingerprint:control.profile_fingerprint,reportKind:input.reportKind,passed:input.reportKind==="pass",
+      reasonCode:input.reasonCode,incidentSequence:input.incidentSequence,artifactInventorySha256,
+      acceptedSnapshotSha256:input.acceptedSnapshotSha256,committedAt:committedAt.toISOString()});
+    if(latest){
+      const priorBytes=Buffer.from(latest.report_bytes_base64,"base64").toString("utf8");
+      const expectedPriorBytes=input.reportBytes??`${canonicalJson(reportFor(latest.committed_at))}\n`;
+      const priorDigest=`sha256:${createHash("sha256").update(priorBytes).digest("hex")}`;
+      if(priorBytes===expectedPriorBytes&&priorDigest===latest.report_sha256&&latest.destination===destination
+        &&latest.accepted_snapshot_sha256===input.acceptedSnapshotSha256)return Number(latest.intent_sequence);
+      if(latest.report_kind==="failure"&&input.reportKind==="pass")throw new Error("REPORT_FAILURE_AUTHORITY_FINAL");
+      if(latest.state==="published"||(latest.state==="artifact_conflict"&&!(latest.report_kind==="pass"&&input.reportKind==="failure")))
+        throw new Error("REPORT_PUBLICATION_AUTHORITY_FINAL");
+    }
+    const clock=await client.query<{now:Date}>("SELECT clock_timestamp() now");
+    const committedAt=clock.rows[0]!.now;
+    const sequence=await client.query<{intent_sequence:string}>(`UPDATE reliability_protocol_controls
+      SET next_report_intent_sequence=next_report_intent_sequence+1 WHERE run_id=$1
+      RETURNING (next_report_intent_sequence-1)::text intent_sequence`,[input.runId]);
+    if(!sequence.rows[0])throw new Error("PROTOCOL_CONTROL_NOT_FOUND");
+    const intentSequence=Number(sequence.rows[0].intent_sequence);
+    const report=reportFor(committedAt);
+    const bytes=input.reportBytes??`${canonicalJson(report)}\n`;
+    const reportSha256=`sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+    const reportBytesBase64=Buffer.from(bytes).toString("base64");
+    const intentPath=`evidence/${control.evidence_type}/publication-intents/reports/${input.runId}.json`;
+    const intent={schemaVersion:1,evidenceType:control.evidence_type,protocolVersion:control.protocol_version,runId:input.runId,
+      profileFingerprint:control.profile_fingerprint,reportKind:input.reportKind,destination,reportSha256,
+      reportBytesBase64,artifactInventorySha256,acceptedSnapshotSha256:input.acceptedSnapshotSha256,committedAt:committedAt.toISOString()};
+    const intentBytes=`${canonicalJson(intent)}\n`;
+    const intentSha256=`sha256:${createHash("sha256").update(intentBytes).digest("hex")}`;
+    const deadline=input.publicationDeadline??new Date(committedAt.getTime()+60_000);
+    const supersedes=latest?Number(latest.intent_sequence):null;
+    await client.query(`INSERT INTO reliability_report_publication_outbox
+      (run_id,intent_sequence,profile_fingerprint,report_kind,destination,report_sha256,report_bytes_base64,
+       intent_path,intent_sha256,intent_bytes_base64,artifact_inventory_sha256,accepted_snapshot_sha256,committed_at,
+       publication_deadline,supersedes_intent_sequence,state)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'committed')`,[input.runId,intentSequence,control.profile_fingerprint,
+      input.reportKind,destination,reportSha256,reportBytesBase64,intentPath,intentSha256,Buffer.from(intentBytes).toString("base64"),
+      artifactInventorySha256,input.acceptedSnapshotSha256,committedAt,deadline,supersedes]);
+    await this.appendReportPublicationEventLocked(client,input.runId,intentSequence,"committed",{reportSha256,destination},["committed"],committedAt);
+    if(latest){
+      await this.appendReportPublicationEventLocked(client,input.runId,Number(latest.intent_sequence),"superseded",
+        {supersededByIntentSequence:intentSequence},["committed","publication_failed","superseded","artifact_conflict"]);
+    }
+    return intentSequence;
+  }
+
+  private async appendReportPublicationEventLocked(client:Queryable,runId:string,intentSequence:number,
+    state:"committed"|"published"|"superseded"|"publication_failed"|"artifact_conflict",evidence:Record<string,unknown>,
+    allowedStates:readonly string[],occurredAt?:Date):Promise<number>{
+    const sequence=await client.query<{event_sequence:string}>(`UPDATE reliability_report_publication_outbox
+      SET state=$3,next_event_sequence=next_event_sequence+1
+      WHERE run_id=$1 AND intent_sequence=$2 AND state=ANY($4::text[])
+      RETURNING (next_event_sequence-1)::text event_sequence`,[runId,intentSequence,state,allowedStates]);
+    if(!sequence.rows[0])throw new Error("REPORT_INTENT_STATE_CONFLICT");
+    const eventSequence=Number(sequence.rows[0].event_sequence);
+    await client.query(`INSERT INTO reliability_report_publication_events
+      (run_id,intent_sequence,event_sequence,state,evidence,occurred_at)
+      VALUES($1,$2,$3,$4,$5::jsonb,COALESCE($6,clock_timestamp()))`,
+    [runId,intentSequence,eventSequence,state,JSON.stringify(evidence),occurredAt??null]);
+    return eventSequence;
   }
 
   private async appendEvent(client: Queryable, runId: string, requestId: string | null, eventType: string, payload: unknown): Promise<number> {
@@ -1417,12 +1949,31 @@ export class ReliabilityProtocolStore {
     return value;
   }
 
+  private async lockControlProfile(client: Queryable, runId: string): Promise<{
+    state: "active"|"failed"|"complete"; plan_fingerprint: string; failure_sequence: string; durable_stage: DurableReliabilityStage;
+    reconciliation_credential_id: string|null; nonusable_allowance_owner: string|null; protocol_version:number; evidence_type:string;
+    plan_schema_version:number; mapping_version:number; profile_fingerprint:string;
+  }> {
+    const control = await client.query<{
+      state: "active"|"failed"|"complete"; plan_fingerprint: string; failure_sequence: string; durable_stage: DurableReliabilityStage;
+      reconciliation_credential_id: string|null; nonusable_allowance_owner: string|null; protocol_version: number; evidence_type: string;
+      plan_schema_version: number; mapping_version: number; profile_fingerprint: string;
+    }>(`SELECT state,plan_fingerprint,failure_sequence::text,durable_stage,reconciliation_credential_id,nonusable_allowance_owner,protocol_version,evidence_type,plan_schema_version,mapping_version,profile_fingerprint
+        FROM reliability_protocol_controls WHERE run_id=$1 FOR UPDATE`, [runId]);
+    const row = control.rows[0];
+    if (!row) throw new Error("PROTOCOL_CONTROL_NOT_FOUND");
+    const expected = reliabilityProtocolProfileForRunId(runId);
+    if (row.protocol_version !== expected.protocolVersion || row.evidence_type !== expected.evidenceType
+      || row.plan_schema_version !== expected.planSchemaVersion || row.mapping_version !== expected.mappingVersion
+      || row.profile_fingerprint !== expected.profileFingerprint) throw new Error("PROTOCOL_PROFILE_CONFLICT");
+    return row;
+  }
+
   private async lockControlLane(client: Queryable, runId: string, laneId: string): Promise<string> {
-    const control = await client.query<{ state: string }>("SELECT state FROM reliability_protocol_controls WHERE run_id=$1 FOR UPDATE", [runId]);
-    if (!control.rows[0]) throw new Error("PROTOCOL_CONTROL_NOT_FOUND");
+    const control = await this.lockControlProfile(client, runId);
     const lane = await client.query("SELECT state FROM reliability_protocol_lanes WHERE run_id=$1 AND lane_id=$2 FOR UPDATE", [runId, laneId]);
     if (!lane.rows[0]) throw new Error("PROTOCOL_LANE_NOT_FOUND");
-    return control.rows[0].state;
+    return control.state;
   }
   private async transactionOnClient<T>(client:Queryable,operation:()=>Promise<T>):Promise<T>{
     try{await client.query("BEGIN");const value=await operation();await client.query("COMMIT");return value;}

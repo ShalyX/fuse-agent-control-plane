@@ -6,10 +6,12 @@ export const REPLAY_AUDITED_TABLES = [
   "reliability_block_claims", "reliability_protocol_attempts", "reliability_protocol_events",
   "reliability_dispatch_tokens", "reliability_burst_barriers", "reliability_protocol_holds",
   "reliability_hold_members", "reliability_setup_readiness_receipts",
+  "reliability_authorization_operations",
   "reliability_authorization_nonces", "reliability_authorization_decisions",
   "reliability_authorization_outbox", "reliability_reconciliation_attempts",
   "reliability_reconciliation_evidence", "reliability_scheduler_claims",
   "reliability_replay_cancellations", "reliability_artifact_bindings", "reliability_final_report_outbox",
+  "reliability_report_publication_outbox", "reliability_report_publication_events", "reliability_report_publication_receipts",
   "reliability_settlement_journal", "reliability_settlement_final_snapshots",
 ] as const;
 
@@ -73,13 +75,25 @@ export const RELIABILITY_SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS reliability_protocol_controls (
  run_id TEXT PRIMARY KEY, state TEXT NOT NULL CHECK (state IN ('preparing','active','failed','complete')),
  durable_stage TEXT NOT NULL DEFAULT 'running' CHECK(durable_stage IN ('running','fresh_terminal','replay_terminal','artifact_bound','settled','final_committed')),
- plan_fingerprint TEXT NOT NULL, failure_sequence BIGINT NOT NULL DEFAULT 0,
+ plan_fingerprint TEXT NOT NULL,
+ protocol_version SMALLINT NOT NULL DEFAULT 2,
+ evidence_type TEXT NOT NULL DEFAULT 'held-out-reliability',
+ plan_schema_version SMALLINT NOT NULL DEFAULT 2,
+ mapping_version SMALLINT NOT NULL DEFAULT 2,
+ profile_fingerprint TEXT NOT NULL DEFAULT 'legacy-v2',
+ failure_sequence BIGINT NOT NULL DEFAULT 0,
  next_event_sequence BIGINT NOT NULL DEFAULT 1, next_incident_sequence BIGINT NOT NULL DEFAULT 1,
+ next_report_intent_sequence BIGINT NOT NULL DEFAULT 1,
  nonusable_allowance_owner TEXT, dispatch_token_count INTEGER NOT NULL DEFAULT 0,
  gate_classification_count INTEGER NOT NULL DEFAULT 0, ambiguity_count INTEGER NOT NULL DEFAULT 0,
  usable_count INTEGER NOT NULL DEFAULT 0, replay_passed_count INTEGER NOT NULL DEFAULT 0,
  reconciliation_credential_id TEXT, failed_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
+ALTER TABLE reliability_protocol_controls ADD COLUMN IF NOT EXISTS protocol_version SMALLINT NOT NULL DEFAULT 2;
+ALTER TABLE reliability_protocol_controls ADD COLUMN IF NOT EXISTS evidence_type TEXT NOT NULL DEFAULT 'held-out-reliability';
+ALTER TABLE reliability_protocol_controls ADD COLUMN IF NOT EXISTS plan_schema_version SMALLINT NOT NULL DEFAULT 2;
+ALTER TABLE reliability_protocol_controls ADD COLUMN IF NOT EXISTS mapping_version SMALLINT NOT NULL DEFAULT 2;
+ALTER TABLE reliability_protocol_controls ADD COLUMN IF NOT EXISTS profile_fingerprint TEXT NOT NULL DEFAULT 'legacy-v2';
 CREATE TABLE IF NOT EXISTS reliability_protocol_lanes (
  run_id TEXT NOT NULL REFERENCES reliability_protocol_controls(run_id) ON DELETE CASCADE, lane_id TEXT NOT NULL,
  state TEXT NOT NULL DEFAULT 'ready', resume_at TIMESTAMPTZ, allowance_owner TEXT,
@@ -154,6 +168,17 @@ CREATE TABLE IF NOT EXISTS reliability_lane_backlog (
  PRIMARY KEY(run_id,lane_id,block_no,call_ordinal), UNIQUE(run_id,request_id),
  FOREIGN KEY(run_id,request_id) REFERENCES reliability_sealed_calls(run_id,request_id)
 );
+CREATE TABLE IF NOT EXISTS reliability_authorization_operations (
+ run_id TEXT PRIMARY KEY REFERENCES reliability_protocol_controls(run_id),
+ started_at TIMESTAMPTZ NOT NULL, validation_deadline TIMESTAMPTZ NOT NULL,
+ decision_deadline TIMESTAMPTZ NOT NULL, publication_deadline TIMESTAMPTZ NOT NULL,
+ transition_deadline TIMESTAMPTZ NOT NULL, publication_completed_at TIMESTAMPTZ,
+ transition_completed_at TIMESTAMPTZ, failure_reason TEXT,
+ CHECK(validation_deadline=started_at+interval '5 seconds'),
+ CHECK(decision_deadline=started_at+interval '20 seconds'),
+ CHECK(publication_deadline=started_at+interval '50 seconds'),
+ CHECK(transition_deadline=started_at+interval '55 seconds')
+);
 CREATE TABLE IF NOT EXISTS reliability_authorization_nonces (
  issuer_id TEXT NOT NULL, nonce TEXT NOT NULL, run_id TEXT NOT NULL, consumed_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
  PRIMARY KEY(issuer_id,nonce), UNIQUE(run_id)
@@ -191,13 +216,14 @@ CREATE TABLE IF NOT EXISTS reliability_setup_readiness_receipts (
 CREATE TABLE IF NOT EXISTS reliability_replay_authorizations (
  run_id TEXT NOT NULL, replay_ordinal SMALLINT NOT NULL CHECK(replay_ordinal BETWEEN 1 AND 20),
  request_id TEXT NOT NULL, operation_id TEXT NOT NULL, authorization_decision_id UUID NOT NULL,
- signed_authorization_sha256 TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'authorized'
+ signed_authorization_sha256 TEXT, state TEXT NOT NULL DEFAULT 'authorized'
    CHECK(state IN ('authorized','transport_started','passed','failed')),
  transport_started_at TIMESTAMPTZ, completed_at TIMESTAMPTZ, response_projection JSONB,
  PRIMARY KEY(run_id,request_id), UNIQUE(run_id,replay_ordinal), UNIQUE(operation_id),
  FOREIGN KEY(run_id,request_id) REFERENCES reliability_sealed_calls(run_id,request_id),
  FOREIGN KEY(authorization_decision_id) REFERENCES reliability_authorization_decisions(decision_id)
 );
+ALTER TABLE reliability_replay_authorizations ALTER COLUMN signed_authorization_sha256 DROP NOT NULL;
 CREATE TABLE IF NOT EXISTS reliability_replay_mutex (
  run_id TEXT PRIMARY KEY, request_id TEXT, owner_id TEXT NOT NULL, operation_id TEXT,
  acquired_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
@@ -264,12 +290,59 @@ CREATE TABLE IF NOT EXISTS reliability_failure_report_outbox (
  created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
  FOREIGN KEY(run_id) REFERENCES reliability_protocol_controls(run_id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS reliability_report_publication_outbox (
+ run_id TEXT NOT NULL REFERENCES reliability_protocol_controls(run_id) ON DELETE CASCADE,
+ intent_sequence BIGINT NOT NULL,
+ profile_fingerprint TEXT NOT NULL,
+ report_kind TEXT NOT NULL CHECK(report_kind IN ('pass','failure')),
+ destination TEXT NOT NULL,
+ report_sha256 TEXT NOT NULL CHECK(report_sha256 ~ '^sha256:[a-f0-9]{64}$'),
+ report_bytes_base64 TEXT NOT NULL,
+ intent_path TEXT NOT NULL,
+ intent_sha256 TEXT NOT NULL CHECK(intent_sha256 ~ '^sha256:[a-f0-9]{64}$'),
+ intent_bytes_base64 TEXT NOT NULL,
+ artifact_inventory_sha256 TEXT NOT NULL CHECK(artifact_inventory_sha256 ~ '^sha256:[a-f0-9]{64}$'),
+ accepted_snapshot_sha256 TEXT CHECK(accepted_snapshot_sha256 IS NULL OR accepted_snapshot_sha256 ~ '^sha256:[a-f0-9]{64}$'),
+ committed_at TIMESTAMPTZ NOT NULL,
+ publication_deadline TIMESTAMPTZ NOT NULL,
+ supersedes_intent_sequence BIGINT,
+ next_event_sequence BIGINT NOT NULL DEFAULT 1,
+ state TEXT NOT NULL DEFAULT 'committed' CHECK(state IN ('committed','published','superseded','publication_failed','artifact_conflict')),
+ PRIMARY KEY(run_id,intent_sequence),
+ UNIQUE(run_id,destination,intent_sequence),
+ FOREIGN KEY(run_id,supersedes_intent_sequence) REFERENCES reliability_report_publication_outbox(run_id,intent_sequence)
+);
+CREATE TABLE IF NOT EXISTS reliability_report_publication_events (
+ run_id TEXT NOT NULL, intent_sequence BIGINT NOT NULL, event_sequence BIGINT NOT NULL,
+ state TEXT NOT NULL CHECK(state IN ('committed','published','superseded','publication_failed','artifact_conflict')),
+ evidence JSONB NOT NULL DEFAULT '{}'::jsonb, occurred_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+ PRIMARY KEY(run_id,intent_sequence,event_sequence),
+ FOREIGN KEY(run_id,intent_sequence) REFERENCES reliability_report_publication_outbox(run_id,intent_sequence)
+);
+CREATE TABLE IF NOT EXISTS reliability_report_publication_receipts (
+ run_id TEXT NOT NULL, intent_sequence BIGINT NOT NULL, destination TEXT NOT NULL,
+ report_sha256 TEXT NOT NULL, intent_path TEXT NOT NULL, intent_sha256 TEXT NOT NULL, filesystem_completed_at TIMESTAMPTZ NOT NULL,
+ committed_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+ PRIMARY KEY(run_id,intent_sequence),
+ FOREIGN KEY(run_id,intent_sequence) REFERENCES reliability_report_publication_outbox(run_id,intent_sequence)
+);
 
 -- Idempotent forward migrations are intentionally kept in the bootstrap SQL.  Early
 -- no-spend tests created older table shapes in Neon; CREATE TABLE IF NOT EXISTS does
 -- not upgrade those tables.
 ALTER TABLE reliability_protocol_controls ADD COLUMN IF NOT EXISTS next_event_sequence BIGINT NOT NULL DEFAULT 1;
 ALTER TABLE reliability_protocol_controls ADD COLUMN IF NOT EXISTS next_incident_sequence BIGINT NOT NULL DEFAULT 1;
+ALTER TABLE reliability_protocol_controls ADD COLUMN IF NOT EXISTS next_report_intent_sequence BIGINT NOT NULL DEFAULT 1;
+ALTER TABLE reliability_report_publication_outbox ADD COLUMN IF NOT EXISTS next_event_sequence BIGINT NOT NULL DEFAULT 1;
+ALTER TABLE reliability_report_publication_outbox ADD COLUMN IF NOT EXISTS intent_path TEXT;
+ALTER TABLE reliability_report_publication_outbox ADD COLUMN IF NOT EXISTS intent_sha256 TEXT;
+ALTER TABLE reliability_report_publication_outbox ADD COLUMN IF NOT EXISTS intent_bytes_base64 TEXT;
+ALTER TABLE reliability_report_publication_receipts ADD COLUMN IF NOT EXISTS intent_path TEXT;
+ALTER TABLE reliability_report_publication_receipts ADD COLUMN IF NOT EXISTS intent_sha256 TEXT;
+ALTER TABLE reliability_report_publication_outbox DROP CONSTRAINT IF EXISTS reliability_report_publication_outbox_state_check;
+ALTER TABLE reliability_report_publication_outbox ADD CONSTRAINT reliability_report_publication_outbox_state_check CHECK(state IN ('committed','published','superseded','publication_failed','artifact_conflict'));
+ALTER TABLE reliability_report_publication_events DROP CONSTRAINT IF EXISTS reliability_report_publication_events_state_check;
+ALTER TABLE reliability_report_publication_events ADD CONSTRAINT reliability_report_publication_events_state_check CHECK(state IN ('committed','published','superseded','publication_failed','artifact_conflict'));
 ALTER TABLE reliability_protocol_controls ADD COLUMN IF NOT EXISTS nonusable_allowance_owner TEXT;
 ALTER TABLE reliability_protocol_controls ADD COLUMN IF NOT EXISTS dispatch_token_count INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE reliability_protocol_controls ADD COLUMN IF NOT EXISTS gate_classification_count INTEGER NOT NULL DEFAULT 0;
@@ -292,6 +365,7 @@ ALTER TABLE reliability_protocol_attempts ADD COLUMN IF NOT EXISTS terminal_at T
 ALTER TABLE reliability_block_claims ADD COLUMN IF NOT EXISTS plan_fingerprint TEXT;
 ALTER TABLE reliability_burst_barriers ADD COLUMN IF NOT EXISTS planned_request_ids JSONB NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE reliability_burst_barriers ADD COLUMN IF NOT EXISTS canceled_at TIMESTAMPTZ;
+ALTER TABLE reliability_hold_members ADD COLUMN IF NOT EXISTS member_state TEXT NOT NULL DEFAULT 'ordinary_inflight';
 ALTER TABLE reliability_reconciliation_attempts ADD COLUMN IF NOT EXISTS scheduled_at TIMESTAMPTZ;
 ALTER TABLE reliability_reconciliation_attempts ADD COLUMN IF NOT EXISTS evidence_cutoff TIMESTAMPTZ;
 ALTER TABLE reliability_reconciliation_attempts ADD COLUMN IF NOT EXISTS classification_deadline TIMESTAMPTZ;

@@ -1,6 +1,15 @@
 import { expect, it, vi } from "vitest";
 import { OpenRouterProvider } from "../src/providers/openRouter.js";
 
+it("omits attribution headers for sealed reliability requests",async()=>{
+  let headers:HeadersInit|undefined;
+  const provider=new OpenRouterProvider({apiKey:"open"+"router-key",model:"m",siteUrl:"https://fuse.invalid",appName:"Fuse",fetch:vi.fn(async(_u,init)=>{
+    headers=init?.headers;return new Response(JSON.stringify({id:"g",model:"m",choices:[{finish_reason:"stop",message:{content:"ok"}}],usage:{prompt_tokens:1,completion_tokens:1,cost:0.01}}),{status:200});
+  })});
+  await provider.complete({requestId:"r",childId:"a",model:"m",inputTokens:1,maxOutputTokens:8,messages:[],suppressAttributionHeaders:true});
+  expect(headers).toEqual({Authorization:"Bearer "+("open"+"router-key"),"Content-Type":"application/json"});
+});
+
 it("calls OpenRouter chat completions and uses provider-reported usage", async () => {
   const fetcher = vi.fn(async () => new Response(JSON.stringify({
     id: "gen-openrouter-1",

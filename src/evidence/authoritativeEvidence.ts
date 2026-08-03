@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { reliabilityArtifactNamespace } from "./reliabilityArtifactNamespace.js";
 
 export type AuthoritativeOutcomeState =
   | "not_dispatched"
@@ -111,17 +112,20 @@ export function expectedReliabilityArtifactPaths(input: {
   runId: string; planFingerprint: string; lanes?: readonly string[]; incidentPaths: readonly string[];
 }): string[] {
   const lanes = input.lanes ?? LANES;
+  const namespace = reliabilityArtifactNamespace(input.runId);
+  const root = namespace.root;
+  const claimRoot = `evidence/.run-claims/${namespace.evidenceType}`;
   return [
-    "evidence/held-out-reliability/protocols/held-out-reliability-v2.json",
-    "evidence/held-out-reliability/beacons/drand-6315000.json",
-    `evidence/held-out-reliability/plans/${input.planFingerprint}.json`,
-    `evidence/held-out-reliability/authorizations/operator/${input.runId}.json`,
-    `evidence/held-out-reliability/authorizations/reconciliation/${input.runId}.json`,
-    `evidence/held-out-reliability/authorization-receipts/operator/${input.runId}.json`,
-    `evidence/held-out-reliability/authorization-receipts/reconciliation/${input.runId}.json`,
-    ...lanes.map((lane) => `evidence/.run-claims/held-out-reliability/${input.runId}/${lane}.claim`),
-    ...lanes.flatMap((lane) => Array.from({ length: 5 }, (_, index) => `evidence/held-out-reliability/manifests/${input.runId}/${lane}-${index + 1}.json`)),
-    `evidence/held-out-reliability/replay-preliminary/${input.runId}.json`,
+    `${root}/protocols/${namespace.protocolArtifact}`,
+    `${root}/beacons/drand-${namespace.beaconRound}.json`,
+    `${root}/plans/${input.planFingerprint}.json`,
+    `${root}/authorizations/operator/${input.runId}.json`,
+    `${root}/authorizations/reconciliation/${input.runId}.json`,
+    `${root}/authorization-receipts/operator/${input.runId}.json`,
+    `${root}/authorization-receipts/reconciliation/${input.runId}.json`,
+    ...lanes.map((lane) => `${claimRoot}/${input.runId}/${lane}.claim`),
+    ...lanes.flatMap((lane) => Array.from({ length: 5 }, (_, index) => `${root}/manifests/${input.runId}/${lane}-${index + 1}.json`)),
+    `${root}/replay-preliminary/${input.runId}.json`,
     ...input.incidentPaths,
   ].sort();
 }
@@ -180,6 +184,9 @@ function hasAcceptedResolution(rows: readonly AuthoritativeReconciliationRow[], 
 
 export function reduceAuthoritativeReliabilityEvidence(input: AuthoritativeEvidenceInventory): AuthoritativeEvidenceReport {
   const reasons: string[] = [];
+  const namespace = reliabilityArtifactNamespace(input.runId);
+  const root = namespace.root;
+  const claimRoot = `evidence/.run-claims/${namespace.evidenceType}`;
   const plannedValid = input.requestIds.length === 100 && unique(input.requestIds);
   const attemptsValid = input.attempts.length === 100 && unique(input.attempts.map((row) => row.requestId))
     && exactMembers(input.attempts.map((row) => row.requestId), input.requestIds)
@@ -200,24 +207,24 @@ export function reduceAuthoritativeReliabilityEvidence(input: AuthoritativeEvide
   if (input.replayAudits.some((row) => row.writeSet.length !== 0)) reasons.push("REPLAY_WRITE_SET_NOT_EMPTY");
 
   const expectedReceipts = [
-    `operator:consumed:evidence/held-out-reliability/authorization-receipts/operator/${input.runId}.json`,
-    `reconciliation:validated:evidence/held-out-reliability/authorization-receipts/reconciliation/${input.runId}.json`,
+    `operator:consumed:${root}/authorization-receipts/operator/${input.runId}.json`,
+    `reconciliation:validated:${root}/authorization-receipts/reconciliation/${input.runId}.json`,
   ];
   const actualReceipts = input.authorizationReceipts.map((row) => `${row.kind}:${row.status}:${row.path}`);
   const signed = input.signedAuthorizations.map((row) => `${row.kind}:${row.path}`);
   if (!exactMembers(actualReceipts, expectedReceipts) || !exactMembers(signed, [
-    `operator:evidence/held-out-reliability/authorizations/operator/${input.runId}.json`,
-    `reconciliation:evidence/held-out-reliability/authorizations/reconciliation/${input.runId}.json`,
+    `operator:${root}/authorizations/operator/${input.runId}.json`,
+    `reconciliation:${root}/authorizations/reconciliation/${input.runId}.json`,
   ])) reasons.push("AUTHORIZATION_RECEIPTS_INVALID");
 
   // Protocol source of truth (docs lines 420 and 426) requires one claim per lane.
   // The prior five block-claim interpretation was contradictory and is rejected.
-  const claimPaths = LANES.map((lane) => `evidence/.run-claims/held-out-reliability/${input.runId}/${lane}.claim`);
+  const claimPaths = LANES.map((lane) => `${claimRoot}/${input.runId}/${lane}.claim`);
   if (input.claims.length !== 4 || unique(input.claims.map((row) => row.lane)) === false
     || !input.claims.every((row) => row.terminal && LANES.includes(row.lane as typeof LANES[number]))
     || !exactMembers(input.claims.map((row) => row.path), claimPaths)) reasons.push("CLAIM_INVENTORY_INVALID");
 
-  const expectedManifests = LANES.flatMap((lane) => Array.from({ length: 5 }, (_, index) => `evidence/held-out-reliability/manifests/${input.runId}/${lane}-${index + 1}.json`));
+  const expectedManifests = LANES.flatMap((lane) => Array.from({ length: 5 }, (_, index) => `${root}/manifests/${input.runId}/${lane}-${index + 1}.json`));
   if (input.manifests.length !== 20 || !input.manifests.every((row) => row.terminal && SHA256.test(row.digest))
     || !exactMembers(input.manifests.map((row) => row.path), expectedManifests)) reasons.push("MANIFEST_INVENTORY_INVALID");
 
@@ -241,13 +248,14 @@ export function reduceAuthoritativeReliabilityEvidence(input: AuthoritativeEvide
 
   const finalizedAt = Date.parse(input.hardFinalization.finalizedAt);
   const deadline = Date.parse(input.hardFinalization.deadline);
-  if (!input.hardFinalization.allTerminal || input.hardFinalization.deadline !== "2026-07-28T09:30:00.000Z"
+  const expectedDeadline = namespace.protocolVersion === 3 ? "2026-08-05T09:30:00.000Z" : "2026-07-28T09:30:00.000Z";
+  if (!input.hardFinalization.allTerminal || input.hardFinalization.deadline !== expectedDeadline
     || !Number.isFinite(finalizedAt) || !Number.isFinite(deadline) || finalizedAt > deadline) reasons.push("HARD_FINALIZATION_INVALID");
 
   const incidentPaths = input.incidents.map((row) => row.path);
   const incidentsValid = unique(incidentPaths) && [...input.incidents].sort((a, b) => a.sequence - b.sequence).every((row, index) =>
     row.sequence === index + 1 && /^[a-z0-9_]+$/.test(row.eventType)
-      && row.path === `evidence/held-out-reliability/incidents/${input.runId}/${row.sequence}-${row.eventType}.json`);
+      && row.path === `${root}/incidents/${input.runId}/${row.sequence}-${row.eventType}.json`);
   if (!incidentsValid) reasons.push("INCIDENT_INVENTORY_INVALID");
 
   const expectedPaths = expectedReliabilityArtifactPaths({ runId: input.runId, planFingerprint: input.planFingerprint, incidentPaths });

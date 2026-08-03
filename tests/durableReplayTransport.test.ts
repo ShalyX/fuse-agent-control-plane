@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { QueryResult } from "pg";
 import { buildResponseCommitment, type StableSuccessfulResponseProjection } from "../src/reliability/commitments.js";
 import { ReliabilityProtocolStore } from "../src/reliability/protocolStore.js";
+import { RELIABILITY_V2_PROFILE } from "../src/reliability/protocolProfile.js";
 
 const body = {
   model: "nousresearch/hermes-4-405b",
@@ -23,7 +24,7 @@ const projection: StableSuccessfulResponseProjection = {
 
 function replayInput(transport: () => Promise<{ id: string; content: string; usage: { inputTokens: number; outputTokens: number } }>) {
   return {
-    operationId: "replay-1234567890abcdef", organizationId: "org-1", credentialId: "credential-1",
+    operationId: `replay-${"a".repeat(64)}`, organizationId: "org-1", credentialId: "credential-1",
     agentId: "agent-1", mandateId: "mandate-1", branchId: "branch-1", workloadClass: "reliability.normal",
     requestId: "request-1", body, ownerId: "agent-1", transport: async () => transport(),
   };
@@ -63,7 +64,18 @@ function replayDatabase(events: string[]) {
 describe("remaining protocol writers", () => {
   it("routes reconciliation, readiness, replay audit, and settlement writes through shared exclusion", async () => {
     const sql: string[] = [];
-    const client = { query: vi.fn(async (statement: string) => { sql.push(statement); return { rows: [] }; }), release: vi.fn() };
+    const client = { query: vi.fn(async (statement: string) => {
+      sql.push(statement);
+      if (statement.includes("FROM reliability_protocol_controls") && statement.includes("FOR UPDATE")) return { rows: [{
+        state: "active", plan_fingerprint: "sha256:test", failure_sequence: "0",
+        protocol_version: RELIABILITY_V2_PROFILE.protocolVersion,
+        evidence_type: RELIABILITY_V2_PROFILE.evidenceType,
+        plan_schema_version: RELIABILITY_V2_PROFILE.planSchemaVersion,
+        mapping_version: RELIABILITY_V2_PROFILE.mappingVersion,
+        profile_fingerprint: RELIABILITY_V2_PROFILE.profileFingerprint,
+      }] };
+      return { rows: [] };
+    }), release: vi.fn() };
     const store = new ReliabilityProtocolStore({ query: client.query, connect: vi.fn(async () => client) } as never);
     const operations = [
       () => store.failReconciliationOffset({ runId: "run-1", requestId: "request-1", offsetSeconds: 30, failureCode: "FAILED" }),
@@ -90,7 +102,14 @@ describe("durable replay run completion", () => {
     const rows = Array.from({ length: 20 }, (_, index) => ({ replay_ordinal: index + 1, request_id: `request-${index + 1}`, state: "passed", audited: true }));
     const client = { query: vi.fn(async (statement: string) => {
       sql.push(statement);
-      if (statement.includes("FROM reliability_protocol_controls") && statement.includes("FOR UPDATE")) return { rows: [{ durable_stage: "fresh_terminal" }] };
+      if (statement.includes("FROM reliability_protocol_controls") && statement.includes("FOR UPDATE")) return { rows: [{
+        state: "active", durable_stage: "fresh_terminal", plan_fingerprint: "sha256:test", failure_sequence: "0",
+        protocol_version: RELIABILITY_V2_PROFILE.protocolVersion,
+        evidence_type: RELIABILITY_V2_PROFILE.evidenceType,
+        plan_schema_version: RELIABILITY_V2_PROFILE.planSchemaVersion,
+        mapping_version: RELIABILITY_V2_PROFILE.mappingVersion,
+        profile_fingerprint: RELIABILITY_V2_PROFILE.profileFingerprint,
+      }] };
       if (statement.includes("FROM reliability_replay_authorizations") && statement.includes("ORDER BY")) return { rows };
       return { rows: [] };
     }), release: vi.fn() };

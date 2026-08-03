@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { createHash } from "node:crypto";
 import {
   AUTHORITATIVE_SNAPSHOT_INVENTORIES,
   assertAcceptedSnapshotAuthority,
@@ -13,8 +14,19 @@ import {
 import { planHardFinalization } from "../src/evidence/evidenceSettlementClosure.js";
 import { RELIABILITY_SCHEMA_SQL } from "../src/reliability/reliabilitySchema.js";
 import { ReliabilityProtocolStore } from "../src/reliability/protocolStore.js";
+import { RELIABILITY_V2_PROFILE } from "../src/reliability/protocolProfile.js";
+import { canonicalJson } from "../src/evidence/heldOutReliabilityV2.js";
 
 const sha = (c: string) => `sha256:${c.repeat(64)}`;
+const artifactDigest=(value:unknown)=>`sha256:${createHash("sha256").update(`${canonicalJson(value)}\n`).digest("hex")}`;
+const AUTH_RECEIPTS={
+  operator:{artifactKind:"authorization_receipt",kind:"operator",runId:"run-1",status:"consumed",presentedArtifactSha256:sha("c")},
+  reconciliation:{artifactKind:"authorization_receipt",kind:"reconciliation",runId:"run-1",status:"validated",presentedArtifactSha256:sha("d")},
+};
+const EXPECTED_ARTIFACTS={"evidence/protocol.json":sha("b"),"evidence/scheduler/r-1.json":sha("a"),
+  "evidence/authorizations/operator/run-1.json":sha("c"),"evidence/authorizations/reconciliation/run-1.json":sha("d"),
+  "evidence/authorization-receipts/operator/run-1.json":artifactDigest(AUTH_RECEIPTS.operator),
+  "evidence/authorization-receipts/reconciliation/run-1.json":artifactDigest(AUTH_RECEIPTS.reconciliation)};
 
 function authoritativeRows() {
   return {
@@ -31,26 +43,27 @@ function authoritativeRows() {
     protocolControls: [{ state: "active", failureSequence: 0, gateClassificationCount: 100, replayPassedCount: 20 }],
     protocolLanes: [{ lane: "normal-paced", state: "ready", resumeAtMs: null }],
     blockClaims: [{ block: 1, state: "claimed" }],
-    authorizationDecisions: [{ active: true, operatorValid: true, reconciliationValid: true }],
-    authorizationOutbox: [{ kind: "operator", published: true }, { kind: "reconciliation", published: true }],
+    laneBacklog: [],
+    authorizationDecisions: [{ active: true, operatorValid: true, reconciliationValid: true, decisionIdValid:true }],
+    authorizationOutbox: [{ kind: "operator", published: true,receipt:AUTH_RECEIPTS.operator }, { kind: "reconciliation", published: true,receipt:AUTH_RECEIPTS.reconciliation }],
     reconciliationAttempts: [{ requestId: "r-1", phase: "terminal" }],
     reconciliationEvidence: [{ requestId: "r-1", accepted: true }],
-    holds: [{ lane: "normal-paced", resolved: true, heldUnresolved: [] }],
+    holds: [{ lane: "normal-paced", resolved: true, heldUnresolved: [] as string[] }],
     incidents: [] as Array<{ sequence: number; eventType: string }>,
-    schedulerClaims: [{ requestId: "r-1", state: "terminal", manifestDigest: sha("a") }],
+    schedulerClaims: [{ requestId: "r-1", state: "terminal", manifestPath:"evidence/scheduler/r-1.json",manifestDigest: sha("a"),manifestFsynced:true }],
     costRows: [{ knownCostMicros: "100", unresolvedExposureMicros: "0" }],
-    artifactBindings: [{ path: "evidence/protocol.json", digest: sha("b") }],
+    artifactBindings: Object.entries(EXPECTED_ARTIFACTS).map(([path,digest])=>({path,digest})),
   };
 }
 
 describe("P0 authoritative snapshot and final commit closure", () => {
   it("requires every authoritative protocol/auth/reconciliation/hold/incident/claim/cost/artifact inventory", () => {
     const rows = authoritativeRows();
-    expect(assertAcceptedSnapshotAuthority(rows, { "evidence/protocol.json": sha("b") })).toEqual({ complete: true, reasons: [] });
+    expect(assertAcceptedSnapshotAuthority(rows, EXPECTED_ARTIFACTS)).toEqual({ complete: true, reasons: [] });
     for (const key of Object.keys(rows)) {
       const mutated = structuredClone(rows) as Record<string, unknown>;
       delete mutated[key];
-      expect(assertAcceptedSnapshotAuthority(mutated, { "evidence/protocol.json": sha("b") }).complete, key).toBe(false);
+      expect(assertAcceptedSnapshotAuthority(mutated, EXPECTED_ARTIFACTS).complete, key).toBe(false);
     }
   });
 
@@ -58,15 +71,17 @@ describe("P0 authoritative snapshot and final commit closure", () => {
     const cases = [
       (r: ReturnType<typeof authoritativeRows>) => { r.protocolControls[0]!.state = "failed"; },
       (r: ReturnType<typeof authoritativeRows>) => { r.authorizationDecisions[0]!.active = false; },
+      (r: ReturnType<typeof authoritativeRows>) => { r.authorizationDecisions[0]!.decisionIdValid = false; },
+      (r: ReturnType<typeof authoritativeRows>) => { r.authorizationOutbox[0]!.receipt.status = "substituted"; },
       (r: ReturnType<typeof authoritativeRows>) => { r.holds[0]!.resolved = false; r.holds[0]!.heldUnresolved = ["r-2"]; },
       (r: ReturnType<typeof authoritativeRows>) => { r.incidents.push({ sequence: 1, eventType: "control_failure" }); },
       (r: ReturnType<typeof authoritativeRows>) => { r.costRows[0]!.unresolvedExposureMicros = "1"; },
     ];
     for (const mutate of cases) {
       const rows = authoritativeRows(); mutate(rows);
-      expect(assertAcceptedSnapshotAuthority(rows, { "evidence/protocol.json": sha("b") }).complete).toBe(false);
+      expect(assertAcceptedSnapshotAuthority(rows, EXPECTED_ARTIFACTS).complete).toBe(false);
     }
-    expect(assertAcceptedSnapshotAuthority(authoritativeRows(), { "evidence/protocol.json": sha("c") }).reasons)
+    expect(assertAcceptedSnapshotAuthority(authoritativeRows(), { ...EXPECTED_ARTIFACTS,"evidence/protocol.json":sha("c") }).reasons)
       .toContain("SNAPSHOT_ARTIFACT_BINDING_INVALID");
   });
 
@@ -82,11 +97,15 @@ describe("P0 authoritative snapshot and final commit closure", () => {
     stage = planDurableStageTransition({ stage, terminalFresh: 100, openHolds: 0, replayAudits: 20, artifactsBound: true, settlementPassed: true }, "settled");
     expect(buildCanonicalFinalCommitMarker({ runId: "run-1", planFingerprint: sha("d"), stage, reportPassed: true,
       settlementDigest: sha("e"), settlementJournalCardinality: 1, authoritativeInventoryDigest: sha("f"), artifactDigests: { "evidence/protocol.json": sha("b") } }))
-      .toMatchObject({ artifactKind: "final_commit", state: "committed", passed: true });
+      .toMatchObject({ evidenceType:"held-out-reliability", protocolVersion:2, artifactKind: "final_commit", state: "committed", passed: true });
+    expect(buildCanonicalFinalCommitMarker({ runId: "hov3-run:colon", planFingerprint: sha("d"), stage, reportPassed: true,
+      settlementDigest: sha("e"), settlementJournalCardinality: 1, authoritativeInventoryDigest: sha("f"), artifactDigests: { "evidence/protocol.json": sha("b") } }))
+      .toMatchObject({ evidenceType:"held-out-reliability-v3", protocolVersion:3, runId:"hov3-run:colon" });
     expect(() => buildCanonicalFinalCommitMarker({ runId: "run-1", planFingerprint: sha("d"), stage: "replay_terminal", reportPassed: true,
       settlementDigest: sha("e"), settlementJournalCardinality: 1, authoritativeInventoryDigest: sha("f"), artifactDigests: {} }))
       .toThrow("SETTLEMENT_REQUIRED_BEFORE_FINAL_COMMIT");
     expect(canonicalFinalCommitPath("run-1")).toBe("evidence/held-out-reliability/replay/run-1.json");
+    expect(canonicalFinalCommitPath("hov3-run:colon")).toBe("evidence/held-out-reliability-v3/replay/hov3-run:colon.json");
     expect(preliminaryReplayArtifactPath("run-1")).toBe("evidence/held-out-reliability/replay-preliminary/run-1.json");
     expect(preliminaryReplayArtifactPath("run-1")).not.toBe(canonicalFinalCommitPath("run-1"));
     expect(() => canonicalFinalCommitPath("../escape")).toThrow("RUN_ID_INVALID");
@@ -96,7 +115,7 @@ describe("P0 authoritative snapshot and final commit closure", () => {
     expect(AUTHORITATIVE_SNAPSHOT_INVENTORIES).toEqual(expect.arrayContaining([
       "sealedCalls", "attempts", "executions", "decisions", "shadowQueue", "shadowEvidence",
       "dispatchTokens", "lifecycleEvents", "replayAudits", "replayCancellations",
-      "protocolControls", "protocolLanes", "blockClaims", "authorizationDecisions",
+      "protocolControls", "protocolLanes", "blockClaims", "laneBacklog", "authorizationDecisions",
       "authorizationOutbox", "reconciliationAttempts", "reconciliationEvidence", "holds",
       "incidents", "schedulerClaims", "costRows", "artifactBindings",
     ]));
@@ -140,11 +159,22 @@ describe("hard finalizer production contract", () => {
     expect(RELIABILITY_SCHEMA_SQL).toContain("reliability_artifact_bindings");
     expect(RELIABILITY_SCHEMA_SQL).toContain("'artifact_bound'");
     expect(RELIABILITY_SCHEMA_SQL).toContain("publication_items JSONB");
+    expect(RELIABILITY_SCHEMA_SQL).toContain("CREATE TABLE IF NOT EXISTS reliability_report_publication_outbox");
+    for(const column of ["intent_sequence BIGINT","profile_fingerprint TEXT","report_kind TEXT","destination TEXT","report_sha256 TEXT","report_bytes_base64 TEXT","intent_path TEXT","intent_sha256 TEXT","intent_bytes_base64 TEXT","artifact_inventory_sha256 TEXT","accepted_snapshot_sha256 TEXT","publication_deadline TIMESTAMPTZ","supersedes_intent_sequence BIGINT","next_event_sequence BIGINT","state TEXT"]){
+      expect(RELIABILITY_SCHEMA_SQL).toContain(column);
+    }
+    expect(RELIABILITY_SCHEMA_SQL).toContain("next_report_intent_sequence BIGINT");
+    expect(RELIABILITY_SCHEMA_SQL).toContain("'superseded','publication_failed','artifact_conflict'");
+    expect(RELIABILITY_SCHEMA_SQL).toContain("CREATE TABLE IF NOT EXISTS reliability_report_publication_events");
+    expect(RELIABILITY_SCHEMA_SQL).toContain("CREATE TABLE IF NOT EXISTS reliability_report_publication_receipts");
     const prototype = ReliabilityProtocolStore.prototype as unknown as Record<string, unknown>;
     expect(prototype["advanceDurableStage"]).toBeTypeOf("function");
     expect(prototype["publishPendingFailureReport"]).toBeTypeOf("function");
     expect(prototype["commitCanonicalFinalReport"]).toBeTypeOf("function");
     expect(prototype["publishPendingCanonicalFinalReport"]).toBeTypeOf("function");
+    expect(prototype["publishPendingReportIntent"]).toBeTypeOf("function");
+    expect(prototype["commitAuthorizationPredecisionFailure"]).toBeTypeOf("function");
+    expect(ReliabilityProtocolStore.prototype.commitAuthorization.toString()).toContain("commitReportIntentLocked");
   });
 
   it("replays failure publication from exact durable bytes without recomputing artifacts", async () => {
@@ -153,6 +183,13 @@ describe("hard finalizer production contract", () => {
     const queries: string[] = [];
     const database = { query: async (statement: string) => {
       queries.push(statement);
+      if (statement.includes("FROM reliability_protocol_controls") && statement.includes("FOR UPDATE")) return { rows: [{
+        state: "failed", durable_stage: "failed", plan_fingerprint: sha("f"), failure_sequence: "1",
+        reconciliation_credential_id: null, nonusable_allowance_owner: null,
+        protocol_version: RELIABILITY_V2_PROFILE.protocolVersion, evidence_type: RELIABILITY_V2_PROFILE.evidenceType,
+        plan_schema_version: RELIABILITY_V2_PROFILE.planSchemaVersion, mapping_version: RELIABILITY_V2_PROFILE.mappingVersion,
+        profile_fingerprint: RELIABILITY_V2_PROFILE.profileFingerprint,
+      }] };
       if (statement.includes("publication_items")) return { rows: [{ publication_items: [{ path: "evidence/held-out-reliability/replay/run-1.json", bytes, digest }], published_at: null }] };
       return { rows: [{ ok: 1 }] };
     } };
@@ -168,7 +205,11 @@ describe("hard finalizer production contract", () => {
     const statements: string[] = [];
     const database = { query: async (statement: string) => {
       statements.push(statement);
-      return { rows: [{ durable_stage: "replay_terminal", state: "active" }] };
+      return { rows: [{ durable_stage: "replay_terminal", state: "active", plan_fingerprint: sha("f"), failure_sequence: "0",
+        reconciliation_credential_id: null, nonusable_allowance_owner: null,
+        protocol_version: RELIABILITY_V2_PROFILE.protocolVersion, evidence_type: RELIABILITY_V2_PROFILE.evidenceType,
+        plan_schema_version: RELIABILITY_V2_PROFILE.planSchemaVersion, mapping_version: RELIABILITY_V2_PROFILE.mappingVersion,
+        profile_fingerprint: RELIABILITY_V2_PROFILE.profileFingerprint }] };
     } };
     const store = new ReliabilityProtocolStore(database as never);
     await expect(store.runAndPersistAuthoritativeSettlement("run-1")).rejects.toThrow("ARTIFACT_BINDING_REQUIRED_BEFORE_SETTLEMENT");

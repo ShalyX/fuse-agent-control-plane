@@ -23,8 +23,8 @@ export class OpenRouterProvider implements InferenceProvider {
   async complete(request: CompletionRequest) {
     const fetcher = this.config.fetch ?? fetch;
     const headers: Record<string, string> = { Authorization: `Bearer ${this.config.apiKey}`, "Content-Type": "application/json" };
-    if (this.config.siteUrl) headers["HTTP-Referer"] = this.config.siteUrl;
-    if (this.config.appName) headers["X-OpenRouter-Title"] = this.config.appName;
+    if (!request.suppressAttributionHeaders && this.config.siteUrl) headers["HTTP-Referer"] = this.config.siteUrl;
+    if (!request.suppressAttributionHeaders && this.config.appName) headers["X-OpenRouter-Title"] = this.config.appName;
     const body = JSON.stringify({ model: this.config.model, max_tokens: request.maxOutputTokens, messages: request.messages, provider: { allow_fallbacks: false } });
 
     let primitiveEntered = false;
