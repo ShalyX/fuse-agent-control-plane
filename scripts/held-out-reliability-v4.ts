@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { createHash, createPublicKey, verify } from "node:crypto";
+import { createHash, createPublicKey, randomBytes, verify } from "node:crypto";
 import { execFile } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
@@ -8,9 +8,9 @@ import { promisify } from "node:util";
 import { Pool } from "pg";
 import { executeReliabilityCli, type ReliabilityCliCommand, type ReliabilityCliDependencies } from "../src/evidence/reliabilityCliV2.js";
 import {
-  V3_AUTHORIZATION_WINDOW, V3_LANES, buildReliabilityV3Plan, canonicalJson, validateReliabilityV3Plan, verifyPinnedReliabilityV3Beacon,
-  type ExecutableV3Identity, type ReliabilityV3Plan,
-} from "../src/evidence/heldOutReliabilityV3.js";
+  V4_AUTHORIZATION_WINDOW, V4_LANES, buildReliabilityV4Plan, canonicalJson, validateReliabilityV4Plan, validateV4Identity, verifyPinnedReliabilityV4Beacon,
+  type ExecutableV4Identity, type ReliabilityV4Plan,
+} from "../src/evidence/heldOutReliabilityV4.js";
 import { ReliabilityArtifactStore, publishManifestDurably } from "../src/evidence/reliabilityProtocolV2.js";
 import {
   authorizationPayloadBytes, verifyAuthorizationArtifact, type AuthorizationArtifact, type AuthorizationPayload,
@@ -23,13 +23,14 @@ import { ReliabilityProtocolStore, deterministicAuthorizationDecisionId, buildRe
 import { RELIABILITY_SCHEMA_SQL } from "../src/reliability/reliabilitySchema.js";
 import { ReliabilityInferenceExecutionStore } from "../src/reliability/inferenceStore.js";
 import { PolicyStore } from "../src/persistence/policyStore.js";
-import { V3_AUTHORIZATION_ISSUERS } from "../src/reliability/issuersV3.js";
-import { RELIABILITY_V3_PROFILE } from "../src/reliability/protocolProfile.js";
+import { V4_AUTHORIZATION_ISSUERS } from "../src/reliability/issuersV4.js";
+import { RELIABILITY_V4_PROFILE } from "../src/reliability/protocolProfile.js";
 import { reconstructReliabilityArtifacts, reconstructSchedulerManifestArtifacts, type ReconstructedReliabilityArtifacts, type SchedulerManifestBindingRow } from "../src/evidence/artifactReconstruction.js";
 import { buildCanonicalFinalCommitMarker, finalEvidenceClosure, preliminaryReplayArtifactPath } from "../src/evidence/finalEvidenceClosure.js";
 import type { AuthoritativeEvidenceInventory } from "../src/evidence/authoritativeEvidence.js";
 import type { EvidenceClosureRows } from "../src/evidence/evidenceSettlementClosure.js";
 import type { AuthoritativeSettlementResult } from "../src/evidence/authoritativeSettlement.js";
+import { buildBeaconPlanPublicationIntent, publishBeaconPlanPair } from "../src/evidence/beaconPlanPublicationV4.js";
 
 function flag(args: readonly string[], name: string): string | undefined { const i=args.indexOf(name); return i < 0 ? undefined : args[i+1]; }
 function required(args: readonly string[], name: string): string { const value=flag(args,name)?.trim(); if(!value) throw new Error(`${name.slice(2).toUpperCase().replaceAll("-","_")}_REQUIRED`); return value; }
@@ -40,12 +41,34 @@ function pool(): Pool { return new Pool({ connectionString: databaseUrl(), ssl: 
 async function sleep(ms:number):Promise<void>{ await new Promise((r)=>setTimeout(r,ms)); }
 async function waitForDatabaseTime(db:Pool,target:string):Promise<void>{ for(;;){ const remaining=Date.parse(target)-Date.parse(await databaseNow(db)); if(remaining<=0)return; await sleep(Math.min(1_000,remaining)); } }
 async function publishAbsolute(path:string,value:unknown):Promise<void>{ await new ReliabilityArtifactStore(dirname(path)).publishOnce(basename(path),value); }
-function executableFingerprint(plan:ReliabilityV3Plan):string { return `sha256:${createHash("sha256").update(canonicalJson(plan.identity)).digest("hex")}`; }
+function canonicalPlanPath(cwd:string,planFingerprint:string):string{return join(cwd,"evidence","held-out-reliability-v4","plans",`${planFingerprint}.json`);}
+function canonicalAuthorizationPath(cwd:string,kind:"operator"|"reconciliation",runId:string):string{return join(cwd,"evidence","held-out-reliability-v4","authorizations",kind,`${runId}.json`);}
+function canonicalAuthorizationReceiptPath(cwd:string,kind:"operator"|"reconciliation",runId:string):string{return join(cwd,"evidence","held-out-reliability-v4","authorization-receipts",kind,`${runId}.json`);}
+function executableFingerprint(plan:ReliabilityV4Plan):string { return `sha256:${createHash("sha256").update(canonicalJson(plan.identity)).digest("hex")}`; }
+function assertCanonicalPlanCoordinate(cwd:string,requestedPath:string,plan:ReliabilityV4Plan):void{if(resolve(cwd,requestedPath)!==canonicalPlanPath(cwd,plan.planFingerprint))throw new Error("RELIABILITY_V4_PLAN_PATH_INVALID");}
+function assertCanonicalAuthorizationCoordinate(cwd:string,requestedPath:string,kind:"operator"|"reconciliation",runId:string):void{if(resolve(cwd,requestedPath)!==canonicalAuthorizationPath(cwd,kind,runId))throw new Error("RELIABILITY_V4_AUTHORIZATION_PATH_INVALID");}
+async function productionV4CandidateIdentityProbe(cwd:string):Promise<import("../src/evidence/heldOutReliabilityV4.js").V4CandidateIdentity>{
+  const attested=JSON.parse(await readFile(join(cwd,"evidence/held-out-reliability-v4/executable-identity.json"),"utf8")) as import("../src/evidence/heldOutReliabilityV4.js").V4CandidateIdentity;
+  const git=(await promisify(execFile)("git",["rev-parse","HEAD","HEAD^{tree}"],{cwd})).stdout.trim().split(/\s+/);
+  if(attested.implementationCommit!==git[0]||attested.implementationTree!==git[1])throw new Error("RELIABILITY_V4_EXECUTABLE_IDENTITY_SOURCE_MISMATCH");
+  return attested;
+}
+const unavailableCandidateProbe={readActualCandidateIdentity:()=>productionV4CandidateIdentityProbe(process.cwd())};
+async function requireActualCandidate(plan:ReliabilityV4Plan,probe:import("../src/evidence/heldOutReliabilityV4.js").V4CandidateIdentityProbe):Promise<void>{
+  const actual=await probe.readActualCandidateIdentity();
+  const module=await import("../src/evidence/heldOutReliabilityV4.js");
+  module.assertV4CandidateIdentity(plan.identity,actual);
+}
 export function verifyPinnedAuthorizationSignature(kind:"operator"|"reconciliation",parsed:Record<string,unknown>):boolean{
-  const artifact=parsed as unknown as AuthorizationArtifact;const issuer=V3_AUTHORIZATION_ISSUERS[kind];
+  const artifact=parsed as unknown as AuthorizationArtifact;const issuer=V4_AUTHORIZATION_ISSUERS[kind];
   if(!artifact.payload||artifact.payload.kind!==kind||artifact.payload.issuerCredentialId!==issuer.id||typeof artifact.signature!=="string")return false;
   try{const spki=Buffer.concat([Buffer.from("302a300506032b6570032100","hex"),Buffer.from(issuer.rawPublicKeyHex,"hex")]);
     return verify(null,authorizationPayloadBytes(artifact.payload),createPublicKey({key:spki,type:"spki",format:"der"}),Buffer.from(artifact.signature,"base64"));}catch{return false;}
+}
+function authorizationMatchesPlan(kind:"operator"|"reconciliation",parsed:Record<string,unknown>,plan:ReliabilityV4Plan):boolean{
+  const payload=parsed.payload as Record<string,unknown>|undefined;if(!payload)return false;
+  const expectedActor=`${plan.runId}-${kind==="operator"?"operator":"reconciler"}`;
+  return payload.kind===kind&&payload.runId===plan.runId&&payload.organizationId===plan.setup.organizationId&&payload.planFingerprint===plan.planFingerprint&&payload.profileFingerprint===plan.profileFingerprint&&payload.executableFingerprint===executableFingerprint(plan)&&payload.actorId===expectedActor&&payload.serviceAccountId===expectedActor&&payload.credentialId===(kind==="operator"?plan.setup.operatorCredentialId:plan.setup.reconcilerCredentialId)&&payload.credentialOwnerId===expectedActor&&payload.issuerCredentialId===V4_AUTHORIZATION_ISSUERS[kind].id&&payload.capability===(kind==="operator"?"evidence:authorize-spend":"evidence:authorize-reconciliation")&&payload.expiresAt===(kind==="operator"?"2026-08-08T08:22:00.000Z":"2026-08-11T09:30:00.000Z")&&(kind==="operator"?typeof payload.nonce==="string"&&new RegExp(`^hov4:${plan.runId}:[0-9a-f]{64}$`).test(payload.nonce):payload.nonce===null);
 }
 export function runnerCallFailureDisposition(state:string|null):"hold_lane"|"fail_protocol"{return state==="reconciliation_pending"?"hold_lane":"fail_protocol";}
 export function boundedBurstFailureDisposition(states:readonly (string|null)[]):"hold_lane"|"fail_protocol"|"continue"{
@@ -58,38 +81,45 @@ export async function runWorkerProcess(input:{executable:string;argv:string[];cw
   const line=result.stdout.trim().split("\n").at(-1);if(!line)throw new Error("WORKER_PROCESS_OUTPUT_MISSING");
   const parsed=JSON.parse(line) as Record<string,any>;if(parsed["ok"]!==true)throw new Error(String(parsed["errorCode"]??"WORKER_PROCESS_FAILED"));return parsed;
 }
-type ProductionSetupCounts={organizations:string;providers:string;agents:string;credentials:string;policies:string;mandates:string;branches:string};
-export function productionSetupCountsExact(row:ProductionSetupCounts|undefined):boolean{return !!row&&Number(row.organizations)===1&&Number(row.providers)===1&&Number(row.agents)===4&&Number(row.credentials)===4&&Number(row.policies)===4&&Number(row.mandates)===4&&Number(row.branches)===12;}
-async function readProductionSetupCounts(db:Pool,plan:ReliabilityV3Plan):Promise<ProductionSetupCounts>{
+type ProductionSetupCounts={organizations:string;providers:string;serviceAccounts:string;serviceAccountCredentials:string;agents:string;credentials:string;policies:string;mandates:string;branches:string};
+export function productionSetupCountsExact(row:ProductionSetupCounts|undefined):boolean{return !!row&&Number(row.organizations)===1&&Number(row.providers)===1
+  &&Number(row.serviceAccounts)===5&&Number(row.serviceAccountCredentials)===5&&Number(row.agents)===4&&Number(row.credentials)===4
+  &&Number(row.policies)===4&&Number(row.mandates)===4&&Number(row.branches)===12;}
+async function readProductionSetupCounts(db:Pool,plan:ReliabilityV4Plan):Promise<ProductionSetupCounts>{
   const exact=await db.query<ProductionSetupCounts>(`SELECT
     (SELECT count(*)::text FROM organizations WHERE id=$1) organizations,
-    (SELECT count(*)::text FROM provider_configurations WHERE organization_id=$1 AND id=$2 AND provider='openrouter' AND model=$3 AND status='active') providers,
-    (SELECT count(*)::text FROM agent_identities WHERE organization_id=$1 AND id=ANY($4::text[]) AND status='active') agents,
-    (SELECT count(*)::text FROM api_credentials WHERE organization_id=$1 AND id=ANY($5::text[]) AND revoked_at IS NULL) credentials,
-    (SELECT count(*)::text FROM policy_versions WHERE organization_id=$1 AND policy_id=ANY($6::text[]) AND version=1 AND mode='enforce') policies,
-    (SELECT count(*)::text FROM control_mandates WHERE organization_id=$1 AND id=ANY($7::text[]) AND state='active') mandates,
-    (SELECT count(*)::text FROM mandate_branches WHERE organization_id=$1 AND branch_id=ANY($8::text[]) AND authority_source='fuse_control_plane') branches`,[
-    plan.setup.organizationId,plan.setup.providerConfigurationId,plan.model,plan.setup.authority.map(a=>a.agentId),plan.setup.authority.map(a=>a.credentialId),plan.setup.authority.map(a=>a.policy.id),plan.setup.authority.map(a=>a.mandate.id),plan.setup.authority.flatMap(a=>[a.root.id,...a.children.map(c=>c.id)])]);
+    (SELECT count(*)::text FROM provider_configurations WHERE organization_id=$1) providers,
+    (SELECT count(*)::text FROM service_accounts WHERE organization_id=$1) "serviceAccounts",
+    (SELECT count(*)::text FROM service_account_credentials WHERE organization_id=$1) "serviceAccountCredentials",
+    (SELECT count(*)::text FROM agent_identities WHERE organization_id=$1) agents,
+    (SELECT count(*)::text FROM api_credentials WHERE organization_id=$1) credentials,
+    (SELECT count(*)::text FROM policy_versions WHERE organization_id=$1) policies,
+    (SELECT count(*)::text FROM control_mandates WHERE organization_id=$1) mandates,
+    (SELECT count(*)::text FROM mandate_branches WHERE organization_id=$1) branches`,[
+    plan.setup.organizationId]);
   if(!exact.rows[0])throw new Error("SETUP_PRODUCTION_SERVICES_NOT_EXACT");return exact.rows[0];
 }
 
-type SetupSnapshot={organization:{id:string}|null;provider:Record<string,unknown>|null;workloadShadow:Record<string,unknown>;schemaFingerprint:string;principals:Array<Record<string,unknown>>;payerAbsence:Record<string,number>;identityIsolation:Record<string,unknown>;lanes:Array<Record<string,unknown>>};
-export function expectedProductionSetupSnapshot(plan:ReliabilityV3Plan):SetupSnapshot{return {
+type SetupSnapshot={organization:{id:string}|null;provider:Record<string,unknown>|null;workloadShadow:Record<string,unknown>;schemaFingerprint:string;cardinalities:ProductionSetupCounts;principals:Array<Record<string,unknown>>;payerAbsence:Record<string,number>;identityIsolation:Record<string,unknown>;lanes:Array<Record<string,unknown>>};
+export function expectedProductionSetupSnapshot(plan:ReliabilityV4Plan):SetupSnapshot{return {
   organization:{id:plan.setup.organizationId},provider:{id:plan.setup.providerConfigurationId,provider:plan.provider,model:plan.model,status:"active",credentialVersion:1,encryptionKeyId:plan.setup.providerCredentialEncryptionKeyId,credentialConfigured:true,
     credentialId:plan.setup.providerCredentialId,credentialOwnerId:plan.setup.providerCredentialOwnerId,credentialCapabilities:["provider:invoke:openrouter"],soleCredential:true,ciphertextEnvelopeSha256:plan.setup.providerCredentialCiphertextEnvelopeSha256},
   workloadShadow:{enabled:true,requiredTables:["shadow_cohort_counters","shadow_evaluation_queue","shadow_evaluations"]},schemaFingerprint:plan.identity.schemaFingerprint,
+  cardinalities:{organizations:"1",providers:"1",serviceAccounts:"5",serviceAccountCredentials:"5",agents:"4",credentials:"4",policies:"4",mandates:"4",branches:"12"},
   principals:[
     {kind:"setup_admin",serviceAccountId:plan.setup.setupAdminActorId,credentialId:plan.setup.setupAdminCredentialId,credentialOwnerId:plan.setup.setupAdminActorId,capabilities:["reliability:setup"],active:true,payer:false},
-    {kind:"provider_owner",serviceAccountId:plan.setup.providerCredentialOwnerId,credentialId:plan.setup.providerCredentialId,credentialOwnerId:plan.setup.providerCredentialOwnerId,capabilities:["provider:configure"],active:true,payer:false},
+    {kind:"provider_owner",serviceAccountId:plan.setup.providerCredentialOwnerId,credentialId:plan.setup.providerCredentialId,credentialOwnerId:plan.setup.providerCredentialOwnerId,
+      role:"admin",capabilities:["provider:configure"],credentialCapabilities:["provider:invoke:openrouter"],active:true,payer:false},
     {kind:"operator",serviceAccountId:plan.setup.operatorServiceAccountId,credentialId:plan.setup.operatorCredentialId,credentialOwnerId:plan.setup.operatorServiceAccountId,capabilities:["reliability:operate"],active:true,payer:false},
     {kind:"runner",serviceAccountId:plan.setup.runnerServiceAccountId,credentialId:plan.setup.runnerOrchestrationCredentialId,credentialOwnerId:plan.setup.runnerServiceAccountId,capabilities:["reliability:orchestrate"],active:true,payer:false},
     {kind:"reconciliation",serviceAccountId:plan.setup.reconcilerServiceAccountId,credentialId:plan.setup.reconcilerCredentialId,credentialOwnerId:plan.setup.reconcilerServiceAccountId,capabilities:["reliability:reconcile"],active:true,payer:false},
   ],payerAbsence:{principals:0,credentials:0,paymentConfigurations:0,paymentCapabilities:0},identityIsolation:{allDistinct:true,principalCount:11},
-  lanes:plan.setup.authority.map(a=>({lane:a.lane,agent:{id:a.agentId,status:"active"},credential:{id:a.credentialId,agentId:a.agentId,revoked:false},
-    policy:{id:a.policy.id,version:a.policy.version,mode:a.policy.mode,provider:plan.provider,model:plan.model,workloadClass:a.policy.workloadClass,perCall:a.policy.perCallUsdMicros,hourly:a.policy.hourlyUsdMicros,daily:a.policy.dailyUsdMicros,maxRequestsPerMinute:a.policy.maxRequestsPerMinute,maxInputTokens:a.policy.maxInputTokens,maxOutputTokens:a.policy.maxOutputTokens},
+  lanes:plan.setup.authority.map(a=>({lane:a.lane,agent:{id:a.agentId,status:"active"},credential:{id:a.credentialId,agentId:a.agentId,capabilities:["inference:execute"],revoked:false},
+    policy:{id:a.policy.id,version:a.policy.version,mode:a.policy.mode,providers:[plan.provider],models:[plan.model],workloadClasses:[a.policy.workloadClass],perCall:a.policy.perCallUsdMicros,hourly:a.policy.hourlyUsdMicros,daily:a.policy.dailyUsdMicros,maxRequestsPerMinute:a.policy.maxRequestsPerMinute,maxInputTokens:a.policy.maxInputTokens,maxOutputTokens:a.policy.maxOutputTokens},
     mandate:{id:a.mandate.id,state:"active",policyId:a.policy.id,policyVersion:a.policy.version,maximum:a.mandate.maximumUsdMicros,expiresAt:a.mandate.expiresAt},
-    branches:[{id:a.root.id,parentId:null,maximum:a.root.maximumUsdMicros,expiresAt:a.root.expiresAt,allowedWorkloadClasses:[a.policy.workloadClass]},...a.children.map(c=>({id:c.id,parentId:a.root.id,maximum:c.maximumUsdMicros,expiresAt:c.expiresAt,allowedWorkloadClasses:[a.policy.workloadClass]}))]}))};}
-async function readProductionSetupSnapshot(db:Pool,plan:ReliabilityV3Plan):Promise<SetupSnapshot>{
+    branches:[{id:a.root.id,parentId:null,maximum:a.root.maximumUsdMicros,expiresAt:a.root.expiresAt,allowedWorkloadClasses:[a.policy.workloadClass],authoritySource:"fuse_control_plane"},...a.children.map(c=>({id:c.id,parentId:a.root.id,maximum:c.maximumUsdMicros,expiresAt:c.expiresAt,allowedWorkloadClasses:[a.policy.workloadClass],authoritySource:"fuse_control_plane"}))]}))};}
+async function readProductionSetupSnapshot(db:Pool,plan:ReliabilityV4Plan):Promise<SetupSnapshot>{
+  const cardinalities=await readProductionSetupCounts(db,plan);
   const organization=(await db.query<{id:string}>("SELECT id FROM organizations WHERE id=$1",[plan.setup.organizationId])).rows[0]??null;
   const providerRow=(await db.query<any>("SELECT id,provider,model,status,credential_version,encryption_key_id,encrypted_secret,encrypted_secret<>'' credential_configured FROM provider_configurations WHERE organization_id=$1 AND id=$2 FOR SHARE",[plan.setup.organizationId,plan.setup.providerConfigurationId])).rows[0];
   const providerCredential=(await db.query<any>(`SELECT credential.id,credential.service_account_id owner_id,credential.capabilities,
@@ -120,40 +150,47 @@ async function readProductionSetupSnapshot(db:Pool,plan:ReliabilityV3Plan):Promi
       WHERE account.organization_id=$1 AND account.id=$2 AND credential.id=$3 FOR SHARE`,[plan.setup.organizationId,serviceAccountId,credentialId])).rows[0];
     const expectedRole=kind==="setup_admin"||kind==="provider_owner"?"admin":"operator";
     principals.push(row&&row.role===expectedRole?{kind,serviceAccountId:row.service_account_id,credentialId:row.credential_id,credentialOwnerId:row.credential_owner_id,
-      capabilities:kind==="provider_owner"?["provider:configure"]:[...row.capabilities].sort(),active:row.active,payer:row.payer}:{kind,missing:true});
+      ...(kind==="provider_owner"?{role:row.role,capabilities:["provider:configure"],credentialCapabilities:[...row.capabilities].sort()}:{capabilities:[...row.capabilities].sort()}),
+      active:row.active,payer:row.payer}:{kind,missing:true});
   }
-  const payerRow=(await db.query<{principals:string;credentials:string;payment_configurations:string;payment_capabilities:string}>(`SELECT
+  const payerRow=(await db.query<{principals:string;credentials:string;payment_capabilities:string}>(`SELECT
     ((SELECT count(*) FROM service_accounts WHERE organization_id=$1 AND lower(id) LIKE '%payer%')+
      (SELECT count(*) FROM agent_identities WHERE organization_id=$1 AND lower(id) LIKE '%payer%'))::text principals,
     ((SELECT count(*) FROM service_account_credentials WHERE organization_id=$1 AND lower(id) LIKE '%payer%')+
      (SELECT count(*) FROM api_credentials WHERE organization_id=$1 AND lower(id) LIKE '%payer%'))::text credentials,
-    CASE WHEN to_regclass('public.payment_configurations') IS NULL THEN '0' ELSE '1' END payment_configurations,
     ((SELECT count(*) FROM service_account_credentials WHERE organization_id=$1 AND capabilities::text ~* '(payment|payer)')+
      (SELECT count(*) FROM api_credentials WHERE organization_id=$1 AND capabilities::text ~* '(payment|payer)'))::text payment_capabilities`,[plan.setup.organizationId])).rows[0];
-  const payerAbsence={principals:Number(payerRow?.principals??-1),credentials:Number(payerRow?.credentials??-1),paymentConfigurations:Number(payerRow?.payment_configurations??-1),paymentCapabilities:Number(payerRow?.payment_capabilities??-1)};
+  const paymentTable=(await db.query<{exists:boolean}>("SELECT to_regclass('public.payment_configurations') IS NOT NULL AS exists")).rows[0]?.exists===true;
+  const paymentConfigurations=paymentTable?Number((await db.query<{count:string}>("SELECT count(*)::text count FROM payment_configurations WHERE organization_id=$1",[plan.setup.organizationId])).rows[0]?.count??-1):0;
+  const payerAbsence={principals:Number(payerRow?.principals??-1),credentials:Number(payerRow?.credentials??-1),paymentConfigurations,paymentCapabilities:Number(payerRow?.payment_capabilities??-1)};
   const lanes:Array<Record<string,unknown>>=[];
   for(const a of plan.setup.authority){
     const agent=(await db.query<{id:string;status:string}>("SELECT id,status FROM agent_identities WHERE organization_id=$1 AND id=$2",[plan.setup.organizationId,a.agentId])).rows[0]??null;
-    const credentialRow=(await db.query<{id:string;agent_id:string;revoked:boolean}>("SELECT id,agent_id,revoked_at IS NOT NULL revoked FROM api_credentials WHERE organization_id=$1 AND id=$2",[plan.setup.organizationId,a.credentialId])).rows[0];
+    const credentialRow=(await db.query<{id:string;agent_id:string;capabilities:string[];revoked:boolean}>("SELECT id,agent_id,capabilities,revoked_at IS NOT NULL revoked FROM api_credentials WHERE organization_id=$1 AND id=$2",[plan.setup.organizationId,a.credentialId])).rows[0];
     const policyRow=(await db.query<any>(`SELECT policy_id,version,mode,allowed_providers,allowed_models,workload_classes,max_per_call_atomic::text per_call,max_hourly_atomic::text hourly,max_daily_atomic::text daily,
       max_requests_per_minute,max_input_tokens,max_output_tokens FROM policy_versions WHERE organization_id=$1 AND policy_id=$2 AND version=$3 FOR SHARE`,[plan.setup.organizationId,a.policy.id,a.policy.version])).rows[0];
     const mandateRow=(await db.query<any>("SELECT id,state,policy_id,policy_version,maximum_spend_atomic::text maximum,expires_at FROM control_mandates WHERE organization_id=$1 AND id=$2",[plan.setup.organizationId,a.mandate.id])).rows[0];
-    const branchRows=(await db.query<any>(`SELECT branch_id,parent_branch_id,allowed_workload_classes,maximum_spend_atomic::text maximum,expires_at FROM mandate_branches
+    const branchRows=(await db.query<any>(`SELECT branch_id,parent_branch_id,allowed_workload_classes,maximum_spend_atomic::text maximum,expires_at,authority_source FROM mandate_branches
       WHERE organization_id=$1 AND mandate_id=$2 AND branch_id=ANY($3::text[])`,[plan.setup.organizationId,a.mandate.id,[a.root.id,...a.children.map(c=>c.id)]])).rows;
     const branchById=new Map<string,any>(branchRows.map(row=>[row.branch_id,row]));
-    lanes.push({lane:a.lane,agent,credential:credentialRow?{id:credentialRow.id,agentId:credentialRow.agent_id,revoked:credentialRow.revoked}:null,
-      policy:policyRow?{id:policyRow.policy_id,version:policyRow.version,mode:policyRow.mode,provider:policyRow.allowed_providers?.[0],model:policyRow.allowed_models?.[0],workloadClass:policyRow.workload_classes?.[0]?.id,perCall:policyRow.per_call,hourly:policyRow.hourly,daily:policyRow.daily,maxRequestsPerMinute:policyRow.max_requests_per_minute,maxInputTokens:policyRow.max_input_tokens,maxOutputTokens:policyRow.max_output_tokens}:null,
+    lanes.push({lane:a.lane,agent,credential:credentialRow?{id:credentialRow.id,agentId:credentialRow.agent_id,capabilities:[...credentialRow.capabilities].sort(),revoked:credentialRow.revoked}:null,
+      policy:policyRow?{id:policyRow.policy_id,version:policyRow.version,mode:policyRow.mode,providers:[...(policyRow.allowed_providers??[])].sort(),models:[...(policyRow.allowed_models??[])].sort(),workloadClasses:[...(policyRow.workload_classes??[])].map((entry:any)=>entry?.id).sort(),perCall:policyRow.per_call,hourly:policyRow.hourly,daily:policyRow.daily,maxRequestsPerMinute:policyRow.max_requests_per_minute,maxInputTokens:policyRow.max_input_tokens,maxOutputTokens:policyRow.max_output_tokens}:null,
       mandate:mandateRow?{id:mandateRow.id,state:mandateRow.state,policyId:mandateRow.policy_id,policyVersion:mandateRow.policy_version,maximum:mandateRow.maximum,expiresAt:mandateRow.expires_at?.toISOString()??null}:null,
-      branches:[a.root,...a.children].map((branch,index)=>{const row=branchById.get(branch.id);return row?{id:row.branch_id,parentId:row.parent_branch_id,maximum:row.maximum,expiresAt:row.expires_at?.toISOString()??null,allowedWorkloadClasses:row.allowed_workload_classes}:{id:branch.id,missing:true,index};})});
+      branches:[a.root,...a.children].map((branch,index)=>{const row=branchById.get(branch.id);return row?{id:row.branch_id,parentId:row.parent_branch_id,maximum:row.maximum,expiresAt:row.expires_at?.toISOString()??null,allowedWorkloadClasses:row.allowed_workload_classes,authoritySource:row.authority_source}:{id:branch.id,missing:true,index};})});
   }
-  const identityIds=[...principals.map(principal=>principal["serviceAccountId"]),...lanes.map(lane=>(lane["agent"] as Record<string,unknown>|null)?.["id"]),V3_AUTHORIZATION_ISSUERS.operator.id,V3_AUTHORIZATION_ISSUERS.reconciliation.id];
+  const identityIds=[...principals.map(principal=>principal["serviceAccountId"]),...lanes.map(lane=>(lane["agent"] as Record<string,unknown>|null)?.["id"]),V4_AUTHORIZATION_ISSUERS.operator.id,V4_AUTHORIZATION_ISSUERS.reconciliation.id];
   const identityIsolation={allDistinct:identityIds.every((id):id is string=>typeof id==="string")&&new Set(identityIds).size===11,principalCount:identityIds.length};
-  return {organization,provider,workloadShadow,schemaFingerprint,principals,payerAbsence,identityIsolation,lanes};
+  return {organization,provider,workloadShadow,schemaFingerprint,cardinalities,principals,payerAbsence,identityIsolation,lanes};
 }
-async function recordExactProductionReadiness(store:ReliabilityProtocolStore,db:Pool,plan:ReliabilityV3Plan){
+async function recordExactProductionReadiness(store:ReliabilityProtocolStore,db:Pool,plan:ReliabilityV4Plan){
   const receipt=await store.recordSetupReadinessReceipt({runId:plan.runId,expectedSnapshot:expectedProductionSetupSnapshot(plan),actualSnapshot:await readProductionSetupSnapshot(db,plan)});
   if(!receipt.ready)throw new Error(`SETUP_READINESS_NOT_EXACT:${receipt.differingFields.join(",")}`);
   await store.requireSetupReadinessReceipt({runId:plan.runId,planFingerprint:plan.planFingerprint});return receipt;
+}
+
+export async function initializeV4SetupControl(store:Pick<ReliabilityProtocolStore,"initializeRun">,plan:ReliabilityV4Plan):Promise<void>{
+  await store.initializeRun({runId:plan.runId,planFingerprint:plan.planFingerprint,lanes:V4_LANES.map(lane=>lane.id),
+    reconciliationCredentialId:plan.setup.reconcilerCredentialId,profile:RELIABILITY_V4_PROFILE});
 }
 
 export function validateEvidenceReportArguments(args:readonly string[]):{planPath:string;outputPath:string|null}{
@@ -161,9 +198,9 @@ export function validateEvidenceReportArguments(args:readonly string[]):{planPat
   return {planPath:required(args,"--plan"),outputPath:flag(args,"--output")??null};
 }
 export function buildFourLaneClaimArtifacts(input:{runId:string;planFingerprint:string}){
-  return V3_LANES.map(({id:lane})=>({evidenceType:"held-out-reliability-v3" as const,protocolVersion:3 as const,
+  return V4_LANES.map(({id:lane})=>({evidenceType:"held-out-reliability-v4" as const,protocolVersion:4 as const,
     runId:input.runId,planFingerprint:input.planFingerprint,artifactKind:"lane_claim" as const,lane,state:"terminal" as const,
-    path:`evidence/.run-claims/held-out-reliability-v3/${input.runId}/${lane}.claim`}));
+    path:`evidence/.run-claims/held-out-reliability-v4/${input.runId}/${lane}.claim`}));
 }
 export function buildProductionEvidenceReport(input:{
   closure:{rows:EvidenceClosureRows;replayTargetRequestIds:string[];acceptedSnapshot:{digest:string;databaseStartedAtMs:number};settlement:{passed:boolean;acceptedSnapshotDigest:string};runId:string};
@@ -177,7 +214,7 @@ export function buildProductionEvidenceReport(input:{
 }
 
 /** Builds strict authority exclusively from the accepted snapshot, sealed plan, and already-bound artifact bytes. */
-export function buildSnapshotBoundStrictInventory(input:{plan:ReliabilityV3Plan;snapshot:Awaited<ReturnType<ReliabilityProtocolStore["loadEvidenceClosureSnapshot"]>>;artifacts:ReconstructedReliabilityArtifacts}):AuthoritativeEvidenceInventory{
+export function buildSnapshotBoundStrictInventory(input:{plan:ReliabilityV4Plan;snapshot:Awaited<ReturnType<ReliabilityProtocolStore["loadEvidenceClosureSnapshot"]>>;artifacts:ReconstructedReliabilityArtifacts}):AuthoritativeEvidenceInventory{
   const {rows}=input.snapshot;
   const attempts=rows.attempts;
   const reconciliation=attempts.flatMap(attempt=>{
@@ -192,15 +229,15 @@ export function buildSnapshotBoundStrictInventory(input:{plan:ReliabilityV3Plan;
     dispatchTokens:rows.dispatchTokens,shadowQueue:rows.shadowQueue,shadowEvidence:rows.shadowEvidence,replayAudits:rows.replayAudits,
     authorizationReceipts:input.artifacts.authorizationReceipts,signedAuthorizations:input.artifacts.signedAuthorizations,
     claims:input.artifacts.claims,manifests:input.artifacts.manifests,reconciliation,
-    incidents:rows.incidents.map(row=>({sequence:Number(row["sequence"]),eventType:String(row["eventType"]),path:`evidence/held-out-reliability-v3/incidents/${input.plan.runId}/${row["sequence"]}-${row["eventType"]}.json`})),
+    incidents:rows.incidents.map(row=>({sequence:Number(row["sequence"]),eventType:String(row["eventType"]),path:`evidence/held-out-reliability-v4/incidents/${input.plan.runId}/${row["sequence"]}-${row["eventType"]}.json`})),
     settlement:{passed:true,acceptedOffsetSeconds:input.snapshot.settlement.acceptedOffsetSeconds,journalCardinality:input.snapshot.settlement.journalCardinality,
       finalSnapshotDigest:input.snapshot.acceptedSnapshot.digest,finalRowCardinality:input.snapshot.settlement.rowCardinality},
     costs:{knownCostMicros:String(cost["knownCostMicros"]??""),unresolvedExposureMicros:String(cost["unresolvedExposureMicros"]??""),knownCostCapMicros:"3000000",unresolvedExposureCapMicros:"320000"},
-    hardFinalization:{allTerminal:attempts.length===100&&attempts.every(row=>row.gateClassificationCount===1),finalizedAt:new Date(input.snapshot.acceptedSnapshot.databaseStartedAtMs).toISOString(),deadline:"2026-08-05T09:30:00.000Z"},
+    hardFinalization:{allTerminal:attempts.length===100&&attempts.every(row=>row.gateClassificationCount===1),finalizedAt:new Date(input.snapshot.acceptedSnapshot.databaseStartedAtMs).toISOString(),deadline:"2026-08-11T09:30:00.000Z"},
     artifactPaths:input.artifacts.artifactPaths};
 }
 
-async function buildStrictSettlementAuthority(cwd:string,args:readonly string[],plan:ReliabilityV3Plan,result:AuthoritativeSettlementResult){
+async function buildStrictSettlementAuthority(cwd:string,args:readonly string[],plan:ReliabilityV4Plan,result:AuthoritativeSettlementResult){
   if(!result.passed||!result.acceptedSnapshot||result.acceptedOffsetSeconds===null||!result.finalSnapshot.digest)throw new Error("ACCEPTED_SETTLEMENT_SNAPSHOT_REQUIRED");
   const settlementDigest=result.finalSnapshot.digest,acceptedOffsetSeconds=result.acceptedOffsetSeconds;
   const rows=result.acceptedSnapshot.rows as unknown as EvidenceClosureRows;
@@ -212,7 +249,7 @@ async function buildStrictSettlementAuthority(cwd:string,args:readonly string[],
       committedAt:new Date(result.acceptedSnapshot.databaseStartedAtMs).toISOString()}};
   const incidents=rows.incidents.map(row=>({sequence:Number(row["sequence"]),eventType:String(row["eventType"])}));
   const reconstructed=await reconstructReliabilityArtifacts({root:cwd,runId:plan.runId,planFingerprint:plan.planFingerprint,incidents,
-    verifyAuthorization:({kind,parsed})=>verifyPinnedAuthorizationSignature(kind,parsed)});
+    verifyAuthorization:({kind,parsed})=>v4AuthorizationIdentityValid(plan,parsed as unknown as AuthorizationArtifact,kind)&&verifyPinnedAuthorizationSignature(kind,parsed)});
   const schedulerManifests=await reconstructSchedulerManifestArtifacts({root:cwd,runId:plan.runId,planFingerprint:plan.planFingerprint,
     claims:rows.schedulerClaims as unknown as SchedulerManifestBindingRow[]});
   const artifactDigests={...reconstructed.artifactDigests,...Object.fromEntries(schedulerManifests.map(artifact=>[artifact.path,artifact.digest]))};
@@ -227,42 +264,52 @@ async function buildStrictSettlementAuthority(cwd:string,args:readonly string[],
   return {marker,reasons:report.reasons};
 }
 
-async function buildEvidenceReport(cwd:string,args:readonly string[]):Promise<Record<string,unknown>>{
+export async function publishPendingV4FinalizationArtifacts(
+  store:Pick<ReliabilityProtocolStore,"publishPendingFailureReport"|"publishPendingReportIntent">,runId:string,
+  publishSupport:(path:string,value:unknown)=>Promise<void>,publishReport:(path:string,bytes:string)=>Promise<void>,
+){
+  const support=await store.publishPendingFailureReport(runId,publishSupport);
+  const report=await store.publishPendingReportIntent(runId,publishReport);
+  return {support,report};
+}
+
+async function buildEvidenceReport(cwd:string,args:readonly string[],candidateProbe:import("../src/evidence/heldOutReliabilityV4.js").V4CandidateIdentityProbe):Promise<Record<string,unknown>>{
   const reportArgs=validateEvidenceReportArguments(args);
-  const plan=parse<ReliabilityV3Plan>(await readFile(resolve(cwd,reportArgs.planPath)),"RELIABILITY_V3_PLAN_INVALID");validateReliabilityV3Plan(plan,false);
+  const plan=parse<ReliabilityV4Plan>(await readFile(resolve(cwd,reportArgs.planPath)),"RELIABILITY_V4_PLAN_INVALID");validateReliabilityV4Plan(plan,false);assertCanonicalPlanCoordinate(cwd,reportArgs.planPath,plan);await requireActualCandidate(plan,candidateProbe);
   const db=pool();try{
     const store=new ReliabilityProtocolStore(db);
-    const finalized=await store.hardFinalizeReliabilityRun({runId:plan.runId,deadlineMs:Date.parse("2026-08-05T09:30:00.000Z"),replayTargetRequestIds:plan.replayTargets.map(target=>target.requestId)});
+    const finalized=await store.hardFinalizeReliabilityRun({runId:plan.runId,deadlineMs:Date.parse("2026-08-11T09:30:00.000Z"),replayTargetRequestIds:plan.replayTargets.map(target=>target.requestId)});
     if(finalized.action==="wait")throw new Error("HARD_FINALIZATION_PENDING");
+    const recovered=await publishPendingV4FinalizationArtifacts(store,plan.runId,
+      async(path,bytes)=>new ReliabilityArtifactStore(cwd).publishBytesOnce(path,String(bytes)),
+      async(path,bytes)=>new ReliabilityArtifactStore(cwd).publishBytesOnce(path,bytes));
     if(finalized.action==="finalize_failure"){
-      const support=await store.publishPendingFailureReport(plan.runId,async(path,bytes)=>new ReliabilityArtifactStore(cwd).publishBytesOnce(path,String(bytes)));
-      const published=await store.publishPendingReportIntent(plan.runId,async(path,bytes)=>new ReliabilityArtifactStore(cwd).publishBytesOnce(path,bytes));
-      return {runId:plan.runId,passed:false,reasons:["HARD_FINALIZATION_DEADLINE"],failurePublished:published.published,
-        paths:[...support.paths,...(published.path?[published.path]:[])]};
+      return {runId:plan.runId,passed:false,reasons:["HARD_FINALIZATION_DEADLINE"],failurePublished:recovered.report.published,
+        paths:[...recovered.support.paths,...(recovered.report.path?[recovered.report.path]:[])]};
     }
-    const publication=await store.publishPendingReportIntent(plan.runId,async(path,bytes)=>new ReliabilityArtifactStore(cwd).publishBytesOnce(path,bytes));
+    const publication=recovered.report;
     if(!publication.report)throw new Error("REPORT_INTENT_REQUIRED");
     return {report:publication.report,...publication.report as Record<string,unknown>,output:publication.path,finalCommitted:publication.published};
   }finally{await db.end();}
 }
 
 async function verifyPair(
-  store: ReliabilityProtocolStore, db: Pool, plan: ReliabilityV3Plan,
+  store: ReliabilityProtocolStore, db: Pool, plan: ReliabilityV4Plan,
   operator: AuthorizationArtifact|null, reconciliation: AuthorizationArtifact|null,
   operatorArtifactSha256:`sha256:${string}`|"absent", reconciliationArtifactSha256:`sha256:${string}`|"absent",
   validationDeadline:string, decisionDeadline:string, publicationDeadline:string, transitionDeadline:string,
   failPredecision:(reasonCode:string)=>Promise<never>,
   publish: (kind: string, receipt: unknown) => Promise<void>,
 ): Promise<void> {
-  const now=await databaseNow(db); const expected=(kind:"operator"|"reconciliation")=>{const principal=kind==="operator"?plan.setup.operatorServiceAccountId:plan.setup.reconcilerServiceAccountId;return {now,expectedRunId:plan.runId,expectedPlanFingerprint:plan.planFingerprint,expectedExecutableFingerprint:executableFingerprint(plan),expectedProtocolIdentity:{organizationId:plan.setup.organizationId,profileFingerprint:plan.profileFingerprint,serviceAccountId:principal,credentialId:kind==="operator"?plan.setup.operatorCredentialId:plan.setup.reconcilerCredentialId,credentialOwnerId:principal}};};
-  const valid=(artifact:AuthorizationArtifact|null,kind:"operator"|"reconciliation")=>{try{return artifact!==null&&v3AuthorizationIdentityValid(plan,artifact,kind)&&verifyAuthorizationArtifact(artifact,kind,expected(kind),V3_AUTHORIZATION_ISSUERS);}catch{return false;}};
+  const now=await databaseNow(db); const expected=(kind:"operator"|"reconciliation")=>v4AuthorizationVerificationOptions(plan,kind,now);
+  const valid=(artifact:AuthorizationArtifact|null,kind:"operator"|"reconciliation")=>{try{return artifact!==null&&v4AuthorizationIdentityValid(plan,artifact,kind)&&verifyAuthorizationArtifact(artifact,kind,expected(kind),V4_AUTHORIZATION_ISSUERS);}catch{return false;}};
   const operatorValid=valid(operator,"operator");
   const reconciliationValid=valid(reconciliation,"reconciliation")&&operator!==null&&reconciliation!==null
     &&operator.payload.actorId!==reconciliation.payload.actorId&&operator.payload.issuerCredentialId!==reconciliation.payload.issuerCredentialId;
   const active=operatorValid&&reconciliationValid;
   if(Date.parse(await databaseNow(db))>=Date.parse(validationDeadline))await failPredecision("validation_phase_deadline");
   const verdict={operatorValid,reconciliationValid,runId:plan.runId,planFingerprint:plan.planFingerprint};
-  const common={evidenceType:"held-out-reliability-v3",protocolVersion:3,runId:plan.runId,planFingerprint:plan.planFingerprint,artifactKind:"authorization_receipt"};
+  const common={evidenceType:"held-out-reliability-v4",protocolVersion:4,runId:plan.runId,planFingerprint:plan.planFingerprint,artifactKind:"authorization_receipt"};
   const operatorReceipt={...common,kind:"operator",status:operatorValid?(reconciliationValid?"consumed":"valid_not_consumed_peer_invalid"):"absent_or_invalid",databaseValidationTime:now,reasonCode:active?"valid_pair":"absent_or_invalid_pair",presentedArtifactSha256:operatorArtifactSha256};
   const reconciliationReceipt={...common,kind:"reconciliation",status:reconciliationValid?(operatorValid?"validated":"valid_not_activated_peer_invalid"):"absent_or_invalid",databaseValidationTime:now,reasonCode:active?"valid_pair":"absent_or_invalid_pair",presentedArtifactSha256:reconciliationArtifactSha256};
   const decisionKind=active?"active":"readiness_failed" as const;
@@ -271,7 +318,7 @@ async function verifyPair(
     profileFingerprint:plan.profileFingerprint,decisionKind,reasonCode,operatorArtifactSha256,reconciliationArtifactSha256});
   try{
     await store.commitAuthorization({runId:plan.runId,decisionId,verdict,active,
-      operatorIssuerId:operator?.payload?.issuerCredentialId??V3_AUTHORIZATION_ISSUERS.operator.id,operatorNonce:active?operator!.payload.nonce:null,
+      operatorIssuerId:operator?.payload?.issuerCredentialId??V4_AUTHORIZATION_ISSUERS.operator.id,operatorNonce:active?operator!.payload.nonce:null,
       operatorReceipt,reconciliationReceipt,decisionDeadline});
   }catch(error){
     if(error instanceof Error&&error.message==="AUTHORIZATION_DECISION_DEADLINE_MISSED")await failPredecision("decision_phase_deadline");
@@ -280,6 +327,13 @@ async function verifyPair(
   await store.publishAuthorizationOutbox(plan.runId,publish,publicationDeadline);
   await store.completeAuthorizationOperation(plan.runId,transitionDeadline);
   if(!active) throw new Error("SIGNED_AUTHORIZATION_PAIR_INVALID");
+}
+
+export function v4AuthorizationVerificationOptions(plan:ReliabilityV4Plan,kind:"operator"|"reconciliation",now:string){
+  const principal=kind==="operator"?plan.setup.operatorServiceAccountId:plan.setup.reconcilerServiceAccountId;
+  return {now,expectedRunId:plan.runId,expectedPlanFingerprint:plan.planFingerprint,expectedExecutableFingerprint:executableFingerprint(plan),
+    expectedProtocolIdentity:{organizationId:plan.setup.organizationId,profileFingerprint:plan.profileFingerprint,serviceAccountId:principal,
+      credentialId:kind==="operator"?plan.setup.operatorCredentialId:plan.setup.reconcilerCredentialId,credentialOwnerId:principal}};
 }
 
 export function classifyPresentedAuthorizationArtifacts(operatorBytes?:Buffer,reconciliationBytes?:Buffer):{
@@ -291,20 +345,30 @@ export function classifyPresentedAuthorizationArtifacts(operatorBytes?:Buffer,re
   return {operator:decode(operatorBytes),reconciliation:decode(reconciliationBytes),operatorArtifactSha256:digest(operatorBytes),reconciliationArtifactSha256:digest(reconciliationBytes)};
 }
 
-export function v3AuthorizationIdentityValid(plan:ReliabilityV3Plan,artifact:AuthorizationArtifact,kind:"operator"|"reconciliation"):boolean{
-  const expectedExpiry=kind==="operator"?"2026-08-02T08:22:00.000Z":"2026-08-05T09:30:00.000Z";
-  const nonceValid=kind==="operator"?typeof artifact.payload.nonce==="string"&&new RegExp(`^hov3:${plan.runId.replace(/[.*+?^${}()|[\]\\]/g,"\\$&")}:[a-f0-9]{64}$`).test(artifact.payload.nonce):artifact.payload.nonce===null;
+export function v4AuthorizationIdentityValid(plan:ReliabilityV4Plan,artifact:AuthorizationArtifact,kind:"operator"|"reconciliation"):boolean{
+  const expectedExpiry=kind==="operator"?"2026-08-08T08:22:00.000Z":"2026-08-11T09:30:00.000Z";
+  const nonceValid=kind==="operator"?typeof artifact.payload.nonce==="string"&&new RegExp(`^hov4:${plan.runId.replace(/[.*+?^${}()|[\]\\]/g,"\\$&")}:[a-f0-9]{64}$`).test(artifact.payload.nonce):artifact.payload.nonce===null;
   const expectedActor=`${plan.runId}-${kind==="operator"?"operator":"reconciler"}`;
   const expectedCredential=kind==="operator"?plan.setup.operatorCredentialId:plan.setup.reconcilerCredentialId;
-  return artifact.payload.kind===kind&&artifact.payload.runId===plan.runId&&artifact.payload.actorId===expectedActor
+  return artifact.payload.kind===kind&&artifact.payload.runId===plan.runId&&artifact.payload.planFingerprint===plan.planFingerprint
+    &&artifact.payload.executableFingerprint===executableFingerprint(plan)&&artifact.payload.actorId===expectedActor
     &&artifact.payload.organizationId===plan.setup.organizationId&&artifact.payload.profileFingerprint===plan.profileFingerprint
     &&artifact.payload.serviceAccountId===expectedActor&&artifact.payload.credentialId===expectedCredential&&artifact.payload.credentialOwnerId===expectedActor
-    &&artifact.payload.issuerCredentialId===V3_AUTHORIZATION_ISSUERS[kind].id&&artifact.payload.expiresAt===expectedExpiry&&nonceValid;
+    &&artifact.payload.issuerCredentialId===V4_AUTHORIZATION_ISSUERS[kind].id
+    &&artifact.payload.capability===(kind==="operator"?"evidence:authorize-spend":"evidence:authorize-reconciliation")
+    &&artifact.payload.expiresAt===expectedExpiry&&nonceValid;
 }
 
-function callBody(plan:ReliabilityV3Plan,call:ReliabilityV3Plan["calls"][number]):Record<string,unknown>{return {model:plan.model,max_tokens:8,workload_class:call.workloadClass,messages:[{role:"user",content:`Reliability context ${call.contextUnits}: ${"x".repeat(call.contextUnits)}`} ]};}
-function laneAuthority(plan:ReliabilityV3Plan,lane:string){const authority=plan.setup.authority.find((item)=>item.lane===lane);if(!authority)throw new Error("SEALED_LANE_AUTHORITY_REQUIRED");return authority;}
-async function controlledInference(baseUrl:string,token:string,plan:ReliabilityV3Plan,call:ReliabilityV3Plan["calls"][number]):Promise<unknown>{
+function callBody(plan:ReliabilityV4Plan,call:ReliabilityV4Plan["calls"][number]):Record<string,unknown>{return {model:plan.model,max_tokens:8,workload_class:call.workloadClass,messages:[{role:"user",content:`Reliability context ${call.contextUnits}: ${"x".repeat(call.contextUnits)}`} ]};}
+function laneAuthority(plan:ReliabilityV4Plan,lane:string){const authority=plan.setup.authority.find((item)=>item.lane===lane);if(!authority)throw new Error("SEALED_LANE_AUTHORITY_REQUIRED");return authority;}
+export function v4SealedCallRegistration(plan:ReliabilityV4Plan,call:ReliabilityV4Plan["calls"][number]){
+  const authority=laneAuthority(plan,call.lane);
+  return {requestId:call.requestId,block:call.block,laneId:call.lane,callOrdinal:call.callOrdinal,body:callBody(plan,call),organizationId:plan.setup.organizationId,
+    agentId:authority.agentId,credentialId:authority.credentialId,mandateId:authority.mandate.id,branchId:authority.children[call.branch-1].id,
+    workloadClass:call.workloadClass,provider:plan.provider,model:plan.model,maxOutputTokens:call.maxOutputTokens,
+    reservationCostMicros:BigInt(call.reservationUsdMicros),claimFingerprint:plan.planFingerprint,requestCommitment:call.requestCommitment};
+}
+async function controlledInference(baseUrl:string,token:string,plan:ReliabilityV4Plan,call:ReliabilityV4Plan["calls"][number]):Promise<unknown>{
   const authority=laneAuthority(plan,call.lane);const child=authority.children[call.branch-1];
   const headers:Record<string,string>={"Content-Type":"application/json","Idempotency-Key":call.requestId,"X-Fuse-Mandate":authority.mandate.id,"X-Fuse-Branch":child.id,"X-Fuse-Reliability-Run":plan.runId,"X-Fuse-Reliability-Lane":call.lane,"X-Fuse-Reliability-Block":String(call.block)};
   headers[["Author","ization"].join("")]=`Bearer ${token}`;
@@ -312,16 +376,16 @@ async function controlledInference(baseUrl:string,token:string,plan:ReliabilityV
   const text=await response.text(); if(response.status===402)throw new Error("PAYMENT_REQUIRED_FAIL_CLOSED"); if(!response.ok)throw new Error(`CONTROLLED_INFERENCE_HTTP_${response.status}`); return JSON.parse(text);
 }
 
-export function createReliabilityOperations(cwd=process.cwd()): NonNullable<ReliabilityCliDependencies["operations"]> {
+export function createReliabilityOperations(cwd=process.cwd(),candidateProbe:import("../src/evidence/heldOutReliabilityV4.js").V4CandidateIdentityProbe=unavailableCandidateProbe): NonNullable<ReliabilityCliDependencies["operations"]> {
   return {
     doctor: async ({args})=>{
-      const plan=parse<ReliabilityV3Plan>(await readFile(resolve(cwd,required(args,"--plan"))),"RELIABILITY_V3_PLAN_INVALID");validateReliabilityV3Plan(plan,false);
+      const requestedPlan=required(args,"--plan");const plan=parse<ReliabilityV4Plan>(await readFile(resolve(cwd,requestedPlan)),"RELIABILITY_V4_PLAN_INVALID");validateReliabilityV4Plan(plan,false);assertCanonicalPlanCoordinate(cwd,requestedPlan,plan);await requireActualCandidate(plan,candidateProbe);
       const db=pool();try{
         const store=new ReliabilityProtocolStore(db);await store.createSchema();
         const readiness=await db.query<{scheduler:string|null;audit:string|null}>("SELECT to_regclass('public.reliability_scheduler_claims')::text scheduler,to_regclass('public.reliability_replay_write_audit')::text audit");
         if(!readiness.rows[0]?.scheduler)throw new Error("RESTART_RESUME_RECOVERY_UNAVAILABLE");
         if(!readiness.rows[0]?.audit)throw new Error("REPLAY_AUDIT_UNAVAILABLE");
-        await store.initializeRun({runId:plan.runId,planFingerprint:plan.planFingerprint,lanes:V3_LANES.map(l=>l.id),reconciliationCredentialId:plan.setup.reconcilerCredentialId,profile:RELIABILITY_V3_PROFILE});
+        await store.initializeRun({runId:plan.runId,planFingerprint:plan.planFingerprint,lanes:V4_LANES.map(l=>l.id),reconciliationCredentialId:plan.setup.reconcilerCredentialId,profile:RELIABILITY_V4_PROFILE});
         const receipt=await store.recordSetupReadinessReceipt({runId:plan.runId,expectedSnapshot:expectedProductionSetupSnapshot(plan),actualSnapshot:await readProductionSetupSnapshot(db,plan)});
         if(!receipt.ready)throw new Error(`SETUP_READINESS_NOT_EXACT:${receipt.differingFields.join(",")}`);
         await store.requireSetupReadinessReceipt({runId:plan.runId,planFingerprint:plan.planFingerprint});
@@ -329,22 +393,25 @@ export function createReliabilityOperations(cwd=process.cwd()): NonNullable<Reli
       }finally{await db.end();}
     },
     setup: async ({args})=>{
-      const plan=parse<ReliabilityV3Plan>(await readFile(resolve(cwd,required(args,"--plan"))),"RELIABILITY_V3_PLAN_INVALID");validateReliabilityV3Plan(plan,false);
+      const requestedPlan=required(args,"--plan");const plan=parse<ReliabilityV4Plan>(await readFile(resolve(cwd,requestedPlan)),"RELIABILITY_V4_PLAN_INVALID");validateReliabilityV4Plan(plan,false);assertCanonicalPlanCoordinate(cwd,requestedPlan,plan);await requireActualCandidate(plan,candidateProbe);
       const db=pool(),store=new ReliabilityProtocolStore(db);
       try{
         await store.createSchema();
+        await initializeV4SetupControl(store,plan);
         const refreshedSetupReadiness=await recordExactProductionReadiness(store,db,plan);
         const setupReadinessReceipt=refreshedSetupReadiness.snapshotDigest;
-        await store.registerSealedCalls({runId:plan.runId,calls:plan.calls.map(call=>{const authority=laneAuthority(plan,call.lane);return {requestId:call.requestId,block:call.block,laneId:call.lane,callOrdinal:call.callOrdinal,body:callBody(plan,call),organizationId:plan.setup.organizationId,agentId:authority.agentId,credentialId:authority.credentialId,mandateId:authority.mandate.id,branchId:authority.children[call.branch-1].id,workloadClass:call.workloadClass,provider:plan.provider,model:plan.model,maxOutputTokens:call.maxOutputTokens,reservationCostMicros:BigInt(call.reservationUsdMicros),claimFingerprint:plan.planFingerprint,requestCommitment:call.requestCommitment};})});
+        await store.registerSealedCalls({runId:plan.runId,calls:plan.calls.map(call=>v4SealedCallRegistration(plan,call))});
         const readback=await db.query<{calls:string;attempts:string}>(`SELECT
           (SELECT count(*)::text FROM reliability_sealed_calls WHERE run_id=$1 AND claim_fingerprint=$2) calls,
-          (SELECT count(*)::text FROM reliability_protocol_attempts WHERE run_id=$1) attempts`,[plan.runId,plan.planFingerprint]);
+          (SELECT count(*)::text FROM reliability_protocol_attempts attempt JOIN reliability_sealed_calls sealed
+             ON sealed.run_id=attempt.run_id AND sealed.request_id=attempt.request_id
+             WHERE attempt.run_id=$1 AND attempt.request_commitment=sealed.request_commitment) attempts`,[plan.runId,plan.planFingerprint]);
         if(Number(readback.rows[0]?.calls)!==100||Number(readback.rows[0]?.attempts)!==100)throw new Error("SETUP_READBACK_CONFLICT");
         return {runId:plan.runId,setupFingerprint:plan.setup.setupFingerprint,setupReadinessReceipt,exactReadback:true,sealedCalls:100};
       }finally{await db.end();}
     },
     worker: async ({args})=>{
-      const plan=parse<ReliabilityV3Plan>(await readFile(resolve(cwd,required(args,"--plan"))),"RELIABILITY_V3_PLAN_INVALID");validateReliabilityV3Plan(plan,false);
+      const requestedPlan=required(args,"--plan");const plan=parse<ReliabilityV4Plan>(await readFile(resolve(cwd,requestedPlan)),"RELIABILITY_V4_PLAN_INVALID");validateReliabilityV4Plan(plan,false);assertCanonicalPlanCoordinate(cwd,requestedPlan,plan);await requireActualCandidate(plan,candidateProbe);
       const requestId=required(args,"--request-id"),ownerId=required(args,"--owner-id");const call=plan.calls.find(c=>c.requestId===requestId);if(!call)throw new Error("WORKER_REQUEST_NOT_SEALED");
       const manifestRelativePath=required(args,"--manifest");
       const manifestPath=resolve(cwd,manifestRelativePath);const db=pool(),store=new ReliabilityProtocolStore(db);
@@ -363,7 +430,7 @@ export function createReliabilityOperations(cwd=process.cwd()): NonNullable<Reli
               return {terminal:(await store.readSchedulerRecoveryState({runId:plan.runId,requestId})).terminal};},
             readManifest:async()=>{try{return parse<{state:string;sequence:number}>(await readFile(manifestPath),"SCHEDULER_MANIFEST_INVALID");}catch(error){if(error instanceof Error&&error.message==="SCHEDULER_MANIFEST_INVALID")throw error;return null;}},
             publishManifest:async manifest=>{
-              const repaired={...manifest,evidenceType:"held-out-reliability-v3",protocolVersion:3,
+              const repaired={...manifest,evidenceType:"held-out-reliability-v4",protocolVersion:4,
                 planFingerprint:plan.planFingerprint,artifactKind:"scheduler_manifest",runId:plan.runId,requestId,laneId:call.lane,block:call.block,ownerId,generation:claim.generation};
               await publishManifestDurably(manifestPath,repaired);
               if(claim.generation!==null)await store.recordRecoveredTerminalSchedulerManifest({runId:plan.runId,requestId,laneId:call.lane,generation:claim.generation,
@@ -372,7 +439,7 @@ export function createReliabilityOperations(cwd=process.cwd()): NonNullable<Reli
           });
           return {runId:plan.runId,requestId,recoveryDecision:recovered.action,dispatched:false,terminal:recovered.terminal,manifestRepaired:recovered.manifestRepaired};
         }
-        const claimed={evidenceType:"held-out-reliability-v3",protocolVersion:3,planFingerprint:plan.planFingerprint,
+        const claimed={evidenceType:"held-out-reliability-v4",protocolVersion:4,planFingerprint:plan.planFingerprint,
           artifactKind:"scheduler_manifest",state:"claimed",sequence:1,runId:plan.runId,requestId,laneId:call.lane,block:call.block,ownerId,generation:claim.generation};
         await publishManifestDurably(manifestPath,claimed);const digest=`sha256:${createHash("sha256").update(`${canonicalJson(claimed)}\n`).digest("hex")}`;
         await store.recordSchedulerManifestFsynced({runId:plan.runId,requestId,laneId:call.lane,ownerId,generation:claim.generation,manifestDigest:digest,state:"claimed"});
@@ -397,32 +464,54 @@ export function createReliabilityOperations(cwd=process.cwd()): NonNullable<Reli
       }finally{await db.end();}
     },
     seal: async ({args,files})=>{
-      const beacon=await verifyPinnedReliabilityV3Beacon(parse(files.beacon!,"RELIABILITY_V3_BEACON_INVALID"));
-      const identity=parse<ExecutableV3Identity>(await readFile(resolve(cwd,required(args,"--identity"))),"RELIABILITY_V3_IDENTITY_INVALID");
-      const plan=buildReliabilityV3Plan(beacon,required(args,"--run-id"),identity); const output=resolve(cwd,required(args,"--output"));
-      await publishAbsolute(output,plan); return {sealed:true,planPath:output,planFingerprint:plan.planFingerprint,plannedFresh:100,plannedReplays:20,beaconCalls:0};
+      if(flag(args,"--output"))throw new Error("BEACON_PLAN_ARBITRARY_OUTPUT_FORBIDDEN");
+      const identity=parse<ExecutableV4Identity>(await readFile(resolve(cwd,required(args,"--identity"))),"RELIABILITY_V4_IDENTITY_INVALID");
+      validateV4Identity(identity);
+      const probePlan={identity,runId:required(args,"--run-id")} as ReliabilityV4Plan;
+      await requireActualCandidate(probePlan,candidateProbe);
+      const parsedBeacon=parse(files.beacon!,"RELIABILITY_V4_BEACON_INVALID");
+      const beacon=await verifyPinnedReliabilityV4Beacon(parsedBeacon);
+      const plan=buildReliabilityV4Plan(beacon,required(args,"--run-id"),identity);
+      const beaconBytes=Buffer.from(`${canonicalJson(parsedBeacon)}\n`,"utf8");
+      const planBytes=Buffer.from(`${canonicalJson(plan)}\n`,"utf8");
+      const intent=buildBeaconPlanPublicationIntent({runId:plan.runId,profileFingerprint:plan.profileFingerprint,planFingerprint:plan.planFingerprint,beaconBytes,planBytes});
+      await publishBeaconPlanPair(cwd,intent);
+      return {sealed:true,planPath:resolve(cwd,intent.members[1].destination),planFingerprint:plan.planFingerprint,plannedFresh:100,plannedReplays:20,beaconCalls:0};
     },
     authorize: async ({args})=>{
-      const planPath=resolve(cwd,required(args,"--plan")); const plan=parse<ReliabilityV3Plan>(await readFile(planPath),"RELIABILITY_V3_PLAN_INVALID"); validateReliabilityV3Plan(plan,false);
+      const requestedPlan=resolve(cwd,required(args,"--plan"));
+      const plan=parse<ReliabilityV4Plan>(await readFile(requestedPlan),"RELIABILITY_V4_PLAN_INVALID"); validateReliabilityV4Plan(plan,false);
+      if(requestedPlan!==canonicalPlanPath(cwd,plan.planFingerprint))throw new Error("RELIABILITY_V4_PLAN_PATH_INVALID");
+      await requireActualCandidate(plan,candidateProbe);
       const kind=required(args,"--kind"); if(kind!=="operator"&&kind!=="reconciliation")throw new Error("AUTHORIZATION_KIND_INVALID");
       const actorId=required(args,"--actor-id"); const issuerCredentialId=required(args,"--issuer-id"); const expiresAt=required(args,"--expires-at");
-      if(!actorId.startsWith("hov3-")||issuerCredentialId!==V3_AUTHORIZATION_ISSUERS[kind].id)throw new Error("RELIABILITY_V3_AUTHORIZATION_IDENTITY_INVALID");
-      const expectedExpiry=kind==="operator"?"2026-08-02T08:22:00.000Z":"2026-08-05T09:30:00.000Z";if(expiresAt!==expectedExpiry)throw new Error("RELIABILITY_V3_AUTHORIZATION_EXPIRY_INVALID");
-      const nonce=kind==="operator"?required(args,"--nonce"):null;if(kind==="operator"&&!nonce!.startsWith(`hov3:${plan.runId}:`))throw new Error("RELIABILITY_V3_AUTHORIZATION_NONCE_INVALID");
+      const expectedActor=`${plan.runId}-${kind==="operator"?"operator":"reconciler"}`;
+      if(actorId!==expectedActor||issuerCredentialId!==V4_AUTHORIZATION_ISSUERS[kind].id)throw new Error("RELIABILITY_V4_AUTHORIZATION_IDENTITY_INVALID");
+      const expectedExpiry=kind==="operator"?"2026-08-08T08:22:00.000Z":"2026-08-11T09:30:00.000Z";if(expiresAt!==expectedExpiry)throw new Error("RELIABILITY_V4_AUTHORIZATION_EXPIRY_INVALID");
+      const nonce=kind==="operator"?`hov4:${plan.runId}:${randomBytes(32).toString("hex")}`:null;
       const credentialId=kind==="operator"?plan.setup.operatorCredentialId:plan.setup.reconcilerCredentialId;
       const payload:AuthorizationPayload={kind,runId:plan.runId,organizationId:plan.setup.organizationId,planFingerprint:plan.planFingerprint,profileFingerprint:plan.profileFingerprint,
         executableFingerprint:executableFingerprint(plan),actorId,serviceAccountId:actorId,credentialId,credentialOwnerId:actorId,issuerCredentialId,
         capability:kind==="operator"?"evidence:authorize-spend":"evidence:authorize-reconciliation",nonce,expiresAt};
       const signed=await signAuthorizationArtifact(payload,resolve(cwd,required(args,"--private-key")));
-      const artifact={...signed,evidenceType:"held-out-reliability-v3",protocolVersion:3,runId:plan.runId,planFingerprint:plan.planFingerprint,artifactKind:"authorization",kind};
+      const artifact={...signed,evidenceType:"held-out-reliability-v4",protocolVersion:4,runId:plan.runId,planFingerprint:plan.planFingerprint,artifactKind:"authorization",kind};
       const publicKeyPath=required(args,"--public-key"); const publicKey=createPublicKey(await readFile(resolve(cwd,publicKeyPath)));
-      const publicDer=publicKey.export({type:"spki",format:"der"});const publicRaw=Buffer.from(publicDer).subarray(-32).toString("hex");if(publicRaw!==V3_AUTHORIZATION_ISSUERS[kind].rawPublicKeyHex)throw new Error("RELIABILITY_V3_AUTHORIZATION_KEY_UNPINNED");
+      const publicDer=publicKey.export({type:"spki",format:"der"});const publicRaw=Buffer.from(publicDer).subarray(-32).toString("hex");if(publicRaw!==V4_AUTHORIZATION_ISSUERS[kind].rawPublicKeyHex)throw new Error("RELIABILITY_V4_AUTHORIZATION_KEY_UNPINNED");
       if(!verify(null,authorizationPayloadBytes(payload),publicKey,Buffer.from(artifact.signature,"base64")))throw new Error("AUTHORIZATION_SIGNATURE_SELF_CHECK_FAILED");
-      const output=resolve(cwd,required(args,"--output")); await publishAbsolute(output,artifact);
-      return {authorized:true,kind,artifactPath:output,artifactSha256:`sha256:${createHash("sha256").update(canonicalJson(artifact)).digest("hex")}`};
+      const expectedOutput=join(cwd,"evidence/held-out-reliability-v4/authorizations",kind,`${plan.runId}.json`);
+      const suppliedOutput=flag(args,"--output");
+      if(suppliedOutput&&resolve(cwd,suppliedOutput)!==expectedOutput)throw new Error("RELIABILITY_V4_AUTHORIZATION_OUTPUT_INVALID");
+      await publishAbsolute(expectedOutput,artifact);
+      return {authorized:true,kind,artifactPath:expectedOutput,artifactSha256:`sha256:${createHash("sha256").update(canonicalJson(artifact)).digest("hex")}`};
     },
     run: async ({args,files})=>{
-      const plan=parse<ReliabilityV3Plan>(files.plan!,"RELIABILITY_V3_PLAN_INVALID"); validateReliabilityV3Plan(plan,false);
+      const requestedPlan=resolve(cwd,required(args,"--plan"));
+      const plan=parse<ReliabilityV4Plan>(files.plan!,"RELIABILITY_V4_PLAN_INVALID"); validateReliabilityV4Plan(plan,false);
+      if(requestedPlan!==canonicalPlanPath(cwd,plan.planFingerprint))throw new Error("RELIABILITY_V4_PLAN_PATH_INVALID");
+      const operatorPath=flag(args,"--operator-authorization");
+      const reconciliationPath=flag(args,"--reconciliation-authorization");
+      if((operatorPath&&resolve(cwd,operatorPath)!==canonicalAuthorizationPath(cwd,"operator",plan.runId))||(reconciliationPath&&resolve(cwd,reconciliationPath)!==canonicalAuthorizationPath(cwd,"reconciliation",plan.runId)))throw new Error("RELIABILITY_V4_AUTHORIZATION_PATH_INVALID");
+      await requireActualCandidate(plan,candidateProbe);
       const db=pool(); const store=new ReliabilityProtocolStore(db); let dispatched=0;
       try{
         await store.createSchema();
@@ -436,7 +525,7 @@ export function createReliabilityOperations(cwd=process.cwd()): NonNullable<Reli
           throw new Error(reasonCode);
         };
         const authorizationStartedAt=Date.parse(authorizationOperation.startedAt);
-        if(authorizationStartedAt<Date.parse(V3_AUTHORIZATION_WINDOW.startsAt)||authorizationStartedAt>=Date.parse(V3_AUTHORIZATION_WINDOW.startsBefore))
+        if(authorizationStartedAt<Date.parse(V4_AUTHORIZATION_WINDOW.startsAt)||authorizationStartedAt>=Date.parse(V4_AUTHORIZATION_WINDOW.startsBefore))
           await failPredecision("validation_phase_deadline");
         if((await store.databaseTime()).getTime()>=Date.parse(authorizationOperation.validationDeadline))await failPredecision("validation_phase_deadline");
         const refreshedSetupReadiness=await recordExactProductionReadiness(store,db,plan);
@@ -444,17 +533,17 @@ export function createReliabilityOperations(cwd=process.cwd()): NonNullable<Reli
         if((await store.databaseTime()).getTime()>=Date.parse(authorizationOperation.decisionDeadline))await failPredecision("decision_phase_deadline");
         await verifyPair(store,db,plan,presented.operator,presented.reconciliation,presented.operatorArtifactSha256,presented.reconciliationArtifactSha256,
           authorizationOperation.validationDeadline,authorizationOperation.decisionDeadline,authorizationOperation.publicationDeadline,authorizationOperation.transitionDeadline,failPredecision,async (kind,receipt)=>{
-          const path=resolve(cwd,"evidence","held-out-reliability-v3","authorization-receipts",kind,`${plan.runId}.json`);
+          const path=resolve(cwd,"evidence","held-out-reliability-v4","authorization-receipts",kind,`${plan.runId}.json`);
           await publishAbsolute(path,receipt);
         });
 
         const baseUrl=required(args,"--base-url");const tokens=new Map<string,string>();const tokenFiles=new Map<string,string>();
-        for(const lane of V3_LANES){const tokenFile=required(args,`--lane-token-${lane.id}`);const token=(await readFile(resolve(cwd,tokenFile),"utf8")).trim();if(!token)throw new Error("AGENT_TOKEN_REQUIRED");tokens.set(lane.id,token);tokenFiles.set(lane.id,tokenFile);}
-        const worker=async(call:ReliabilityV3Plan["calls"][number])=>runWorkerProcess({executable:process.execPath,cwd,argv:["--import",resolve(cwd,"node_modules/tsx/dist/loader.mjs"),resolve(cwd,"scripts/held-out-reliability-v3.ts"),"worker","--plan",required(args,"--plan"),"--request-id",call.requestId,"--owner-id",required(args,"--owner-id"),"--manifest",join("evidence","held-out-reliability-v3","scheduler-manifests",plan.runId,`${call.requestId}.json`),"--lane-token-file",tokenFiles.get(call.lane)!,"--base-url",baseUrl]});
-        await store.registerSealedCalls({runId:plan.runId,calls:plan.calls.map((call)=>{const authority=laneAuthority(plan,call.lane);return {requestId:call.requestId,block:call.block,laneId:call.lane,callOrdinal:call.callOrdinal,body:callBody(plan,call),organizationId:plan.setup.organizationId,agentId:authority.agentId,credentialId:authority.credentialId,mandateId:authority.mandate.id,branchId:authority.children[call.branch-1].id,workloadClass:call.workloadClass,provider:plan.provider,model:plan.model,maxOutputTokens:call.maxOutputTokens,reservationCostMicros:BigInt(call.reservationUsdMicros),claimFingerprint:plan.planFingerprint};})});
-        const publishLaneManifest=async(laneId:string,block:number)=>publishAbsolute(resolve(cwd,"evidence","held-out-reliability-v3","manifests",plan.runId,`${laneId}-${block}.json`),
-          {evidenceType:"held-out-reliability-v3",protocolVersion:3,runId:plan.runId,planFingerprint:plan.planFingerprint,artifactKind:"manifest",lane:laneId,block,state:"terminal"});
-        const enqueueCalls=async(calls:ReliabilityV3Plan["calls"],nominalOrigin:string):Promise<boolean>=>{
+        for(const lane of V4_LANES){const tokenFile=required(args,`--lane-token-${lane.id}`);const token=(await readFile(resolve(cwd,tokenFile),"utf8")).trim();if(!token)throw new Error("AGENT_TOKEN_REQUIRED");tokens.set(lane.id,token);tokenFiles.set(lane.id,tokenFile);}
+        const worker=async(call:ReliabilityV4Plan["calls"][number])=>runWorkerProcess({executable:process.execPath,cwd,argv:["--import",resolve(cwd,"node_modules/tsx/dist/loader.mjs"),resolve(cwd,"scripts/held-out-reliability-v4.ts"),"worker","--allow-provider-network","--plan",required(args,"--plan"),"--request-id",call.requestId,"--owner-id",required(args,"--owner-id"),"--manifest",join("evidence","held-out-reliability-v4","scheduler-manifests",plan.runId,`${call.requestId}.json`),"--lane-token-file",tokenFiles.get(call.lane)!,"--base-url",baseUrl]});
+        await store.registerSealedCalls({runId:plan.runId,calls:plan.calls.map(call=>v4SealedCallRegistration(plan,call))});
+        const publishLaneManifest=async(laneId:string,block:number)=>publishAbsolute(resolve(cwd,"evidence","held-out-reliability-v4","manifests",plan.runId,`${laneId}-${block}.json`),
+          {evidenceType:"held-out-reliability-v4",protocolVersion:4,runId:plan.runId,planFingerprint:plan.planFingerprint,artifactKind:"manifest",lane:laneId,block,state:"terminal"});
+        const enqueueCalls=async(calls:ReliabilityV4Plan["calls"],nominalOrigin:string):Promise<boolean>=>{
           let queued=false;
           for(const [index,call] of calls.entries()){
             const nominalScheduledAt=new Date(Date.parse(nominalOrigin)+(call.lane==="bounded-burst"?0:index*5_000)).toISOString();
@@ -463,7 +552,7 @@ export function createReliabilityOperations(cwd=process.cwd()): NonNullable<Reli
           }
           return queued;
         };
-        const executeLaneCalls=async(lane:typeof V3_LANES[number],calls:ReliabilityV3Plan["calls"],nominalOrigin:string):Promise<boolean>=>{
+        const executeLaneCalls=async(lane:typeof V4_LANES[number],calls:ReliabilityV4Plan["calls"],nominalOrigin:string):Promise<boolean>=>{
           if(lane.mode==="bounded-burst"){
             await store.createBurstBarrier({runId:plan.runId,laneId:lane.id,block:calls[0]!.block,requestIds:calls.map(call=>call.requestId)});
             const pending=calls.map(call=>worker(call).then(()=>null,()=>call.requestId));
@@ -495,7 +584,7 @@ export function createReliabilityOperations(cwd=process.cwd()): NonNullable<Reli
           await store.resumeDueLanes(plan.runId);
           await waitForDatabaseTime(db,window.opensAt);const claim=await store.claimBlock({runId:plan.runId,block:window.block,ownerId:required(args,"--owner-id"),opensAt:window.opensAt,launchDeadline:window.launchDeadline,planFingerprint:plan.planFingerprint});
           const nominalOrigin=new Date(Date.parse(claim.claimedAt)+1_000).toISOString();await waitForDatabaseTime(db,nominalOrigin);
-          await Promise.all(V3_LANES.map(async lane=>{
+          await Promise.all(V4_LANES.map(async lane=>{
             const calls=plan.calls.filter(call=>call.block===window.block&&call.lane===lane.id);
             if(await enqueueCalls(calls,nominalOrigin))return;
             await executeLaneCalls(lane,calls,nominalOrigin);
@@ -504,13 +593,13 @@ export function createReliabilityOperations(cwd=process.cwd()): NonNullable<Reli
         for(;;){
           await store.resumeDueLanes(plan.runId);
           const schedule=await store.loadReliabilityScheduleReport(plan.runId);
-          for(const lane of V3_LANES){
+          for(const lane of V4_LANES){
             const claimed=schedule.filter(row=>row.laneId===lane.id&&row.state==="claimed");
             if(claimed.length){try{await store.completeResumedWorkGroup({runId:plan.runId,laneId:lane.id,block:claimed[0]!.block});}catch(error){if(!(error instanceof Error)||error.message!=="RESUMED_WORK_GROUP_NOT_TERMINAL")throw error;}continue;}
             const resumed=await store.claimDueResumedWork({runId:plan.runId,laneId:lane.id,mode:lane.mode==="bounded-burst"?"bounded-burst":"sequential"});
             if(!resumed)continue;
             await waitForDatabaseTime(db,resumed.scheduledAt);
-            const calls=resumed.requestIds.map(requestId=>plan.calls.find(call=>call.requestId===requestId)).filter((call):call is ReliabilityV3Plan["calls"][number]=>Boolean(call));
+            const calls=resumed.requestIds.map(requestId=>plan.calls.find(call=>call.requestId===requestId)).filter((call):call is ReliabilityV4Plan["calls"][number]=>Boolean(call));
             if(calls.length!==resumed.requestIds.length)throw new Error("RESUMED_WORK_NOT_SEALED");
             if(await executeLaneCalls(lane,calls,resumed.scheduledAt))await store.completeResumedWorkGroup({runId:plan.runId,laneId:lane.id,block:resumed.block});
           }
@@ -519,7 +608,7 @@ export function createReliabilityOperations(cwd=process.cwd()): NonNullable<Reli
           if(Number(status.rows[0]?.terminal_count)===100)break;
           await sleep(1_000);
         }
-        for(const lane of V3_LANES)for(const block of [1,2,3,4,5])await publishLaneManifest(lane.id,block);
+        for(const lane of V4_LANES)for(const block of [1,2,3,4,5])await publishLaneManifest(lane.id,block);
         await store.advanceDurableStage(plan.runId,"fresh_terminal");
         for(const claim of buildFourLaneClaimArtifacts({runId:plan.runId,planFingerprint:plan.planFingerprint})){
           const {path,...artifact}=claim;await publishAbsolute(resolve(cwd,path),artifact);
@@ -528,12 +617,13 @@ export function createReliabilityOperations(cwd=process.cwd()): NonNullable<Reli
       }catch(error){try{await store.failProtocol(plan.runId,"RUNNER_DURABLE_FAILURE");}catch{/* preserve original */}throw error;}finally{await db.end();}
     },
     reconcile: async ({args,files})=>{
-      const plan=parse<ReliabilityV3Plan>(files.plan!,"RELIABILITY_V3_PLAN_INVALID"); validateReliabilityV3Plan(plan,false);
+      const requestedPlan=required(args,"--plan");const plan=parse<ReliabilityV4Plan>(files.plan!,"RELIABILITY_V4_PLAN_INVALID"); validateReliabilityV4Plan(plan,false);assertCanonicalPlanCoordinate(cwd,requestedPlan,plan);await requireActualCandidate(plan,candidateProbe);
+      const requestedAuth=required(args,"--reconciliation-authorization");assertCanonicalAuthorizationCoordinate(cwd,requestedAuth,"reconciliation",plan.runId);
       const auth=parse<AuthorizationArtifact>(files.authorization!,"RECONCILIATION_AUTHORIZATION_INVALID");
       const db=pool(); const store=new ReliabilityProtocolStore(db);
       try {
         const now=await databaseNow(db);
-        if(!verifyAuthorizationArtifact(auth,"reconciliation",{now,expectedRunId:plan.runId,expectedPlanFingerprint:plan.planFingerprint,expectedExecutableFingerprint:executableFingerprint(plan)},V3_AUTHORIZATION_ISSUERS))throw new Error("RECONCILIATION_AUTHORIZATION_INVALID");
+        if(!v4AuthorizationIdentityValid(plan,auth,"reconciliation")||!verifyAuthorizationArtifact(auth,"reconciliation",v4AuthorizationVerificationOptions(plan,"reconciliation",now),V4_AUTHORIZATION_ISSUERS))throw new Error("RECONCILIATION_AUTHORIZATION_INVALID");
         const key=(await readFile(resolve(cwd,required(args,"--provider-key-file")),"utf8")).trim();
         if(!key)throw new Error("RECONCILIATION_PROVIDER_KEY_REQUIRED");
         const reconciler=new OpenRouterReconciler({apiKey:key});
@@ -553,16 +643,16 @@ export function createReliabilityOperations(cwd=process.cwd()): NonNullable<Reli
       }finally{await db.end();}
     },
     settle: async ({args})=>{
-      const plan=parse<ReliabilityV3Plan>(await readFile(resolve(cwd,required(args,"--plan"))),"RELIABILITY_V3_PLAN_INVALID"); validateReliabilityV3Plan(plan,false);
+      const requestedPlan=required(args,"--plan");const plan=parse<ReliabilityV4Plan>(await readFile(resolve(cwd,requestedPlan)),"RELIABILITY_V4_PLAN_INVALID"); validateReliabilityV4Plan(plan,false);assertCanonicalPlanCoordinate(cwd,requestedPlan,plan);await requireActualCandidate(plan,candidateProbe);
       const db=pool(); try { const store=new ReliabilityProtocolStore(db);const result=await store.runAndPersistAuthoritativeSettlement(plan.runId,
         settlement=>buildStrictSettlementAuthority(cwd,args,plan,settlement));if(result.passed)await store.advanceDurableStage(plan.runId,"settled");return {runId:plan.runId,passed:result.passed,acceptedOffsetSeconds:result.acceptedOffsetSeconds,journalCardinality:result.journal.length}; } finally { await db.end(); }
     },
     replay: async ({args,files})=>{
-      const plan=parse<ReliabilityV3Plan>(await readFile(resolve(cwd,required(args,"--plan"))),"RELIABILITY_V3_PLAN_INVALID"); validateReliabilityV3Plan(plan,false);
+      const requestedPlan=required(args,"--plan");const plan=parse<ReliabilityV4Plan>(await readFile(resolve(cwd,requestedPlan)),"RELIABILITY_V4_PLAN_INVALID"); validateReliabilityV4Plan(plan,false);assertCanonicalPlanCoordinate(cwd,requestedPlan,plan);await requireActualCandidate(plan,candidateProbe);
       const baseUrl=required(args,"--base-url");
       const laneTokens=new Map<string,string>();
-      for(const lane of V3_LANES){const token=(await readFile(resolve(cwd,required(args,`--lane-token-${lane.id}`)),"utf8")).trim();if(!token)throw new Error("AGENT_TOKEN_REQUIRED");laneTokens.set(lane.id,token);}
-      if(new Set(laneTokens.values()).size!==V3_LANES.length)throw new Error("DISTINCT_LANE_CREDENTIALS_REQUIRED");
+      for(const lane of V4_LANES){const token=(await readFile(resolve(cwd,required(args,`--lane-token-${lane.id}`)),"utf8")).trim();if(!token)throw new Error("AGENT_TOKEN_REQUIRED");laneTokens.set(lane.id,token);}
+      if(new Set(laneTokens.values()).size!==V4_LANES.length)throw new Error("DISTINCT_LANE_CREDENTIALS_REQUIRED");
       const db=pool(),store=new ReliabilityProtocolStore(db);
       try{
         const replayInventory=await store.registerReplayAuthorizationInventory({runId:plan.runId,planFingerprint:plan.planFingerprint,requestIds:plan.replayTargets.map(target=>target.requestId)});
@@ -586,15 +676,18 @@ export function createReliabilityOperations(cwd=process.cwd()): NonNullable<Reli
         }
         await store.completeReplayRun(plan.runId);
         await publishAbsolute(resolve(cwd,preliminaryReplayArtifactPath(plan.runId)),
-          {evidenceType:"held-out-reliability-v3",protocolVersion:3,runId:plan.runId,planFingerprint:plan.planFingerprint,artifactKind:"replay_report",passed:passed===20,replayAudits:passed});
+          {evidenceType:"held-out-reliability-v4",protocolVersion:4,runId:plan.runId,planFingerprint:plan.planFingerprint,artifactKind:"replay_report",passed:passed===20,replayAudits:passed});
         return {runId:plan.runId,replayPassed:passed};
       }finally{await db.end();}
     },
     evidence: async ({args})=>{
-      const plan=parse<ReliabilityV3Plan>(await readFile(resolve(cwd,required(args,"--plan"))),"RELIABILITY_V3_PLAN_INVALID");validateReliabilityV3Plan(plan,false);
+      const requestedPlan=resolve(cwd,required(args,"--plan"));
+      const plan=parse<ReliabilityV4Plan>(await readFile(requestedPlan),"RELIABILITY_V4_PLAN_INVALID");validateReliabilityV4Plan(plan,false);
+      if(requestedPlan!==canonicalPlanPath(cwd,plan.planFingerprint))throw new Error("RELIABILITY_V4_PLAN_PATH_INVALID");
+      await requireActualCandidate(plan,candidateProbe);
       const db=pool();try{const store=new ReliabilityProtocolStore(db);const incidents=await store.loadArtifactIncidentCoordinates(plan.runId);
         const reconstructed=await reconstructReliabilityArtifacts({root:cwd,runId:plan.runId,planFingerprint:plan.planFingerprint,incidents,
-          verifyAuthorization:({kind,parsed})=>verifyPinnedAuthorizationSignature(kind,parsed)});
+          verifyAuthorization:({kind,parsed})=>v4AuthorizationIdentityValid(plan,parsed as unknown as AuthorizationArtifact,kind)&&verifyPinnedAuthorizationSignature(kind,parsed)});
         const schedulerClaims=await store.loadSchedulerManifestBindings(plan.runId);
         const schedulerManifests=await reconstructSchedulerManifestArtifacts({root:cwd,runId:plan.runId,planFingerprint:plan.planFingerprint,
           claims:schedulerClaims});
@@ -603,9 +696,9 @@ export function createReliabilityOperations(cwd=process.cwd()): NonNullable<Reli
         return {runId:plan.runId,artifactBound:true,artifactCount:Object.keys(artifactDigests).length,artifactDigests};
       }finally{await db.end();}
     },
-    report: async ({args})=>buildEvidenceReport(cwd,args),
+    report: async ({args})=>buildEvidenceReport(cwd,args,candidateProbe),
   };
 }
 
-export async function main(argv=process.argv.slice(2)):Promise<number>{const result=await executeReliabilityCli(argv,{cwd:process.cwd(),durableRunPredecision:true,operations:createReliabilityOperations(process.cwd())}); process.stdout.write(`${JSON.stringify(result)}\n`); return result.ok?0:1;}
+export async function main(argv=process.argv.slice(2)):Promise<number>{const result=await executeReliabilityCli(argv,{cwd:process.cwd(),durableRunPredecision:true,workerRequiresProviderNetwork:true,operations:createReliabilityOperations(process.cwd())}); process.stdout.write(`${JSON.stringify(result)}\n`); return result.ok?0:1;}
 if(import.meta.url===pathToFileURL(process.argv[1]??"").href){process.exitCode=await main();}

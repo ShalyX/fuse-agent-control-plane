@@ -104,7 +104,7 @@ CREATE TABLE IF NOT EXISTS reliability_sealed_calls (
  call_ordinal SMALLINT NOT NULL, body_commitment TEXT NOT NULL, organization_id TEXT NOT NULL,
  agent_id TEXT NOT NULL, credential_id TEXT NOT NULL, mandate_id TEXT NOT NULL, branch_id TEXT NOT NULL, workload_class TEXT NOT NULL,
  provider TEXT NOT NULL, model TEXT NOT NULL, max_output_tokens INTEGER NOT NULL,
- reservation_cost_micros BIGINT NOT NULL, claim_fingerprint TEXT NOT NULL, request_body JSONB NOT NULL DEFAULT '{}'::jsonb,
+ reservation_cost_micros BIGINT NOT NULL, claim_fingerprint TEXT NOT NULL, request_commitment TEXT NOT NULL, request_body JSONB NOT NULL DEFAULT '{}'::jsonb,
  PRIMARY KEY(run_id,request_id), UNIQUE(run_id,block_no,lane_id,call_ordinal),
  FOREIGN KEY(run_id,lane_id) REFERENCES reliability_protocol_lanes(run_id,lane_id) ON DELETE CASCADE
 );
@@ -355,6 +355,7 @@ ALTER TABLE reliability_failure_report_outbox ADD COLUMN IF NOT EXISTS publicati
 ALTER TABLE reliability_failure_report_outbox ADD COLUMN IF NOT EXISTS publish_by TIMESTAMPTZ;
 ALTER TABLE reliability_sealed_calls ADD COLUMN IF NOT EXISTS credential_id TEXT;
 ALTER TABLE reliability_sealed_calls ADD COLUMN IF NOT EXISTS request_body JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE reliability_sealed_calls ADD COLUMN IF NOT EXISTS request_commitment TEXT;
 ALTER TABLE reliability_replay_mutex ADD COLUMN IF NOT EXISTS operation_id TEXT;
 ALTER TABLE reliability_replay_authorizations ADD COLUMN IF NOT EXISTS response_projection JSONB;
 CREATE UNIQUE INDEX IF NOT EXISTS reliability_replay_mutex_operation_idx ON reliability_replay_mutex(operation_id) WHERE operation_id IS NOT NULL;

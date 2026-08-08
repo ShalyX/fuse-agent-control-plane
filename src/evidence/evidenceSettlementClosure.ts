@@ -12,8 +12,13 @@ import type {
 import { RELIABILITY_LANES, type ReliabilityLane } from "./artifactReconstruction.js";
 import { V2_SCHEDULE } from "./heldOutReliabilityV2.js";
 import { V3_SCHEDULE } from "./heldOutReliabilityV3.js";
+import { V4_SCHEDULE } from "./heldOutReliabilityV4.js";
 
 type ReliabilitySchedule = ReadonlyArray<{ block: number; opensAt: string; launchDeadline: string }>;
+
+export function reliabilityScheduleForRunId(runId:string):ReliabilitySchedule {
+  return runId.startsWith("hov4-") ? V4_SCHEDULE : runId.startsWith("hov3-") ? V3_SCHEDULE : V2_SCHEDULE;
+}
 
 const SHA256 = /^sha256:[a-f0-9]{64}$/;
 const USABLE = new Set<AuthoritativeOutcomeState>(["completed_verified", "reconciled_billed_with_response"]);
@@ -222,7 +227,7 @@ export function buildAuthoritativeClosureReport(input: {
   acceptedSnapshot: { digest: string; databaseStartedAtMs: number };
   settlement: { passed: boolean; acceptedSnapshotDigest: string };
 }): AuthoritativeClosureReport {
-  const schedule = input.runId.startsWith("hov3-") ? V3_SCHEDULE : V2_SCHEDULE;
+  const schedule = reliabilityScheduleForRunId(input.runId);
   const completeness = evaluateSettlementSnapshotCompleteness({ rows: input.rows, replayTargetRequestIds: input.replayTargetRequestIds, schedule });
   const reasons = [...completeness.reasons];
   const currentDigest = authoritativeSnapshotDigest(input.rows as unknown as Readonly<Record<string, readonly unknown[]>>);

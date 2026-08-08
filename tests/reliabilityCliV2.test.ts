@@ -26,6 +26,14 @@ describe("held-out reliability v2 noninteractive CLI and mandatory no-spend boun
     expect(networkCalls).toBe(0);
   });
 
+  it("denies worker provider traffic when the versioned runner requires an explicit gate", async () => {
+    const operation=async()=>({dispatched:true});
+    await expect(executeReliabilityCli(["worker"],{workerRequiresProviderNetwork:true,operations:{worker:operation}}))
+      .resolves.toMatchObject({ok:false,errorCode:"NETWORK_DEFAULT_DENY",providerCalls:0});
+    await expect(executeReliabilityCli(["worker","--allow-provider-network"],{workerRequiresProviderNetwork:true,operations:{worker:operation}}))
+      .resolves.toMatchObject({ok:true,dispatched:true});
+  });
+
   it.each(["run", "reconcile"])("denies %s network path unless explicit purpose flag is present", async (command) => {
     expect(await executeReliabilityCli([command, "--json"], { cwd: "/nonexistent" })).toMatchObject({
       ok: false, errorCode: "NETWORK_DEFAULT_DENY", providerCalls: 0,

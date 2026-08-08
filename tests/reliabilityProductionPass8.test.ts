@@ -39,7 +39,8 @@ describe("reliability v2 eighth production closure", () => {
     expect(JSON.parse(await readFile(path, "utf8"))).toEqual({ sequence: 2, state: "terminal" });
     await publishManifestDurably(path, { state: "terminal", sequence: 2 });
     await expect(publishManifestDurably(path, { state: "claimed", sequence: 1 })).rejects.toThrow("MANIFEST_TRANSITION_CONFLICT");
-    await expect(publishManifestDurably(path, { state: "terminal", sequence: 3 })).rejects.toThrow("MANIFEST_TERMINAL_CONFLICT");
+    await expect(publishManifestDurably(path, { state: "terminal", sequence: 3 })).rejects.toThrow("MANIFEST_PUBLICATION_BUSY");
+    expect(await readFile(`${path}.write-lock`, "utf8")).toContain('"destination"');
   });
 
   it("exposes setup and one-call worker as fail-closed CLI operations", async () => {
