@@ -130,6 +130,13 @@ export function expectedReliabilityArtifactPaths(input: {
   ].sort();
 }
 
+export function hardFinalizationDeadlineForRunId(runId:string):string {
+  const version = reliabilityArtifactNamespace(runId).protocolVersion;
+  return version === 4 ? "2026-08-11T09:30:00.000Z"
+    : version === 3 ? "2026-08-05T09:30:00.000Z"
+    : "2026-07-28T09:30:00.000Z";
+}
+
 function matrixValid(input: AuthoritativeEvidenceInventory): boolean {
   for (const attempt of input.attempts) {
     const executions = rowsFor(input.executions, attempt.requestId);
@@ -248,7 +255,7 @@ export function reduceAuthoritativeReliabilityEvidence(input: AuthoritativeEvide
 
   const finalizedAt = Date.parse(input.hardFinalization.finalizedAt);
   const deadline = Date.parse(input.hardFinalization.deadline);
-  const expectedDeadline = namespace.protocolVersion === 3 ? "2026-08-05T09:30:00.000Z" : "2026-07-28T09:30:00.000Z";
+  const expectedDeadline = hardFinalizationDeadlineForRunId(input.runId);
   if (!input.hardFinalization.allTerminal || input.hardFinalization.deadline !== expectedDeadline
     || !Number.isFinite(finalizedAt) || !Number.isFinite(deadline) || finalizedAt > deadline) reasons.push("HARD_FINALIZATION_INVALID");
 

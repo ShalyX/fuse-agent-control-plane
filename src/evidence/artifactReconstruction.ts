@@ -4,6 +4,13 @@ import { join, relative, sep } from "node:path";
 import { reliabilityArtifactNamespace, schedulerManifestArtifactPath } from "./reliabilityArtifactNamespace.js";
 
 export const RELIABILITY_LANES = ["normal-paced", "high-envelope", "bounded-burst", "restart-resume"] as const;
+
+export function claimInventoryAuthoritySource(runId:string):string {
+  const version=reliabilityArtifactNamespace(runId).protocolVersion;
+  return version===4 ? "docs/held-out-reliability-protocol-v4.md:inherited-v3-four-lane-claims"
+    : version===3 ? "docs/held-out-reliability-protocol-v3.md:inherited-v2-four-lane-claims"
+    : "docs/held-out-reliability-protocol-v2.md:420,426";
+}
 export type ReliabilityLane = typeof RELIABILITY_LANES[number];
 const SHA256 = /^sha256:[a-f0-9]{64}$/;
 
@@ -193,9 +200,7 @@ export async function reconstructReliabilityArtifacts(input: {
     artifactPaths: expectedPaths,
     artifactDigests: Object.fromEntries(artifacts.map((artifact) => [artifact.path, artifact.digest])),
     claimInventoryAuthority: {
-      source: namespace.protocolVersion === 3
-        ? "docs/held-out-reliability-protocol-v3.md:inherited-v2-four-lane-claims"
-        : "docs/held-out-reliability-protocol-v2.md:420,426",
+      source: claimInventoryAuthoritySource(input.runId),
       claims: "four_lane_claims",
       contradictionDetected: true,
       contradictedLegacyShape: "five_block_claims",

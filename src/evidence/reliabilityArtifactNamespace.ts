@@ -1,9 +1,4 @@
-import {
-  RELIABILITY_V2_PROFILE,
-  RELIABILITY_V3_PROFILE,
-  reliabilityProtocolProfileForRunId,
-  type ReliabilityProtocolProfile,
-} from "../reliability/protocolProfile.js";
+import { reliabilityProtocolProfileForRunId, type ReliabilityProtocolProfile } from "../reliability/protocolProfile.js";
 
 export type ReliabilityArtifactNamespace = Pick<
   ReliabilityProtocolProfile,
@@ -21,11 +16,8 @@ function namespace(profile: ReliabilityProtocolProfile): ReliabilityArtifactName
   });
 }
 
-const V2 = namespace(RELIABILITY_V2_PROFILE);
-const V3 = namespace(RELIABILITY_V3_PROFILE);
-
 export function reliabilityArtifactNamespace(runId: string): ReliabilityArtifactNamespace {
-  return reliabilityProtocolProfileForRunId(runId).protocolVersion === 3 ? V3 : V2;
+  return namespace(reliabilityProtocolProfileForRunId(runId));
 }
 
 export function reliabilityArtifactPath(runId: string, ...parts: string[]): string {

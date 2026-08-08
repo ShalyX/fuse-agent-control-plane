@@ -159,8 +159,8 @@ export function finalEvidenceClosure(input: {
 }
 
 export interface CanonicalFinalCommitMarker {
-  evidenceType: "held-out-reliability" | "held-out-reliability-v3";
-  protocolVersion: 2 | 3;
+  evidenceType: "held-out-reliability" | "held-out-reliability-v3" | "held-out-reliability-v4";
+  protocolVersion: 2 | 3 | 4;
   artifactKind: "final_commit";
   state: "committed";
   runId: string;

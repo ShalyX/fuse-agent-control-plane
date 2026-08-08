@@ -115,12 +115,14 @@ export class AuthorizationDecisionStore {
 export function verifyAuthorizationArtifact(artifact: AuthorizationArtifact | null | undefined, kind: "operator" | "reconciliation", input: {
   now: string; expectedRunId: string; expectedPlanFingerprint: string; expectedExecutableFingerprint: string;
   expectedV3Identity?: { organizationId:string;profileFingerprint:string;serviceAccountId:string;credentialId:string;credentialOwnerId:string };
+  expectedProtocolIdentity?: { organizationId:string;profileFingerprint:string;serviceAccountId:string;credentialId:string;credentialOwnerId:string };
 }, issuers: TrustedAuthorizationIssuers = PINNED_ISSUERS): boolean {
   if (!artifact) return false;
   const payload = artifact.payload;
   const v2Keys="actorId,capability,executableFingerprint,expiresAt,issuerCredentialId,kind,nonce,planFingerprint,runId";
   const v3Keys="actorId,capability,credentialId,credentialOwnerId,executableFingerprint,expiresAt,issuerCredentialId,kind,nonce,organizationId,planFingerprint,profileFingerprint,runId,serviceAccountId";
-  if (!payload || typeof payload !== "object" || Object.keys(payload).sort().join(",") !== (input.expectedV3Identity?v3Keys:v2Keys)) return false;
+  const expectedIdentity=input.expectedProtocolIdentity??input.expectedV3Identity;
+  if (!payload || typeof payload !== "object" || Object.keys(payload).sort().join(",") !== (expectedIdentity?v3Keys:v2Keys)) return false;
   const capability = kind === "operator" ? "evidence:authorize-spend" : "evidence:authorize-reconciliation";
   const issuer = issuers[kind];
   if (payload.kind !== kind || payload.capability !== capability || payload.runId !== input.expectedRunId
@@ -128,9 +130,9 @@ export function verifyAuthorizationArtifact(artifact: AuthorizationArtifact | nu
     || Date.parse(payload.expiresAt) <= Date.parse(input.now) || (kind === "operator" && !payload.nonce)
     || (kind === "reconciliation" && payload.nonce !== null) || payload.actorId === payload.issuerCredentialId
     || payload.issuerCredentialId !== issuer.id || !/^[a-f0-9]{64}$/.test(issuer.rawPublicKeyHex)
-    || (input.expectedV3Identity && (payload.organizationId!==input.expectedV3Identity.organizationId
-      ||payload.profileFingerprint!==input.expectedV3Identity.profileFingerprint||payload.serviceAccountId!==input.expectedV3Identity.serviceAccountId
-      ||payload.credentialId!==input.expectedV3Identity.credentialId||payload.credentialOwnerId!==input.expectedV3Identity.credentialOwnerId))
+    || (expectedIdentity && (payload.organizationId!==expectedIdentity.organizationId
+      ||payload.profileFingerprint!==expectedIdentity.profileFingerprint||payload.serviceAccountId!==expectedIdentity.serviceAccountId
+      ||payload.credentialId!==expectedIdentity.credentialId||payload.credentialOwnerId!==expectedIdentity.credentialOwnerId))
     || !/^[A-Za-z0-9+/]+={0,2}$/.test(artifact.signature)) return false;
   try {
     const spki = Buffer.concat([Buffer.from("302a300506032b6570032100", "hex"), Buffer.from(issuer.rawPublicKeyHex, "hex")]);

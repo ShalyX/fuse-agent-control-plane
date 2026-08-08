@@ -1,12 +1,21 @@
 import { randomUUID } from "node:crypto";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 import { Pool } from "pg";
+import { PolicyStore } from "../src/persistence/policyStore.js";
 import { ReliabilityProtocolStore, deterministicAuthorizationDecisionId } from "../src/reliability/protocolStore.js";
 import { PROTOCOL_MUTATION_EXCLUSION_KEY } from "../src/reliability/protocolMutationExclusion.js";
-import { RELIABILITY_V2_PROFILE, RELIABILITY_V3_PROFILE } from "../src/reliability/protocolProfile.js";
+import { RELIABILITY_V2_PROFILE, RELIABILITY_V3_PROFILE, RELIABILITY_V4_PROFILE } from "../src/reliability/protocolProfile.js";
 
 const url = process.env.HELD_OUT_RELIABILITY_DATABASE_URL_UNPOOLED ?? process.env.DATABASE_URL_UNPOOLED;
 const enabled = process.env.RUN_NEON_INTEGRATION === "1";
+const execFileAsync=promisify(execFile);
+
+async function bootstrapProductionSchemas(pool: Pool, store: ReliabilityProtocolStore): Promise<void> {
+  await new PolicyStore(pool).ensureSchema();
+  await store.createSchema();
+}
 if (enabled && url) {
   const hostname = new URL(url).hostname.toLowerCase();
   if (hostname.includes("-pooler") || hostname.includes(".pooler")) {
@@ -15,6 +24,147 @@ if (enabled && url) {
 }
 
 describe.skipIf(!enabled)("reliability v2 real unpooled PostgreSQL", () => {
+  it("durably binds a v4 run to the exact v4 profile and rejects v3 reopening", async () => {
+    if (!url) throw new Error("RUN_NEON_INTEGRATION requires HELD_OUT_RELIABILITY_DATABASE_URL_UNPOOLED");
+    const pool = new Pool({ connectionString: url, ssl: { rejectUnauthorized: true }, max: 2 });
+    const store = new ReliabilityProtocolStore(pool);
+    const runId = `hov4-test-${randomUUID()}`;
+    const fingerprint = `sha256:${"4".repeat(64)}`;
+    try {
+      await bootstrapProductionSchemas(pool, store);
+      await store.initializeRun({ runId, planFingerprint: fingerprint, lanes: ["normal-paced"], profile: RELIABILITY_V4_PROFILE });
+      expect((await pool.query(`SELECT protocol_version,evidence_type,plan_schema_version,mapping_version,profile_fingerprint
+        FROM reliability_protocol_controls WHERE run_id=$1`, [runId])).rows[0]).toEqual({
+        protocol_version: 4,
+        evidence_type: "held-out-reliability-v4",
+        plan_schema_version: 2,
+        mapping_version: 2,
+        profile_fingerprint: RELIABILITY_V4_PROFILE.profileFingerprint,
+      });
+      await expect(store.initializeRun({ runId, planFingerprint: fingerprint, lanes: ["normal-paced"], profile: RELIABILITY_V3_PROFILE }))
+        .rejects.toThrow("PROTOCOL_PROFILE_RUN_ID_CONFLICT");
+    } finally {
+      await pool.query("DELETE FROM reliability_protocol_controls WHERE run_id=$1", [runId]);
+      await pool.end();
+    }
+  }, 90_000);
+
+  it("rejects a pre-existing non-normative v4 attempt commitment during registration", async () => {
+    if (!url) throw new Error("RUN_NEON_INTEGRATION requires HELD_OUT_RELIABILITY_DATABASE_URL_UNPOOLED");
+    const pool=new Pool({connectionString:url,ssl:{rejectUnauthorized:true},max:2});const store=new ReliabilityProtocolStore(pool);
+    const runId=`hov4-commitment-${randomUUID()}`,fingerprint=`sha256:${"c".repeat(64)}`,requestId=`request-${randomUUID()}`;
+    const call={requestId,block:1,laneId:"normal-paced",callOrdinal:1,body:{model:"model",messages:[]},organizationId:"org",agentId:"agent",credentialId:"credential",mandateId:"mandate",branchId:"branch",workloadClass:"class",provider:"openrouter",model:"model",maxOutputTokens:8,reservationCostMicros:1n,claimFingerprint:fingerprint,requestCommitment:`sha256:${"d".repeat(64)}`};
+    try{
+      await bootstrapProductionSchemas(pool,store);await store.initializeRun({runId,planFingerprint:fingerprint,lanes:["normal-paced"],profile:RELIABILITY_V4_PROFILE});
+      await store.registerSealedCalls({runId,calls:[call]});
+      await pool.query("UPDATE reliability_protocol_attempts SET request_commitment=$3 WHERE run_id=$1 AND request_id=$2",[runId,requestId,`sha256:${"e".repeat(64)}`]);
+      await expect(store.registerSealedCalls({runId,calls:[call]})).rejects.toThrow("PROTOCOL_ATTEMPT_CONFLICT");
+    }finally{
+      await pool.query("DELETE FROM reliability_protocol_events WHERE run_id=$1",[runId]);await pool.query("DELETE FROM reliability_protocol_attempts WHERE run_id=$1",[runId]);
+      await pool.query("DELETE FROM reliability_sealed_calls WHERE run_id=$1",[runId]);await pool.query("DELETE FROM reliability_protocol_controls WHERE run_id=$1",[runId]);await pool.end();
+    }
+  });
+
+  it("completes the inherited v4 authorization publication lifecycle", async () => {
+    if (!url) throw new Error("RUN_NEON_INTEGRATION requires HELD_OUT_RELIABILITY_DATABASE_URL_UNPOOLED");
+    const pool = new Pool({ connectionString: url, ssl: { rejectUnauthorized: true }, max: 2 });
+    const store = new ReliabilityProtocolStore(pool);
+    const runId = `hov4-auth-${randomUUID()}`;
+    const planFingerprint = `sha256:${"a".repeat(64)}`;
+    const operatorDigest = `sha256:${"b".repeat(64)}` as const;
+    const reconciliationDigest = `sha256:${"c".repeat(64)}` as const;
+    const reasonCode = "valid_pair";
+    try {
+      await bootstrapProductionSchemas(pool, store);
+      await store.initializeRun({ runId, planFingerprint, lanes: ["normal-paced"], profile: RELIABILITY_V4_PROFILE });
+      const operation = await store.beginAuthorizationOperation(runId);
+      const decisionId = deterministicAuthorizationDecisionId({ runId, planFingerprint,
+        profileFingerprint: RELIABILITY_V4_PROFILE.profileFingerprint, decisionKind: "active", reasonCode,
+        operatorArtifactSha256: operatorDigest, reconciliationArtifactSha256: reconciliationDigest });
+      await store.commitAuthorization({ runId, decisionId, active: true, operatorIssuerId: "v4-operator",
+        operatorNonce: `hov4-operator-${randomUUID()}`, decisionDeadline: operation.decisionDeadline,
+        verdict: { operatorValid: true, reconciliationValid: true },
+        operatorReceipt: { kind: "operator", status: "consumed", reasonCode, presentedArtifactSha256: operatorDigest },
+        reconciliationReceipt: { kind: "reconciliation", status: "validated", reasonCode, presentedArtifactSha256: reconciliationDigest } });
+      const published: string[] = [];
+      await store.publishAuthorizationOutbox(runId, async kind => { published.push(kind); }, operation.publicationDeadline);
+      await store.completeAuthorizationOperation(runId, operation.transitionDeadline);
+      expect(published.sort()).toEqual(["operator", "reconciliation"]);
+      expect((await pool.query("SELECT publication_completed_at IS NOT NULL published,transition_completed_at IS NOT NULL transitioned FROM reliability_authorization_operations WHERE run_id=$1", [runId])).rows[0])
+        .toEqual({ published: true, transitioned: true });
+    } finally {
+      for (const table of ["reliability_report_publication_receipts", "reliability_report_publication_events", "reliability_report_publication_outbox", "reliability_protocol_incidents", "reliability_authorization_outbox", "reliability_authorization_decisions", "reliability_authorization_operations", "reliability_authorization_nonces"])
+        await pool.query(`DELETE FROM ${table} WHERE run_id=$1`, [runId]);
+      await pool.query("DELETE FROM reliability_protocol_controls WHERE run_id=$1", [runId]);
+      await pool.end();
+    }
+  }, 90_000);
+
+  it("registers v4 replay authority from the committed authorization decision", async () => {
+    if (!url) throw new Error("RUN_NEON_INTEGRATION requires HELD_OUT_RELIABILITY_DATABASE_URL_UNPOOLED");
+    const pool = new Pool({ connectionString: url, ssl: { rejectUnauthorized: true }, max: 2 });
+    const store = new ReliabilityProtocolStore(pool);
+    const runId = `hov4-replay-${randomUUID()}`;
+    const planFingerprint = `sha256:${"d".repeat(64)}`;
+    const operatorDigest = `sha256:${"e".repeat(64)}` as const;
+    const reconciliationDigest = `sha256:${"f".repeat(64)}` as const;
+    const decisionId = deterministicAuthorizationDecisionId({ runId, planFingerprint,
+      profileFingerprint: RELIABILITY_V4_PROFILE.profileFingerprint, decisionKind: "active", reasonCode: "valid_pair",
+      operatorArtifactSha256: operatorDigest, reconciliationArtifactSha256: reconciliationDigest });
+    const requestIds = Array.from({ length: 20 }, (_, index) => `r${index + 1}`);
+    try {
+      await bootstrapProductionSchemas(pool, store);
+      await store.initializeRun({ runId, planFingerprint, lanes: ["normal-paced"], profile: RELIABILITY_V4_PROFILE });
+      await store.registerSealedCalls({ runId, calls: requestIds.map((requestId, index) => ({ requestId,
+        block: 1, laneId: "normal-paced", callOrdinal: index + 1, body: { index }, organizationId: "org",
+        agentId: "worker", credentialId: "credential", mandateId: "mandate", branchId: "branch",
+        workloadClass: "baseline-lookup", provider: "openrouter", model: "nousresearch/hermes-4-405b",
+        maxOutputTokens: 8, reservationCostMicros: 10n, claimFingerprint: planFingerprint })) });
+      await pool.query("INSERT INTO reliability_authorization_decisions(run_id,decision_id,verdict) VALUES($1,$2,$3::jsonb)",
+        [runId, decisionId, JSON.stringify({ operatorValid: true, reconciliationValid: true })]);
+      await pool.query("INSERT INTO reliability_authorization_outbox(run_id,receipt_kind,receipt,published_at) VALUES($1,'operator','{}'::jsonb,clock_timestamp()),($1,'reconciliation','{}'::jsonb,clock_timestamp())", [runId]);
+      await pool.query("UPDATE reliability_protocol_controls SET durable_stage='fresh_terminal' WHERE run_id=$1", [runId]);
+      await expect(store.registerReplayAuthorizationInventory({ runId, requestIds })).resolves.toHaveLength(20);
+      const rows = await pool.query("SELECT authorization_decision_id::text,signed_authorization_sha256 FROM reliability_replay_authorizations WHERE run_id=$1", [runId]);
+      expect(rows.rows).toHaveLength(20);
+      expect(rows.rows.every(row => row.authorization_decision_id === decisionId && row.signed_authorization_sha256 === null)).toBe(true);
+    } finally {
+      for (const table of ["reliability_replay_authorizations", "reliability_authorization_outbox", "reliability_authorization_decisions"])
+        await pool.query(`DELETE FROM ${table} WHERE run_id=$1`, [runId]);
+      await pool.query("DELETE FROM reliability_protocol_controls WHERE run_id=$1", [runId]);
+      await pool.end();
+    }
+  }, 90_000);
+
+  it("recovers v4 hard-finalization publications in a fresh process", async () => {
+    if (!url) throw new Error("RUN_NEON_INTEGRATION requires HELD_OUT_RELIABILITY_DATABASE_URL_UNPOOLED");
+    const pool=new Pool({connectionString:url,ssl:{rejectUnauthorized:true},max:2});
+    const store=new ReliabilityProtocolStore(pool);const runId=`hov4-finalize-${randomUUID()}`,fingerprint=`sha256:${"8".repeat(64)}`;
+    try{
+      await bootstrapProductionSchemas(pool,store);
+      await store.initializeRun({runId,planFingerprint:fingerprint,lanes:["normal-paced"],profile:RELIABILITY_V4_PROFILE});
+      await store.registerSealedCalls({runId,calls:[{requestId:`request-${randomUUID()}`,block:1,laneId:"normal-paced",callOrdinal:1,
+        body:{model:"nousresearch/hermes-4-405b",max_tokens:8,messages:[]},organizationId:"org",agentId:"agent",credentialId:"credential",
+        mandateId:"mandate",branchId:"branch",workloadClass:"held-out-normal",provider:"openrouter",model:"nousresearch/hermes-4-405b",
+        maxOutputTokens:8,reservationCostMicros:30_000n,claimFingerprint:fingerprint,requestCommitment:`sha256:${"9".repeat(64)}`}]});
+      expect((await store.hardFinalizeReliabilityRun({runId,deadlineMs:0})).action).toBe("finalize_failure");
+      await pool.end();
+      const moduleUrl=new URL("../src/reliability/protocolStore.ts",import.meta.url).href;
+      const child=`import pg from 'pg';import {ReliabilityProtocolStore} from ${JSON.stringify(moduleUrl)};const pool=new pg.Pool({connectionString:process.env.CHILD_DB_URL,ssl:{rejectUnauthorized:true},max:2});const store=new ReliabilityProtocolStore(pool);const action=(await store.hardFinalizeReliabilityRun({runId:process.env.CHILD_RUN_ID,deadlineMs:0})).action;let supportCount=0,reportCount=0;const support=await store.publishPendingFailureReport(process.env.CHILD_RUN_ID,async()=>{supportCount++});const report=await store.publishPendingReportIntent(process.env.CHILD_RUN_ID,async()=>{reportCount++});await pool.end();console.log(JSON.stringify({action,support,report,supportCount,reportCount}));`;
+      const result=await execFileAsync(process.execPath,["--import",`${process.cwd()}/node_modules/tsx/dist/loader.mjs`,"--input-type=module","--eval",child],
+        {cwd:process.cwd(),env:{...process.env,CHILD_DB_URL:url,CHILD_RUN_ID:runId},maxBuffer:1024*1024});
+      const recovered=JSON.parse(result.stdout.trim()) as {action:string;support:{published:boolean};report:{published:boolean;path:string};supportCount:number;reportCount:number};
+      expect(recovered.action).toBe("already_terminal");expect(recovered.support.published).toBe(true);expect(recovered.supportCount).toBeGreaterThan(0);
+      expect(recovered.report.published).toBe(true);expect(recovered.report.path).toBeTruthy();expect(recovered.reportCount).toBeGreaterThan(0);
+    }finally{
+      await pool.end().catch(()=>undefined);
+      const cleanup=new Pool({connectionString:url,ssl:{rejectUnauthorized:true},max:1});
+      for(const table of ["reliability_report_publication_receipts","reliability_report_publication_events","reliability_report_publication_outbox","reliability_failure_report_outbox","reliability_protocol_events","reliability_protocol_incidents","reliability_protocol_attempts","reliability_sealed_calls"])
+        await cleanup.query(`DELETE FROM ${table} WHERE run_id=$1`,[runId]);
+      await cleanup.query("DELETE FROM reliability_protocol_controls WHERE run_id=$1",[runId]);await cleanup.end();
+    }
+  });
+
   it("durably binds a v3 run to its complete profile and rejects cross-version reopening", async () => {
     if (!url) throw new Error("RUN_NEON_INTEGRATION requires HELD_OUT_RELIABILITY_DATABASE_URL_UNPOOLED");
     const pool = new Pool({ connectionString: url, ssl: { rejectUnauthorized: true }, max: 2 });
@@ -24,7 +174,7 @@ describe.skipIf(!enabled)("reliability v2 real unpooled PostgreSQL", () => {
     const v2RunId = `test-${suffix}`;
     const fingerprint = `sha256:${"7".repeat(64)}`;
     try {
-      await store.createSchema();
+      await bootstrapProductionSchemas(pool, store);
       await store.initializeRun({ runId: v3RunId, planFingerprint: fingerprint, lanes: ["normal-paced"], profile: RELIABILITY_V3_PROFILE });
       const row = await pool.query(`SELECT protocol_version,evidence_type,plan_schema_version,mapping_version,profile_fingerprint
         FROM reliability_protocol_controls WHERE run_id=$1`, [v3RunId]);
@@ -57,7 +207,7 @@ describe.skipIf(!enabled)("reliability v2 real unpooled PostgreSQL", () => {
       decisionKind:"active",reasonCode:"valid_pair",operatorArtifactSha256:operatorReceipt.presentedArtifactSha256 as `sha256:${string}`,
       reconciliationArtifactSha256:reconciliationReceipt.presentedArtifactSha256 as `sha256:${string}`});
     try{
-      await store.createSchema();await store.initializeRun({runId,planFingerprint,lanes:["normal-paced"],profile:RELIABILITY_V3_PROFILE});
+      await bootstrapProductionSchemas(pool, store);await store.initializeRun({runId,planFingerprint,lanes:["normal-paced"],profile:RELIABILITY_V3_PROFILE});
       await pool.query("INSERT INTO reliability_authorization_decisions(run_id,decision_id,verdict) VALUES($1,$2,$3::jsonb)",[runId,decisionId,JSON.stringify({operatorValid:true,reconciliationValid:true})]);
       await pool.query("INSERT INTO reliability_authorization_outbox(run_id,receipt_kind,receipt,published_at) VALUES($1,'operator',$2::jsonb,clock_timestamp()),($1,'reconciliation',$3::jsonb,clock_timestamp())",
         [runId,JSON.stringify(operatorReceipt),JSON.stringify(reconciliationReceipt)]);
@@ -74,13 +224,37 @@ describe.skipIf(!enabled)("reliability v2 real unpooled PostgreSQL", () => {
     }
   },90_000);
 
+  it("recomputes v4 authorization decision authority from the accepted outbox receipts", async () => {
+    if (!url) throw new Error("RUN_NEON_INTEGRATION requires HELD_OUT_RELIABILITY_DATABASE_URL_UNPOOLED");
+    const pool=new Pool({connectionString:url,ssl:{rejectUnauthorized:true},max:2});
+    const store=new ReliabilityProtocolStore(pool);const runId=`hov4-auth-evidence-${randomUUID()}`;
+    const planFingerprint=`sha256:${"7".repeat(64)}`;
+    const operatorReceipt={artifactKind:"authorization_receipt",kind:"operator",runId,status:"consumed",reasonCode:"valid_pair",presentedArtifactSha256:`sha256:${"8".repeat(64)}`};
+    const reconciliationReceipt={artifactKind:"authorization_receipt",kind:"reconciliation",runId,status:"validated",reasonCode:"valid_pair",presentedArtifactSha256:`sha256:${"9".repeat(64)}`};
+    const decisionId=deterministicAuthorizationDecisionId({runId,planFingerprint,profileFingerprint:RELIABILITY_V4_PROFILE.profileFingerprint,
+      decisionKind:"active",reasonCode:"valid_pair",operatorArtifactSha256:operatorReceipt.presentedArtifactSha256 as `sha256:${string}`,
+      reconciliationArtifactSha256:reconciliationReceipt.presentedArtifactSha256 as `sha256:${string}`});
+    try{
+      await bootstrapProductionSchemas(pool, store);await store.initializeRun({runId,planFingerprint,lanes:["normal-paced"],profile:RELIABILITY_V4_PROFILE});
+      await pool.query("INSERT INTO reliability_authorization_decisions(run_id,decision_id,verdict) VALUES($1,$2,$3::jsonb)",[runId,decisionId,JSON.stringify({operatorValid:true,reconciliationValid:true})]);
+      await pool.query("INSERT INTO reliability_authorization_outbox(run_id,receipt_kind,receipt,published_at) VALUES($1,'operator',$2::jsonb,clock_timestamp()),($1,'reconciliation',$3::jsonb,clock_timestamp())",
+        [runId,JSON.stringify(operatorReceipt),JSON.stringify(reconciliationReceipt)]);
+      const accepted=await (store as any).readEvidenceClosureRows(pool,runId);
+      expect(accepted.authorizationDecisions).toEqual([expect.objectContaining({decisionId,decisionIdValid:true})]);
+    }finally{
+      await pool.query("DELETE FROM reliability_authorization_outbox WHERE run_id=$1",[runId]);
+      await pool.query("DELETE FROM reliability_authorization_decisions WHERE run_id=$1",[runId]);
+      await pool.query("DELETE FROM reliability_protocol_controls WHERE run_id=$1",[runId]);await pool.end();
+    }
+  },90_000);
+
   it("counts only dispatch-owned unresolved reservations when all 100 sealed calls are planned", async () => {
     if (!url) throw new Error("RUN_NEON_INTEGRATION requires HELD_OUT_RELIABILITY_DATABASE_URL_UNPOOLED");
     const pool = new Pool({ connectionString: url, ssl: { rejectUnauthorized: true }, max: 4 });
     const store = new ReliabilityProtocolStore(pool);
     const runId = `test-${randomUUID()}`;
     try {
-      await store.createSchema();
+      await bootstrapProductionSchemas(pool, store);
       const planFingerprint = `sha256:${"e".repeat(64)}`;
       await store.initializeRun({ runId, planFingerprint, lanes: ["normal-paced"] });
       await store.registerSealedCalls({ runId, calls: Array.from({ length: 100 }, (_, index) => ({
@@ -113,7 +287,7 @@ describe.skipIf(!enabled)("reliability v2 real unpooled PostgreSQL", () => {
     const store = new ReliabilityProtocolStore(pool);
     const runId = `test-${randomUUID()}`;
     try {
-      await store.createSchema();
+      await bootstrapProductionSchemas(pool, store);
       const planFingerprint = `sha256:${"a".repeat(64)}`;
       await store.initializeRun({ runId, planFingerprint, lanes: ["normal-paced"] });
       await store.registerSealedCalls({ runId, calls: [{
@@ -144,7 +318,7 @@ describe.skipIf(!enabled)("reliability v2 real unpooled PostgreSQL", () => {
   it("permits only one concurrent scheduler claimant and never claims a tokenized call", async () => {
     if (!url) throw new Error("RUN_NEON_INTEGRATION requires HELD_OUT_RELIABILITY_DATABASE_URL_UNPOOLED");
     const pool = new Pool({ connectionString: url, ssl: { rejectUnauthorized: true }, max: 6 }); const store = new ReliabilityProtocolStore(pool); const runId=`test-${randomUUID()}`;
-    try { await store.createSchema(); const fingerprint=`sha256:${"c".repeat(64)}`; await store.initializeRun({runId,planFingerprint:fingerprint,lanes:["normal-paced"]});
+    try { await bootstrapProductionSchemas(pool, store); const fingerprint=`sha256:${"c".repeat(64)}`; await store.initializeRun({runId,planFingerprint:fingerprint,lanes:["normal-paced"]});
       await store.registerSealedCalls({runId,calls:[{requestId:"r1",block:1,laneId:"normal-paced",callOrdinal:1,body:{},organizationId:"org",agentId:"worker",credentialId:"credential",mandateId:"m",branchId:"b",workloadClass:"baseline-lookup",provider:"openrouter",model:"nousresearch/hermes-4-405b",maxOutputTokens:8,reservationCostMicros:10n,claimFingerprint:fingerprint}]});
       const claims=await Promise.all(["owner-a","owner-b"].map(ownerId=>store.acquireSchedulerClaim({runId,requestId:"r1",laneId:"normal-paced",block:1,ownerId,leaseSeconds:30,manifestPath:"/tmp/r1.json"})));
       expect(claims.filter(c=>c.acquired)).toHaveLength(1);
@@ -161,7 +335,7 @@ describe.skipIf(!enabled)("reliability v2 real unpooled PostgreSQL", () => {
     const store = new ReliabilityProtocolStore(pool); const runId=`test-${randomUUID()}`;
     const fingerprint=`sha256:${"9".repeat(64)}`;
     try {
-      await store.createSchema();
+      await bootstrapProductionSchemas(pool, store);
       await store.initializeRun({runId,planFingerprint:fingerprint,lanes:["normal-paced"]});
       await expect(store.requireSetupReadinessReceipt({runId,planFingerprint:fingerprint})).rejects.toThrow("SETUP_READINESS_RECEIPT_REQUIRED");
       await store.recordSetupReadinessReceipt({runId,expectedSnapshot:{provider:{model:"sealed"}},actualSnapshot:{provider:{model:"drifted"}}});
@@ -207,7 +381,7 @@ describe.skipIf(!enabled)("reliability v2 real unpooled PostgreSQL", () => {
     const pool=new Pool({connectionString:url,ssl:{rejectUnauthorized:true},max:4});const store=new ReliabilityProtocolStore(pool);
     const runId=`hov3-lifecycle-${randomUUID()}`,fingerprint=`sha256:${"6".repeat(64)}`;
     try{
-      await store.createSchema();await store.initializeRun({runId,planFingerprint:fingerprint,lanes:["bounded-burst"],profile:RELIABILITY_V3_PROFILE});
+      await bootstrapProductionSchemas(pool, store);await store.initializeRun({runId,planFingerprint:fingerprint,lanes:["bounded-burst"],profile:RELIABILITY_V3_PROFILE});
       await store.registerSealedCalls({runId,calls:Array.from({length:5},(_,index)=>({requestId:`r${index+1}`,block:index<3?1:2,laneId:"bounded-burst",callOrdinal:index<3?index+1:index-2,
         body:{index},organizationId:"org",agentId:"worker",credentialId:"credential",mandateId:"m",branchId:"b",workloadClass:"bounded-burst",
         provider:"openrouter",model:"nousresearch/hermes-4-405b",maxOutputTokens:8,reservationCostMicros:10n,claimFingerprint:fingerprint}))});
@@ -238,7 +412,7 @@ describe.skipIf(!enabled)("reliability v2 real unpooled PostgreSQL", () => {
       const members=await pool.query("SELECT request_id,resolved_at IS NOT NULL resolved FROM reliability_hold_members WHERE run_id=$1 ORDER BY member_sequence",[runId]);
       expect(members.rows).toEqual([{request_id:"r1",resolved:true},{request_id:"r2",resolved:true},{request_id:"r3",resolved:true}]);
     }finally{
-      for(const table of ["reliability_dispatch_tokens","reliability_lane_backlog","reliability_authorization_outbox","reliability_authorization_decisions","reliability_block_claims"])
+      for(const table of ["reliability_dispatch_tokens","reliability_lane_backlog","reliability_protocol_holds","reliability_burst_barriers","reliability_authorization_outbox","reliability_authorization_decisions","reliability_block_claims"])
         await pool.query(`DELETE FROM ${table} WHERE run_id=$1`,[runId]);
       await pool.query("DELETE FROM reliability_protocol_controls WHERE run_id=$1",[runId]);await pool.end();
     }
@@ -250,7 +424,7 @@ describe.skipIf(!enabled)("reliability v2 real unpooled PostgreSQL", () => {
     const runId=`hov3-artifact-${randomUUID()}`,fingerprint=`sha256:${"5".repeat(64)}`,digest=`sha256:${"4".repeat(64)}`;
     const path=`evidence/held-out-reliability-v3/scheduler-manifests/${runId}/r1.json`;
     try{
-      await store.createSchema();await store.initializeRun({runId,planFingerprint:fingerprint,lanes:["normal-paced"],profile:RELIABILITY_V3_PROFILE});
+      await bootstrapProductionSchemas(pool, store);await store.initializeRun({runId,planFingerprint:fingerprint,lanes:["normal-paced"],profile:RELIABILITY_V3_PROFILE});
       await store.registerSealedCalls({runId,calls:[{requestId:"r1",block:1,laneId:"normal-paced",callOrdinal:1,body:{},organizationId:"org",agentId:"worker",credentialId:"credential",mandateId:"m",branchId:"b",workloadClass:"baseline-lookup",provider:"openrouter",model:"nousresearch/hermes-4-405b",maxOutputTokens:8,reservationCostMicros:10n,claimFingerprint:fingerprint}]});
       const claim=await store.acquireSchedulerClaim({runId,requestId:"r1",laneId:"normal-paced",block:1,ownerId:"owner",leaseSeconds:30,manifestPath:path});
       await store.recordSchedulerManifestFsynced({runId,requestId:"r1",laneId:"normal-paced",ownerId:"owner",generation:claim.generation!,manifestDigest:digest,state:"claimed"});

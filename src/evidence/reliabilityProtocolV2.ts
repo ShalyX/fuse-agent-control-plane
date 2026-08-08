@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { link, mkdir, open, readFile, readdir, rename, rm, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { canonicalJson } from "./heldOutReliabilityV2.js";
@@ -198,19 +199,21 @@ export async function publishManifestDurably(path: string, value: DurableManifes
   const directory = dirname(path); await mkdir(directory, { recursive: true, mode: 0o700 });
   const bytes = `${canonicalJson(value)}\n`; const lockPath = `${path}.write-lock`;
   const temporary = `${path}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  let lock: Awaited<ReturnType<typeof open>> | undefined;
+  let lock: Awaited<ReturnType<typeof open>> | undefined; let completed=false;
   try {
     try { lock = await open(lockPath, "wx", 0o600); }
     catch (error) {
       if (error && typeof error === "object" && "code" in error && error.code === "EEXIST") throw new Error("MANIFEST_PUBLICATION_BUSY");
       throw error;
     }
+    try { await lock!.writeFile(`${canonicalJson({schemaVersion:1,destination:path,sha256:`sha256:${createHash("sha256").update(bytes).digest("hex")}`})}\n`,"utf8"); await lock!.sync(); } catch(error){await lock!.close();lock=undefined;throw error;}
+    const lockDirectory=await open(directory,"r");try{await lockDirectory.sync();}finally{await lockDirectory.close();}
     const temporaryFile = await open(temporary, "wx", 0o600);
     try { await temporaryFile.writeFile(bytes, "utf8"); await temporaryFile.sync(); } finally { await temporaryFile.close(); }
     let existingBytes: string | null = null;
     try { existingBytes = await readFile(path, "utf8"); }
     catch (error) { if (!error || typeof error !== "object" || !("code" in error) || error.code !== "ENOENT") throw error; }
-    if (existingBytes === bytes) return;
+    if (existingBytes === bytes) { completed=true; return; }
     if (existingBytes === null) {
       try { await link(temporary, path); }
       catch (error) {
@@ -229,9 +232,14 @@ export async function publishManifestDurably(path: string, value: DurableManifes
     }
     const directoryHandle = await open(directory, "r");
     try { await directoryHandle.sync(); } finally { await directoryHandle.close(); }
+    completed=true;
   } finally {
     await rm(temporary, { force: true });
-    if (lock) { await lock.close(); await unlink(lockPath).catch(() => undefined); }
+    if (lock) {
+      if(completed){const beforeUnlock=await open(directory,"r");try{await beforeUnlock.sync();}finally{await beforeUnlock.close();}}
+      await lock.close();
+      if(completed){await unlink(lockPath);const afterUnlock=await open(directory,"r");try{await afterUnlock.sync();}finally{await afterUnlock.close();}}
+    }
   }
 }
 
@@ -247,13 +255,27 @@ export class ReliabilityArtifactStore {
     await this.publishExactBytes(path, bytes);
   }
   private async publishExactBytes(path: string, bytes: string): Promise<void> {
+    const directory=dirname(path); const lockPath=`${path}.write-lock`;
+    let lockOwned=false; let published=false;
     try {
-      const file = await open(path, "wx", 0o600);
-      try { await file.writeFile(bytes, "utf8"); await file.sync(); } finally { await file.close(); }
-    } catch (error) {
-      if (!error || typeof error !== "object" || !("code" in error) || error.code !== "EEXIST") throw error;
-      const existing = await readFile(path, "utf8");
-      if (existing !== bytes) throw new Error("ARTIFACT_CONFLICT");
+      const lock=await open(lockPath,"wx",0o600);
+      lockOwned=true;
+      try { await lock.writeFile(`${canonicalJson({schemaVersion:1,destination:path,sha256:`sha256:${createHash("sha256").update(bytes).digest("hex")}`})}\n`,"utf8"); await lock.sync(); }
+      finally { await lock.close(); }
+      const directoryHandle=await open(directory,"r"); try { await directoryHandle.sync(); } finally { await directoryHandle.close(); }
+      try {
+        const file = await open(path, "wx", 0o600);
+        try { await file.writeFile(bytes, "utf8"); await file.sync(); } finally { await file.close(); }
+        published=true;
+      } catch (error) {
+        if (!error || typeof error !== "object" || !("code" in error) || error.code !== "EEXIST") throw error;
+        const existing = await readFile(path, "utf8");
+        if (existing !== bytes) throw new Error("ARTIFACT_CONFLICT");
+        published=true;
+      }
+    } finally {
+      const directoryHandle=await open(directory,"r"); try { await directoryHandle.sync(); } finally { await directoryHandle.close(); }
+      if(lockOwned&&published){await unlink(lockPath);const afterUnlock=await open(directory,"r");try{await afterUnlock.sync();}finally{await afterUnlock.close();}}
     }
   }
   async assertNoOrphanLocks(): Promise<void> {

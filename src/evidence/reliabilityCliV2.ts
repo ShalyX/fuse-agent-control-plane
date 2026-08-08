@@ -15,6 +15,7 @@ export interface ReliabilityCliDependencies {
   network?: (...args: unknown[]) => Promise<unknown>;
   readLocal?: (path: string) => Promise<Buffer>;
   durableRunPredecision?: boolean;
+  workerRequiresProviderNetwork?: boolean;
   operations?: Partial<Record<ReliabilityCliCommand, (input: { args: readonly string[]; files: Readonly<Record<string, Buffer>> }) => Promise<Record<string, unknown>>>>;
 }
 
@@ -39,6 +40,8 @@ export async function executeReliabilityCli(args: readonly string[], deps: Relia
     catch (error) { return { ...base, ok: false, errorCode: error instanceof Error ? error.message : "RELIABILITY_OPERATION_FAILED", providerCalls: 0, paymentCalls: 0, beaconCalls: 0 }; }
   }
   if (command === "dry") return { ...base, ok: true, simulated: true, providerCalls: 0, paymentCalls: 0, beaconCalls: 0, plannedFresh: 100, plannedReplays: 20 };
+  if(command==="worker"&&deps.workerRequiresProviderNetwork&&!has(args,"--allow-provider-network"))
+    return {...base,ok:false,errorCode:"NETWORK_DEFAULT_DENY",providerCalls:0};
   if (command === "setup" || command === "worker") {
     const operation = deps.operations?.[command];
     if (!operation) return { ...base, ok: false, errorCode: "RELIABILITY_SERVICE_REQUIRED", providerCalls: 0, paymentCalls: 0, beaconCalls: 0 };

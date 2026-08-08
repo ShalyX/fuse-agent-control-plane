@@ -8,6 +8,7 @@ import * as closure from "../src/evidence/evidenceSettlementClosure.js";
 import { authoritativeSnapshotDigest } from "../src/evidence/authoritativeSettlement.js";
 import { expectedReliabilityArtifactPaths } from "../src/evidence/authoritativeEvidence.js";
 import { V2_SCHEDULE } from "../src/evidence/heldOutReliabilityV2.js";
+import { evaluateSettlementRowsForRun } from "../src/reliability/protocolStore.js";
 
 const sha = (bytes: string | Buffer) => `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
 const lanes = ["normal-paced", "high-envelope", "bounded-burst", "restart-resume"] as const;
@@ -103,6 +104,20 @@ function passingSnapshot() {
 }
 
 describe("accepted-snapshot closure", () => {
+  it.each(["run-v2-settlement","hov3-settlement","hov4-settlement"])("uses the run-version schedule in the production settlement reader for %s", (runId) => {
+    const fixture=passingSnapshot();
+    const schedule=closure.reliabilityScheduleForRunId(runId);
+    const callByRequest=new Map(fixture.rows.sealedCalls.map(call=>[call.requestId,call]));
+    for(const event of fixture.rows.lifecycleEvents){
+      const block=callByRequest.get(event.requestId)!.block;
+      const delta=Date.parse(schedule[block-1]!.opensAt)-Date.parse(V2_SCHEDULE[block-1]!.opensAt);
+      event.databaseTimeMs+=delta;
+      if(event.blockClaimedAtMs!==undefined&&event.blockClaimedAtMs!==null)event.blockClaimedAtMs+=delta;
+      if(event.priorTerminalAtMs!==undefined&&event.priorTerminalAtMs!==null)event.priorTerminalAtMs+=delta;
+    }
+    expect(evaluateSettlementRowsForRun(runId,fixture.rows,fixture.replayIds)).toEqual({complete:true,reasons:[]});
+  });
+
   it("accepts only the exact sealed matrix with 100 shadow completions and 20 ordered replays", () => {
     expect(closure.evaluateSettlementSnapshotCompleteness).toBeTypeOf("function");
     const fixture = passingSnapshot();
