@@ -1,5 +1,6 @@
 import type { RequestHandler } from "express";
-import type { ApiCapability, ServiceAccountRole } from "../identity/apiCredentials.js";
+import { API_CAPABILITIES, type ApiCapability, type ServiceAccountRole } from "../identity/apiCredentials.js";
+import type { HumanSessionSourceCredentialType, HumanSessionStore } from "./humanSessions.js";
 
 export interface AuthenticatedPrincipal {
   principalType: "agent" | "service_account";
@@ -10,8 +11,48 @@ export interface AuthenticatedPrincipal {
   role?: ServiceAccountRole;
 }
 
-export interface CredentialAuthenticator {
+export type CredentialAuthenticator = {
   authenticateToken(token: string, now: string): Promise<AuthenticatedPrincipal | null>;
+  isCredentialActive?(
+    organizationId: string,
+    credentialId: string,
+    credentialType: HumanSessionSourceCredentialType,
+    now: string,
+  ): Promise<boolean>;
+};
+
+export function createSessionAwareAuthenticator(
+  credentials: CredentialAuthenticator,
+  sessions: HumanSessionStore,
+): CredentialAuthenticator {
+  return {
+    async authenticateToken(token, now) {
+      if (!token.startsWith("fuse_hs_")) return credentials.authenticateToken(token, now);
+      const session = await sessions.resolve(token, now);
+      if (!session) return null;
+      if (!credentials.isCredentialActive
+        || !await credentials.isCredentialActive(
+          session.workspaceId,
+          session.sourceCredentialId,
+          session.sourceCredentialType,
+          now,
+        )) return null;
+      const role: ServiceAccountRole = session.role === "owner" ? "admin"
+        : session.role === "member" ? "operator" : "viewer";
+      const capabilities: ApiCapability[] = role === "admin" ? [...API_CAPABILITIES]
+        : role === "operator"
+          ? ["inference:invoke", "mandates:read", "mandates:write", "receipts:read", "policies:read", "providers:read", "sandbox:run"]
+          : ["mandates:read", "receipts:read", "policies:read", "providers:read"];
+      return {
+        principalType: "service_account",
+        principalId: session.userId,
+        organizationId: session.workspaceId,
+        credentialId: session.sessionId,
+        capabilities,
+        role,
+      };
+    },
+  };
 }
 
 async function authenticatePrincipal(

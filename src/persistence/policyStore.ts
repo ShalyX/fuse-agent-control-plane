@@ -160,6 +160,26 @@ export interface StoredPolicyDecision {
   input: PolicyDecisionInput;
 }
 
+export interface DecisionPageCursor {
+  decidedAt: string;
+  id: string;
+}
+
+export interface DecisionPage {
+  decisions: StoredPolicyDecision[];
+  hasMore: boolean;
+  nextCursor: DecisionPageCursor | null;
+}
+
+export interface ExecutionSettlement {
+  requestId: string;
+  status: "denied" | "executing" | "completed" | "failed" | "reconciliation_hold";
+  reservedCostAtomic: bigint;
+  actualCostAtomic: bigint | null;
+  failureCode: string | null;
+  resolved: boolean;
+}
+
 export interface ReconciliationCase {
   requestId: string;
   mandateId: string;
@@ -211,6 +231,183 @@ export class PolicyStore implements InferenceExecutionStore {
     );
     return result.rows.length === 2
       && result.rows[0]?.version === 4 && result.rows[1]?.version === 5;
+  }
+
+  async hasUsablePolicy(
+    organizationId: string,
+    provider: string,
+    model: string,
+  ): Promise<boolean> {
+    if (!organizationId.trim()) throw new Error("POLICY_ORGANIZATION_REQUIRED");
+    if (!provider.trim() || !model.trim()) throw new Error("POLICY_PROVIDER_MODEL_REQUIRED");
+    await this.ensureSchema();
+    const result = await this.pool.query(
+      `SELECT 1 FROM policy_versions
+       WHERE organization_id = $1
+         AND mode <> 'paused'
+         AND required_capability = 'inference:invoke'
+         AND allowed_providers @> $2::jsonb
+         AND allowed_models @> $3::jsonb
+         AND max_per_call_atomic > 0
+         AND max_hourly_atomic > 0
+         AND max_daily_atomic > 0
+         AND max_requests_per_minute > 0
+         AND max_input_tokens > 0
+         AND max_output_tokens > 0
+       LIMIT 1`,
+      [organizationId, JSON.stringify([provider]), JSON.stringify([model])],
+    );
+    return (result.rowCount ?? 0) > 0;
+  }
+
+  async hasExecutableMandate(
+    organizationId: string,
+    now: string,
+    provider?: string,
+    model?: string,
+  ): Promise<boolean> {
+    if (!organizationId.trim()) throw new Error("CONTROL_MANDATE_ORGANIZATION_REQUIRED");
+    const nowMs = Date.parse(now);
+    if (Number.isNaN(nowMs)) throw new Error("CONTROL_MANDATE_CHECK_TIME_INVALID");
+    await this.ensureSchema();
+    const result = await this.pool.query<{
+      mandate_id: string;
+      workload_classes: SerializedWorkloadClass[];
+      branch_id: string | null;
+      allowed_workload_classes: string[] | null;
+      branch_maximum_atomic: string | null;
+      branch_spent_atomic: string;
+      delegated_atomic: string;
+    }>(
+      `WITH mandate_usage AS (
+         SELECT organization_id, mandate_id,
+                SUM(CASE
+                  WHEN status IN ('executing', 'reconciliation_hold') THEN reserved_cost_atomic
+                  WHEN status = 'completed' OR failure_code = 'RECONCILED_BILLED_NO_RESPONSE'
+                    THEN actual_cost_atomic
+                  ELSE 0 END) AS spent_atomic
+         FROM inference_executions
+         GROUP BY organization_id, mandate_id
+       ), branch_usage AS (
+         SELECT organization_id, mandate_id, branch_id,
+                SUM(CASE
+                  WHEN status IN ('executing', 'reconciliation_hold') THEN reserved_cost_atomic
+                  WHEN status = 'completed' OR failure_code = 'RECONCILED_BILLED_NO_RESPONSE'
+                    THEN actual_cost_atomic
+                  ELSE 0 END) AS spent_atomic
+         FROM inference_executions
+         WHERE branch_id IS NOT NULL
+         GROUP BY organization_id, mandate_id, branch_id
+       ), child_authority AS (
+         SELECT organization_id, mandate_id, parent_branch_id,
+                SUM(maximum_spend_atomic) AS allocated_atomic
+         FROM mandate_branches
+         WHERE parent_branch_id IS NOT NULL
+         GROUP BY organization_id, mandate_id, parent_branch_id
+       )
+       SELECT mandates.id AS mandate_id,
+              policies.workload_classes,
+              branches.branch_id,
+              branches.allowed_workload_classes,
+              branches.maximum_spend_atomic::text AS branch_maximum_atomic,
+              COALESCE(branch_usage.spent_atomic, 0)::text AS branch_spent_atomic,
+              COALESCE(delegated.allocated_atomic, 0)::text AS delegated_atomic
+       FROM control_mandates mandates
+       JOIN policy_versions policies
+         ON policies.organization_id = mandates.organization_id
+        AND policies.policy_id = mandates.policy_id
+        AND policies.version = mandates.policy_version
+       JOIN mandate_agent_assignments assignments
+         ON assignments.organization_id = mandates.organization_id
+        AND assignments.mandate_id = mandates.id
+       JOIN agent_identities agents
+         ON agents.organization_id = assignments.organization_id
+        AND agents.id = assignments.agent_id
+       JOIN api_credentials credentials
+         ON credentials.organization_id = agents.organization_id
+        AND credentials.agent_id = agents.id
+       LEFT JOIN mandate_branches branches
+         ON branches.organization_id = mandates.organization_id
+        AND branches.mandate_id = mandates.id
+        AND branches.agent_id = agents.id
+        AND branches.policy_id = mandates.policy_id
+        AND branches.policy_version = mandates.policy_version
+        AND (branches.expires_at IS NULL OR branches.expires_at > $2)
+       LEFT JOIN mandate_usage
+         ON mandate_usage.organization_id = mandates.organization_id
+        AND mandate_usage.mandate_id = mandates.id
+       LEFT JOIN branch_usage
+         ON branch_usage.organization_id = branches.organization_id
+        AND branch_usage.mandate_id = branches.mandate_id
+        AND branch_usage.branch_id = branches.branch_id
+       LEFT JOIN child_authority delegated
+         ON delegated.organization_id = branches.organization_id
+        AND delegated.mandate_id = branches.mandate_id
+        AND delegated.parent_branch_id = branches.branch_id
+       WHERE mandates.organization_id = $1
+         AND mandates.state = 'active'
+         AND (mandates.expires_at IS NULL OR mandates.expires_at > $2)
+         AND policies.mode <> 'paused'
+         AND policies.required_capability = 'inference:invoke'
+         AND ($3::text IS NULL OR policies.allowed_providers @> $3::jsonb)
+         AND ($4::text IS NULL OR policies.allowed_models @> $4::jsonb)
+         AND policies.max_per_call_atomic > 0
+         AND policies.max_hourly_atomic > 0
+         AND policies.max_daily_atomic > 0
+         AND policies.max_requests_per_minute > 0
+         AND policies.max_input_tokens > 0
+         AND policies.max_output_tokens > 0
+         AND agents.status = 'active'
+         AND agents.revoked_at IS NULL
+         AND credentials.revoked_at IS NULL
+         AND (credentials.expires_at IS NULL OR credentials.expires_at > $2)
+         AND credentials.capabilities @> '["inference:invoke"]'::jsonb
+         AND mandates.maximum_spend_atomic > COALESCE(mandate_usage.spent_atomic, 0)`,
+      [
+        organizationId,
+        new Date(nowMs),
+        provider === undefined ? null : JSON.stringify([provider]),
+        model === undefined ? null : JSON.stringify([model]),
+      ],
+    );
+    if ((result.rowCount ?? 0) === 0) return false;
+    if (result.rows.some((row) => row.workload_classes.length === 0)) return true;
+    const usageResult = await this.pool.query<{
+      mandate_id: string;
+      branch_id: string;
+      workload_class: string;
+      invocation_count: number;
+      spent_atomic: string;
+    }>(
+      `SELECT mandate_id, branch_id, workload_class,
+              COUNT(*) FILTER (WHERE status <> 'denied')::int AS invocation_count,
+              COALESCE(SUM(CASE
+                WHEN status IN ('executing', 'reconciliation_hold') THEN reserved_cost_atomic
+                WHEN status = 'completed' OR failure_code = 'RECONCILED_BILLED_NO_RESPONSE'
+                  THEN actual_cost_atomic
+                ELSE 0 END), 0)::text AS spent_atomic
+       FROM inference_executions
+       WHERE organization_id = $1 AND branch_id IS NOT NULL AND workload_class IS NOT NULL
+       GROUP BY mandate_id, branch_id, workload_class`,
+      [organizationId],
+    );
+    const usage = new Map(usageResult.rows.map((row) => [
+      `${row.mandate_id}\0${row.branch_id}\0${row.workload_class}`,
+      { invocations: Number(row.invocation_count), spentAtomic: BigInt(row.spent_atomic) },
+    ]));
+    return result.rows.some((row) => {
+      if (!row.branch_id || !row.branch_maximum_atomic || !row.allowed_workload_classes) return false;
+      if (BigInt(row.branch_maximum_atomic)
+        <= BigInt(row.branch_spent_atomic) + BigInt(row.delegated_atomic)) return false;
+      const allowed = new Set(row.allowed_workload_classes);
+      return this.deserializeWorkloadClasses(row.workload_classes).some((workloadClass) => {
+        if (!allowed.has(workloadClass.id)) return false;
+        const consumed = usage.get(`${row.mandate_id}\0${row.branch_id}\0${workloadClass.id}`)
+          ?? { invocations: 0, spentAtomic: 0n };
+        return consumed.invocations < workloadClass.maxInvocationsPerBranch
+          && consumed.spentAtomic < workloadClass.aggregateBudgetAtomic;
+      });
+    });
   }
 
   async publishPolicy(policy: PolicyVersion, context: PolicyMutationContext): Promise<void> {
@@ -733,7 +930,7 @@ export class PolicyStore implements InferenceExecutionStore {
     maxOutputTokens: number;
     requestFingerprint: string;
     decidedAt: string;
-  }, atomicHook?: (client: PoolClient, result: AdmissionResult) => Promise<void>): Promise<AdmissionResult> {
+  }, atomicHook?: (client: PoolClient, result: AdmissionResult) => Promise<void>, previewOnly = false): Promise<AdmissionResult> {
     input = { ...input, agentCapabilities: [...input.agentCapabilities] };
     if (!input.requestId.trim()) throw new Error("POLICY_DECISION_REQUEST_REQUIRED");
     if (!input.organizationId.trim()) throw new Error("POLICY_DECISION_ORGANIZATION_REQUIRED");
@@ -959,18 +1156,6 @@ export class PolicyStore implements InferenceExecutionStore {
             ? maximumExposureAtomic - requestReservationAtomic : 0n,
         };
       }
-      await client.query(
-        `INSERT INTO policy_decisions
-         (id, organization_id, request_id, mandate_id, agent_id, policy_id, policy_version,
-          outcome, would_outcome, enforced, reason_codes, input_snapshot, decided_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb, $13)`,
-        [
-          decisionInput.id, input.organizationId, input.requestId, input.mandateId, input.agentId,
-          policy.id, policy.version, evaluation.outcome, evaluation.wouldOutcome,
-          evaluation.enforced, JSON.stringify(evaluation.reasonCodes),
-          JSON.stringify(this.serializeDecisionInput(decisionInput)), input.decidedAt,
-        ],
-      );
       const decision: StoredPolicyDecision = {
         id: decisionInput.id,
         requestId: input.requestId,
@@ -984,6 +1169,22 @@ export class PolicyStore implements InferenceExecutionStore {
       };
       const status = evaluation.outcome === "ALLOW" ? "executing" : "denied";
       const reservation = evaluation.outcome === "ALLOW" ? input.estimatedCostAtomic : 0n;
+      const result: AdmissionResult = evaluation.outcome === "ALLOW"
+        ? { status: "execute", decision, reservedCostAtomic: reservation }
+        : { status: "denied", decision };
+      if (previewOnly) return result;
+      await client.query(
+        `INSERT INTO policy_decisions
+         (id, organization_id, request_id, mandate_id, agent_id, policy_id, policy_version,
+          outcome, would_outcome, enforced, reason_codes, input_snapshot, decided_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb, $13)`,
+        [
+          decisionInput.id, input.organizationId, input.requestId, input.mandateId, input.agentId,
+          policy.id, policy.version, evaluation.outcome, evaluation.wouldOutcome,
+          evaluation.enforced, JSON.stringify(evaluation.reasonCodes),
+          JSON.stringify(this.serializeDecisionInput(decisionInput)), input.decidedAt,
+        ],
+      );
       await client.query(
         `INSERT INTO inference_executions
          (organization_id, request_id, mandate_id, agent_id, decision_id, provider, model,
@@ -997,12 +1198,13 @@ export class PolicyStore implements InferenceExecutionStore {
           input.maxOutputTokens, input.decidedAt,
         ],
       );
-      const result: AdmissionResult = evaluation.outcome === "ALLOW"
-        ? { status: "execute", decision, reservedCostAtomic: reservation }
-        : { status: "denied", decision };
       if (atomicHook) await atomicHook(client, result);
       return result;
     });
+  }
+
+  previewInference(input: Parameters<InferenceExecutionStore["admitInference"]>[0]): Promise<AdmissionResult> {
+    return this.admitInference(input, undefined, true);
   }
 
   admitInferenceAtomically(
@@ -1377,6 +1579,101 @@ export class PolicyStore implements InferenceExecutionStore {
         reasonCodes: row.reason_codes,
       },
       input: this.deserializeDecisionInput(row.input_snapshot),
+    }));
+  }
+
+  async listDecisionsPage(organizationId: string, mandateId: string, limit: number, cursor: DecisionPageCursor | null, agentId?: string): Promise<DecisionPage> {
+    await this.ensureSchema();
+    const result = await this.pool.query<DecisionRow>(
+      `SELECT * FROM policy_decisions
+       WHERE organization_id = $1 AND mandate_id = $2
+         AND ($3::timestamptz IS NULL OR decided_at > $3 OR (decided_at = $3 AND id > $4))
+         AND ($5::text IS NULL OR agent_id = $5)
+       ORDER BY decided_at ASC, id ASC
+       LIMIT $6`,
+      [organizationId, mandateId, cursor?.decidedAt ?? null, cursor?.id ?? null, agentId ?? null, limit + 1],
+    );
+    const hasMore = result.rows.length > limit;
+    const rows = result.rows.slice(0, limit);
+    const last = rows[rows.length - 1];
+    return {
+      hasMore,
+      nextCursor: hasMore && last ? { decidedAt: last.decided_at, id: last.id } : null,
+      decisions: rows.map((row) => ({
+        id: row.id, requestId: row.request_id, organizationId: row.organization_id, mandateId: row.mandate_id,
+        agentId: row.agent_id, policyId: row.policy_id, policyVersion: row.policy_version,
+        result: { outcome: row.outcome, wouldOutcome: row.would_outcome, enforced: row.enforced, reasonCodes: row.reason_codes },
+        input: this.deserializeDecisionInput(row.input_snapshot),
+      })),
+    };
+  }
+
+  async getDecision(organizationId: string, mandateId: string, requestId: string): Promise<StoredPolicyDecision | null> {
+    await this.ensureSchema();
+    const result = await this.pool.query<DecisionRow>(
+      `SELECT * FROM policy_decisions
+       WHERE organization_id = $1 AND mandate_id = $2 AND request_id = $3
+       LIMIT 1`,
+      [organizationId, mandateId, requestId],
+    );
+    const row = result.rows[0];
+    if (!row) return null;
+    return {
+      id: row.id, requestId: row.request_id, organizationId: row.organization_id, mandateId: row.mandate_id,
+      agentId: row.agent_id, policyId: row.policy_id, policyVersion: row.policy_version,
+      result: { outcome: row.outcome, wouldOutcome: row.would_outcome, enforced: row.enforced, reasonCodes: row.reason_codes },
+      input: this.deserializeDecisionInput(row.input_snapshot),
+    };
+  }
+
+  async listExecutionSettlementsForRequests(organizationId: string, mandateId: string, requestIds: string[]): Promise<ExecutionSettlement[]> {
+    if (requestIds.length === 0) return [];
+    await this.ensureSchema();
+    const result = await this.pool.query<{
+      request_id: string; status: ExecutionSettlement["status"]; reserved_cost_atomic: string;
+      actual_cost_atomic: string | null; failure_code: string | null; resolved_request_id: string | null;
+    }>(
+      `SELECT executions.request_id, executions.status, executions.reserved_cost_atomic::text,
+              executions.actual_cost_atomic::text, executions.failure_code, resolutions.request_id AS resolved_request_id
+       FROM inference_executions executions
+       LEFT JOIN reconciliation_resolutions resolutions
+         ON resolutions.organization_id = executions.organization_id AND resolutions.request_id = executions.request_id
+       WHERE executions.organization_id = $1 AND executions.mandate_id = $2 AND executions.request_id = ANY($3::text[])`,
+      [organizationId, mandateId, requestIds],
+    );
+    return result.rows.map((row) => ({ requestId: row.request_id, status: row.status,
+      reservedCostAtomic: BigInt(row.reserved_cost_atomic), actualCostAtomic: row.actual_cost_atomic === null ? null : BigInt(row.actual_cost_atomic),
+      failureCode: row.failure_code, resolved: row.resolved_request_id !== null }));
+  }
+
+  async listExecutionSettlements(organizationId: string, mandateId: string): Promise<ExecutionSettlement[]> {
+    await this.ensureSchema();
+    const result = await this.pool.query<{
+      request_id: string;
+      status: ExecutionSettlement["status"];
+      reserved_cost_atomic: string;
+      actual_cost_atomic: string | null;
+      failure_code: string | null;
+      resolved_request_id: string | null;
+    }>(
+      `SELECT executions.request_id, executions.status,
+              executions.reserved_cost_atomic::text, executions.actual_cost_atomic::text,
+              executions.failure_code, resolutions.request_id AS resolved_request_id
+       FROM inference_executions executions
+       LEFT JOIN reconciliation_resolutions resolutions
+         ON resolutions.organization_id = executions.organization_id
+        AND resolutions.request_id = executions.request_id
+       WHERE executions.organization_id = $1 AND executions.mandate_id = $2
+       ORDER BY executions.created_at ASC, executions.request_id ASC`,
+      [organizationId, mandateId],
+    );
+    return result.rows.map((row) => ({
+      requestId: row.request_id,
+      status: row.status,
+      reservedCostAtomic: BigInt(row.reserved_cost_atomic),
+      actualCostAtomic: row.actual_cost_atomic === null ? null : BigInt(row.actual_cost_atomic),
+      failureCode: row.failure_code,
+      resolved: row.resolved_request_id !== null,
     }));
   }
 
@@ -2610,4 +2907,5 @@ interface DecisionRow {
   enforced: boolean;
   reason_codes: PolicyReasonCode[];
   input_snapshot: DecisionSnapshot;
+  decided_at: string;
 }

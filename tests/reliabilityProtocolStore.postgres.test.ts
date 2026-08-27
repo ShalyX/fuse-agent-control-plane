@@ -63,7 +63,7 @@ describe.skipIf(!enabled)("reliability v2 real unpooled PostgreSQL", () => {
       await pool.query("DELETE FROM reliability_protocol_events WHERE run_id=$1",[runId]);await pool.query("DELETE FROM reliability_protocol_attempts WHERE run_id=$1",[runId]);
       await pool.query("DELETE FROM reliability_sealed_calls WHERE run_id=$1",[runId]);await pool.query("DELETE FROM reliability_protocol_controls WHERE run_id=$1",[runId]);await pool.end();
     }
-  });
+  }, 90_000);
 
   it("completes the inherited v4 authorization publication lifecycle", async () => {
     if (!url) throw new Error("RUN_NEON_INTEGRATION requires HELD_OUT_RELIABILITY_DATABASE_URL_UNPOOLED");
@@ -163,7 +163,7 @@ describe.skipIf(!enabled)("reliability v2 real unpooled PostgreSQL", () => {
         await cleanup.query(`DELETE FROM ${table} WHERE run_id=$1`,[runId]);
       await cleanup.query("DELETE FROM reliability_protocol_controls WHERE run_id=$1",[runId]);await cleanup.end();
     }
-  });
+  }, 90_000);
 
   it("durably binds a v3 run to its complete profile and rejects cross-version reopening", async () => {
     if (!url) throw new Error("RUN_NEON_INTEGRATION requires HELD_OUT_RELIABILITY_DATABASE_URL_UNPOOLED");

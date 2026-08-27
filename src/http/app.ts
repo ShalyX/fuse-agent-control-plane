@@ -7,17 +7,34 @@ import { renderControlDesk } from "./desk.js";
 import { renderOperatorConsole } from "./console.js";
 import { renderLandingPage } from "./landing.js";
 import { createAuthenticationGuard, createCapabilityGuard, type CredentialAuthenticator } from "./auth.js";
+import { createHumanSession, type HumanSessionStore } from "./humanSessions.js";
 import type { CredentialAdministrationPort } from "../identity/credentialAdministration.js";
 import { API_CAPABILITIES } from "../identity/apiCredentials.js";
 import type { PolicyAdministrationPort } from "../policy/policyAdministration.js";
 import type { ProviderAdministrationPort } from "../providers/providerAdministration.js";
+import { ProviderConnectionService } from "../product/providerConnections.js";
+import { MandateManagementService, type ProductBranchInput, type ProductMandateInput } from "../product/mandateManagement.js";
+import { PolicyPublishingService, type ProductPolicyInput } from "../product/policyPublishing.js";
+import { AgentIdentityService, type ProductIssueCredentialInput, type ProductRegisterAgentInput } from "../product/agentIdentity.js";
+import { ProductInferenceService } from "../product/inference.js";
+import { ProductReceiptService } from "../product/receipts.js";
+import { SandboxRunService } from "../product/sandboxRuns.js";
+import type { SandboxRunStore } from "../product/sandboxRunStore.js";
+import type { PaymentEvidenceStore } from "../product/paymentEvidence.js";
 import type {
   AdmissionResult,
   ControlledInferenceInput,
 } from "../inference/inferenceExecution.js";
 import { issueReliabilityProtocolContext } from "../inference/inferenceExecution.js";
+import { calculateMaximumCostMicros } from "../core/pricing.js";
+import { buildSetupReadiness, type SetupReadinessInput } from "../product/setupReadiness.js";
+import { buildProductReadiness, type ProductReadinessInput } from "../product/productReadiness.js";
+import { CustomerOnboardingService, type CustomerOnboardingPort, type CreateWorkspaceInput } from "../product/customerOnboarding.js";
 import { withTrustedReplayOperation } from "../reliability/replayOperationContext.js";
 import type { StableSuccessfulResponseProjection } from "../reliability/commitments.js";
+import type { OperationalAuditEvent, OperationalAuditStore } from "../product/operationalAudit.js";
+
+const MAX_HUMAN_SESSION_MS = 24 * 60 * 60 * 1_000;
 
 const completionSchema = z.object({
   model: z.string().min(1),
@@ -30,6 +47,22 @@ const completionSchema = z.object({
 });
 
 type PaymentGuardFactory = (priceUsdc: string) => RequestHandler;
+
+function logInferenceFailure(route: string, requestId: string | undefined, error: unknown): void {
+  const value = error && typeof error === "object" ? error as Record<string, unknown> : {};
+  console.error(JSON.stringify({
+    event: "inference_execution_failure",
+    route,
+    ...(requestId ? { requestId } : {}),
+    ...(typeof value.name === "string" ? { errorName: value.name } : {}),
+    ...(typeof value.code === "string" ? { errorCode: value.code } : {}),
+    ...(typeof value.message === "string" && /^[A-Z0-9_]+$/.test(value.message) && value.message.length <= 128
+      ? { errorMessage: value.message } : {}),
+    ...(typeof value.phase === "string" ? { phase: value.phase } : {}),
+    ...(typeof value.status === "number" ? { upstreamStatus: value.status } : {}),
+    ...(typeof value.generationId === "string" ? { generationId: value.generationId } : {}),
+  }));
+}
 
 const agentRegistrationSchema = z.object({
   agentId: z.string().min(1).max(128),
@@ -61,7 +94,7 @@ const providerPriceSchema = z.string().regex(/^\d+(?:\.\d{1,12})?$/).max(64)
   .refine((value) => Number(value) > 0);
 const providerConfigurationSchema = z.object({
   configId: z.string().min(1).max(128),
-  provider: z.enum(["anthropic", "openrouter"]),
+  provider: z.literal("openrouter"),
   model: z.string().min(1).max(256),
   apiKey: z.string().min(8).max(4096),
   inputUsdPerMillion: providerPriceSchema,
@@ -129,6 +162,19 @@ const mandatePolicySchema = z.object({
   policyId: z.string().min(1).max(128),
   policyVersion: z.number().int().positive().max(1_000_000),
 }).strict();
+const workspaceCreateSchema = z.object({
+  name: z.string().trim().min(1).max(128),
+  agentName: z.string().trim().min(1).max(128),
+  provider: z.literal("openrouter"),
+  model: z.string().trim().min(1).max(256),
+  apiKey: z.string().min(1).max(512),
+  inputUsdPerMillion: providerPriceSchema,
+  outputUsdPerMillion: providerPriceSchema,
+  maximumSpendAtomic: positiveAtomicAmountSchema,
+  idempotencyKey: z.string().regex(/^[A-Za-z0-9._:-]{8,128}$/),
+  expiresAt: z.string().datetime().nullable().optional(),
+}).strict();
+
 const reconciliationResolutionSchema = z.object({
   resolution: z.enum(["settle", "confirm_not_billed"]),
   actualCostAtomic: atomicAmountSchema.optional(),
@@ -150,20 +196,47 @@ const mandateTransitionSchema = z.object({
   ]),
 }).strict();
 
+export interface OperationalReadiness {
+  controlMode: boolean;
+  settlementDisabled: boolean;
+  durableInviteGate: boolean;
+  durableAdminRateLimit: boolean;
+  sourceCredentialRevocationEnforced: boolean;
+  staleOnboardingOperations: number;
+  rollbackFailedOnboardingOperations: number;
+  oldestInProgressAt: string | null;
+  orphanCapacityReservations: number;
+  oldestOrphanReservationAt: string | null;
+}
+
 type AppDependencies = {
   provider: InferenceProvider;
-  paymentGuard: PaymentGuardFactory;
+  paymentGuard?: PaymentGuardFactory;
+  paymentMode?: "control" | "settlement";
   estimateInputTokens: (messages: Array<{ role: string; content: string }>) => number;
   payerWallet?: string;
   price?: { inputUsdPerMillion: string; outputUsdPerMillion: string };
   stateStore?: ServiceStateStore;
   credentialAuthenticator?: CredentialAuthenticator;
+  humanSessionStore?: HumanSessionStore;
   credentialAdministration?: CredentialAdministrationPort;
+  agentIdentityService?: AgentIdentityService;
   policyAdministration?: PolicyAdministrationPort;
+  policyPublishingService?: PolicyPublishingService;
+  mandateManagementService?: MandateManagementService;
   providerAdministration?: ProviderAdministrationPort;
+  providerConnectionService?: ProviderConnectionService;
   inferenceExecution?: {
     execute(input: ControlledInferenceInput): Promise<AdmissionResult>;
+    preview?(input: ControlledInferenceInput): Promise<AdmissionResult>;
   };
+  productInferenceService?: ProductInferenceService;
+  productReceiptService?: ProductReceiptService;
+  sandboxRunService?: SandboxRunService;
+  sandboxRunStore?: SandboxRunStore;
+  paymentEvidenceStore?: PaymentEvidenceStore;
+  customerOnboardingService?: CustomerOnboardingPort;
+  operationalAudit?: OperationalAuditStore;
   reliabilityContextIssuer?: (input: {
     runId: string | null; laneId: string | null; block: number | null; requestId: string;
     organizationId: string; agentId: string; credentialId: string; mandateId: string; branchId: string | null;
@@ -183,10 +256,33 @@ type AppDependencies = {
     }): Promise<StableSuccessfulResponseProjection>;
   };
   readiness?: () => Promise<Record<string, boolean>>;
+  operationalReadiness?: () => Promise<OperationalReadiness>;
+  productReadiness?: (principal: { organizationId: string }) => Promise<ProductReadinessInput>;
   workloadShadowEnabled?: boolean;
   adminRateLimit?: {
     maxPerMinute: number;
     now?: () => number;
+    consume?: (key: string, maxPerMinute: number, now: number) => Promise<{ allowed: boolean; retryAfterSeconds: number }>;
+  };
+  onboardingRateLimit?: {
+    maxPerMinute: number;
+    now?: () => number;
+    consume?: (key: string, maxPerMinute: number, now: number) => Promise<{ allowed: boolean; retryAfterSeconds: number }>;
+  };
+  betaOnboardingGuard?: {
+    maxActiveWorkspaces: number;
+    reserveCapacity: (idempotencyKey: string) => Promise<boolean>;
+    authorizeInvite: (inviteToken: string, idempotencyKey: string) => Promise<boolean>;
+  };
+  productRateLimit?: {
+    maxPerMinute: number;
+    now?: () => number;
+    consume?: (key: string, maxPerMinute: number, now: number) => Promise<{ allowed: boolean; retryAfterSeconds: number }>;
+  };
+  sessionRateLimit?: {
+    maxPerMinute: number;
+    now?: () => number;
+    consume?: (key: string, maxPerMinute: number, now: number) => Promise<{ allowed: boolean; retryAfterSeconds: number }>;
   };
   requestLogger?: (event: {
     requestId: string;
@@ -202,8 +298,29 @@ function microsToUsdc(micros: bigint): string {
   return `${micros / 1_000_000n}.${(micros % 1_000_000n).toString().padStart(6, "0")}`;
 }
 
+function maximumQuoteUsdc(inputTokens: number, maxOutputTokens: number, price?: { inputUsdPerMillion: string; outputUsdPerMillion: string }): string {
+  return microsToUsdc(calculateMaximumCostMicros(
+    { inputTokens, maxOutputTokens },
+    price ?? { inputUsdPerMillion: "3.00", outputUsdPerMillion: "15.00" },
+  ));
+}
+
+async function requirePayment(request: express.Request, response: express.Response, guard: RequestHandler): Promise<boolean> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    guard(request, response, (error?: unknown) => {
+      settled = true;
+      if (error) reject(error);
+      else resolve(true);
+    });
+    if (!settled && response.headersSent) resolve(false);
+  });
+}
+
 export function createFuseApp(dependencies: AppDependencies) {
   const app = express();
+  const paymentRequired = dependencies.paymentMode === "settlement";
+  if (paymentRequired && !dependencies.paymentGuard) throw new Error("SETTLEMENT_PAYMENT_GUARD_REQUIRED");
   const stateStore = dependencies.stateStore ?? new MemoryStateStore();
   const initialState = () => FuseService.createDemo(dependencies.provider, {
     payerWallet: dependencies.payerWallet,
@@ -252,6 +369,20 @@ export function createFuseApp(dependencies: AppDependencies) {
       "Vercel-CDN-Cache-Control": "no-store",
     });
   };
+  const auditOrUnavailable = async (
+    response: express.Response,
+    event: Omit<OperationalAuditEvent, "occurredAt">,
+  ): Promise<boolean> => {
+    if (!dependencies.operationalAudit) return true;
+    try {
+      await dependencies.operationalAudit.record({ ...event, occurredAt: new Date().toISOString() });
+      return true;
+    } catch {
+      disableCaching(response);
+      response.status(503).json({ error: { code: "AUDIT_UNAVAILABLE" } });
+      return false;
+    }
+  };
   const handlePolicyError = (error: unknown, response: express.Response) => {
     const message = error instanceof Error ? error.message : "";
     const databaseCode = typeof error === "object" && error !== null && "code" in error
@@ -299,12 +430,28 @@ export function createFuseApp(dependencies: AppDependencies) {
     if (["SERVICE_ACCOUNT_REQUIRED", "SERVICE_ACCOUNT_ADMIN_REQUIRED", "PROVIDER_CAPABILITY_REQUIRED"]
       .includes(message)) {
       response.status(403).json({ error: { code: message } });
-    } else if (message === "PROVIDER_CONFIGURATION_ID_CONFLICT") {
+    } else if (["PROVIDER_CONFIGURATION_ID_CONFLICT", "PROVIDER_VERIFICATION_IN_PROGRESS", "PROVIDER_ALREADY_VERIFIED"]
+      .includes(message)) {
       response.status(409).json({ error: { code: message } });
     } else if (message.endsWith("_REQUIRED") || message.endsWith("_INVALID")) {
       response.status(400).json({ error: { code: message } });
     } else {
       response.status(503).json({ error: { code: "PROVIDER_ADMINISTRATION_UNAVAILABLE" } });
+    }
+  };
+  const handleIdentityError = (error: unknown, response: express.Response) => {
+    const message = error instanceof Error ? error.message : "";
+    if (["SERVICE_ACCOUNT_REQUIRED", "SERVICE_ACCOUNT_ADMIN_REQUIRED", "AGENT_CAPABILITY_REQUIRED", "CREDENTIAL_CAPABILITY_REQUIRED"]
+      .includes(message)) {
+      response.status(403).json({ error: { code: message } });
+    } else if (message === "AGENT_CREDENTIAL_CAPABILITY_INVALID") {
+      response.status(400).json({ error: { code: message } });
+    } else if (message === "AGENT_NOT_FOUND" || message === "CREDENTIAL_NOT_FOUND") {
+      response.status(404).json({ error: { code: message } });
+    } else if (message.endsWith("_REQUIRED") || message.endsWith("_INVALID") || message.endsWith("_DUPLICATE")) {
+      response.status(400).json({ error: { code: message } });
+    } else {
+      response.status(503).json({ error: { code: "IDENTITY_ADMINISTRATION_UNAVAILABLE" } });
     }
   };
   app.use((request, response, next) => {
@@ -348,24 +495,387 @@ export function createFuseApp(dependencies: AppDependencies) {
   if (!Number.isSafeInteger(adminRateLimit.maxPerMinute) || adminRateLimit.maxPerMinute < 1) {
     throw new Error("ADMIN_RATE_LIMIT_INVALID");
   }
+  const onboardingRateLimit = dependencies.onboardingRateLimit ?? { maxPerMinute: 5 };
+  if (!Number.isSafeInteger(onboardingRateLimit.maxPerMinute) || onboardingRateLimit.maxPerMinute < 1) {
+    throw new Error("ONBOARDING_RATE_LIMIT_INVALID");
+  }
+  let onboardingRateWindows = new Map<string, { startedAt: number; count: number }>();
+  let onboardingRateGenerationStartedAt = 0;
+  if (dependencies.customerOnboardingService) {
+    app.post("/api/v1/product/workspaces", async (request, response) => {
+      disableCaching(response);
+      const now = onboardingRateLimit.now?.() ?? Date.now();
+      if (onboardingRateGenerationStartedAt === 0 || now - onboardingRateGenerationStartedAt >= 60_000) {
+        onboardingRateGenerationStartedAt = now;
+        onboardingRateWindows = new Map();
+      }
+      const origin = request.ip || request.socket.remoteAddress || "unknown";
+      if (onboardingRateLimit.consume) {
+        const decision = await onboardingRateLimit.consume(origin, onboardingRateLimit.maxPerMinute, now);
+        if (!decision.allowed) {
+          response.set("Retry-After", String(decision.retryAfterSeconds));
+          response.status(429).json({ error: { code: "ONBOARDING_RATE_LIMIT_EXCEEDED" } });
+          return;
+        }
+      } else {
+        if (onboardingRateGenerationStartedAt === 0 || now - onboardingRateGenerationStartedAt >= 60_000) {
+          onboardingRateGenerationStartedAt = now;
+          onboardingRateWindows = new Map();
+        }
+        const window = onboardingRateWindows.get(origin) ?? { startedAt: now, count: 0 };
+        window.count += 1;
+        onboardingRateWindows.set(origin, window);
+        if (window.count > onboardingRateLimit.maxPerMinute) {
+          response.set("Retry-After", String(Math.max(1, Math.ceil((window.startedAt + 60_000 - now) / 1_000))));
+          response.status(429).json({ error: { code: "ONBOARDING_RATE_LIMIT_EXCEEDED" } });
+          return;
+        }
+      }
+      const idempotencyKey = request.header("Idempotency-Key")?.trim();
+      if (!idempotencyKey) {
+        response.status(400).json({ error: { code: "IDEMPOTENCY_KEY_REQUIRED" } });
+        return;
+      }
+      const parsed = workspaceCreateSchema.safeParse({ ...request.body, idempotencyKey });
+      if (!parsed.success) {
+        response.status(400).json({ error: { code: "INVALID_WORKSPACE_REQUEST" } });
+        return;
+      }
+      if (dependencies.betaOnboardingGuard) {
+        const inviteToken = request.header("X-Fuse-Invite")?.trim();
+        if (!inviteToken) {
+          if (!await auditOrUnavailable(response, {
+            eventType: "invite.rejected", scopeId: idempotencyKey, outcome: "denied",
+            metadata: { reason: "missing" },
+          })) return;
+          response.status(403).json({ error: { code: "BETA_INVITE_REQUIRED" } });
+          return;
+        }
+        const authorized = await dependencies.betaOnboardingGuard.authorizeInvite(inviteToken, idempotencyKey);
+        if (!authorized) {
+          if (!await auditOrUnavailable(response, {
+            eventType: "invite.rejected", scopeId: idempotencyKey, outcome: "denied",
+            metadata: { reason: "invalid_or_consumed" },
+          })) return;
+          response.status(403).json({ error: { code: "BETA_INVITE_INVALID" } });
+          return;
+        }
+        if (!await dependencies.betaOnboardingGuard.reserveCapacity(idempotencyKey)) {
+          response.status(503).json({ error: { code: "BETA_ONBOARDING_CAPACITY_EXHAUSTED" } });
+          return;
+        }
+        if (!await auditOrUnavailable(response, {
+          eventType: "invite.consumed", scopeId: idempotencyKey, outcome: "allowed", metadata: {},
+        })) return;
+      }
+      try {
+        const result = await dependencies.customerOnboardingService!.createWorkspace(parsed.data as CreateWorkspaceInput);
+        if (!await auditOrUnavailable(response, {
+          eventType: "onboarding.completed", scopeId: result.workspaceId, outcome: "completed",
+          metadata: { idempotencyKey },
+        })) return;
+        response.status(201).json({
+          workspaceId: result.workspaceId,
+          agentId: result.agentId,
+          mandateId: result.mandateId,
+          policyId: result.policyId,
+          providerConfigId: result.providerConfigId,
+          adminCredential: result.adminCredential,
+          credential: result.credential,
+          recoveryCode: result.recoveryCode,
+          next: {
+            method: "POST",
+            path: "/api/v1/product/inference",
+            headers: {
+              Authorization: "Bearer <credential.token>",
+              "Idempotency-Key": "your-unique-request-id",
+              "X-Fuse-Mandate": result.mandateId,
+            },
+          },
+        });
+      } catch (error) {
+        const code = error instanceof Error ? error.message : "WORKSPACE_CREATION_FAILED";
+        if (!await auditOrUnavailable(response, {
+          eventType: code === "WORKSPACE_ONBOARDING_ROLLBACK_FAILED" ? "onboarding.rollback_failed" : "onboarding.rolled_back",
+          scopeId: idempotencyKey,
+          outcome: code === "WORKSPACE_ONBOARDING_ROLLBACK_FAILED" ? "failed" : "rolled_back",
+          metadata: { failureCode: code.slice(0, 96) },
+        })) return;
+        const status = code.includes("REQUIRED") || code.includes("INVALID") ? 400
+          : code.includes("CONFLICT") || code.includes("IN_PROGRESS") || code.includes("CREDENTIAL_UNAVAILABLE") ? 409
+          : 503;
+        response.status(status)
+          .json({ error: { code: code.replace(/[^A-Z0-9_:-]/g, "_").slice(0, 96) } });
+      }
+    });
+
+    app.post("/api/v1/product/workspaces/:workspaceId/credential-recovery", async (request, response) => {
+      disableCaching(response);
+      const origin = request.ip || request.socket.remoteAddress || "unknown";
+      const now = onboardingRateLimit.now?.() ?? Date.now();
+      if (onboardingRateLimit.consume) {
+        const decision = await onboardingRateLimit.consume(`recovery:${origin}`, onboardingRateLimit.maxPerMinute, now);
+        if (!decision.allowed) {
+          response.set("Retry-After", String(decision.retryAfterSeconds));
+          response.status(429).json({ error: { code: "CREDENTIAL_RECOVERY_RATE_LIMIT_EXCEEDED" } });
+          return;
+        }
+      }
+      const parsed = z.object({ recoveryCode: z.string().regex(/^fuse_rc_[A-Za-z0-9_-]{16,128}$/) }).safeParse(request.body);
+      if (!parsed.success) {
+        response.status(400).json({ error: { code: "RECOVERY_CODE_INVALID" } });
+        return;
+      }
+      const idempotencyKey = request.header("Idempotency-Key")?.trim();
+      if (!idempotencyKey || !/^[A-Za-z0-9._:-]{8,128}$/.test(idempotencyKey)) {
+        response.status(400).json({ error: { code: "IDEMPOTENCY_KEY_INVALID" } });
+        return;
+      }
+      try {
+        const result = await dependencies.customerOnboardingService!.recoverWorkspaceCredential({
+          workspaceId: request.params.workspaceId,
+          recoveryCode: parsed.data.recoveryCode,
+          idempotencyKey,
+        });
+        response.status(200).json(result);
+      } catch (error) {
+        const code = error instanceof Error ? error.message : "CREDENTIAL_RECOVERY_FAILED";
+        if (code === "CREDENTIAL_RECOVERY_INVALID") {
+          response.status(401).json({ error: { code } });
+        } else if (code === "RECOVERY_CODE_INVALID" || code === "WORKSPACE_ID_INVALID" || code === "IDEMPOTENCY_KEY_INVALID") {
+          response.status(400).json({ error: { code } });
+        } else if (code === "CREDENTIAL_RECOVERY_UNAVAILABLE") {
+          response.status(503).json({ error: { code } });
+        } else {
+          response.status(503).json({ error: { code: "CREDENTIAL_RECOVERY_FAILED" } });
+        }
+      }
+    });
+  }
+
   if (dependencies.credentialAuthenticator) {
+    if (dependencies.humanSessionStore) {
+      const sessionRateLimit = dependencies.sessionRateLimit ?? dependencies.adminRateLimit;
+      if (sessionRateLimit && (!Number.isSafeInteger(sessionRateLimit.maxPerMinute) || sessionRateLimit.maxPerMinute < 1)) {
+        throw new Error("SESSION_RATE_LIMIT_INVALID");
+      }
+      let sessionRateWindows = new Map<string, { startedAt: number; count: number }>();
+      let sessionRateGenerationStartedAt = 0;
+      const enforceSessionRateLimit: RequestHandler = async (request, response, next) => {
+        const now = sessionRateLimit?.now?.() ?? Date.now();
+        const principal = response.locals.fusePrincipal as { organizationId: string; principalType: string; principalId: string };
+        const key = `${principal.organizationId}:${principal.principalType}:${principal.principalId}`;
+        if (sessionRateLimit?.consume) {
+          const decision = await sessionRateLimit.consume(key, sessionRateLimit.maxPerMinute, now);
+          if (!await auditOrUnavailable(response, {
+            eventType: "rate_limit.decided", scopeId: `session:${key}`,
+            outcome: decision.allowed ? "allowed" : "denied",
+            metadata: { retryAfterSeconds: decision.retryAfterSeconds },
+          })) return;
+          if (!decision.allowed) {
+            disableCaching(response);
+            response.set("Retry-After", String(decision.retryAfterSeconds));
+            response.status(429).json({ error: { code: "RATE_LIMIT_EXCEEDED" } });
+            return;
+          }
+          next();
+          return;
+        }
+        if (!sessionRateLimit) { next(); return; }
+        if (sessionRateGenerationStartedAt === 0 || now - sessionRateGenerationStartedAt >= 60_000) {
+          sessionRateGenerationStartedAt = now;
+          sessionRateWindows = new Map();
+        }
+        const window = sessionRateWindows.get(key) ?? { startedAt: now, count: 0 };
+        window.count += 1;
+        sessionRateWindows.set(key, window);
+        if (window.count > sessionRateLimit.maxPerMinute) {
+          disableCaching(response);
+          response.set("Retry-After", String(Math.max(1, Math.ceil((window.startedAt + 60_000 - now) / 1_000))));
+          response.status(429).json({ error: { code: "RATE_LIMIT_EXCEEDED" } });
+          return;
+        }
+        next();
+      };
+      app.post("/api/v1/session", createAuthenticationGuard(dependencies.credentialAuthenticator), enforceSessionRateLimit, async (request, response) => {
+        disableCaching(response);
+        const principal = response.locals.fusePrincipal as {
+          organizationId: string;
+          principalId: string;
+          credentialId: string;
+          principalType: "agent" | "service_account";
+          role?: "admin" | "operator" | "viewer";
+        };
+        if (principal.principalType !== "service_account" || principal.credentialId.startsWith("hs_")) {
+          response.status(403).json({ error: { code: "SERVICE_ACCOUNT_SESSION_ISSUER_REQUIRED" } });
+          return;
+        }
+        const parsed = z.object({
+          expiresAt: z.string().datetime({ offset: true }),
+        }).safeParse(request.body);
+        if (!parsed.success) {
+          response.status(400).json({ error: { code: "INVALID_SESSION_REQUEST" } });
+          return;
+        }
+        const role = principal.role === "admin" ? "owner"
+          : principal.role === "operator" ? "member" : "viewer";
+        const createdAt = new Date().toISOString();
+        if (Date.parse(parsed.data.expiresAt) - Date.parse(createdAt) > MAX_HUMAN_SESSION_MS) {
+          response.status(400).json({ error: { code: "SESSION_EXPIRY_TOO_LONG" } });
+          return;
+        }
+        try {
+          const session = createHumanSession({
+            workspaceId: principal.organizationId,
+            userId: principal.principalId,
+            sourceCredentialId: principal.credentialId,
+            sourceCredentialType: principal.principalType,
+            role,
+            createdAt,
+            expiresAt: parsed.data.expiresAt,
+          });
+          await dependencies.humanSessionStore!.put(session.record);
+          response.status(201).json({
+            token: session.token,
+            sessionId: session.record.id,
+            workspaceId: session.record.workspaceId,
+            expiresAt: session.record.expiresAt,
+          });
+        } catch {
+          response.status(503).json({ error: { code: "SESSION_UNAVAILABLE" } });
+        }
+      });
+      app.delete("/api/v1/session", async (request, response) => {
+        disableCaching(response);
+        const authorization = request.header("Authorization");
+        const token = authorization?.startsWith("Bearer ") ? authorization.slice(7).trim() : "";
+        if (!token.startsWith("fuse_hs_")) {
+          response.status(401).json({ error: { code: "HUMAN_SESSION_REQUIRED" } });
+          return;
+        }
+        const revokedAt = new Date().toISOString();
+        try {
+          if (!await dependencies.humanSessionStore!.resolve(token, revokedAt)) {
+            response.status(401).json({ error: { code: "INVALID_CREDENTIAL" } });
+            return;
+          }
+          await dependencies.humanSessionStore!.revoke(token, revokedAt);
+          response.status(204).send();
+        } catch {
+          response.status(503).json({ error: { code: "SESSION_UNAVAILABLE" } });
+        }
+      });
+      app.delete(
+        "/api/v1/admin/sessions/:sessionId",
+        createCapabilityGuard(dependencies.credentialAuthenticator, "policies:read"),
+        async (request, response) => {
+          disableCaching(response);
+          const principal = response.locals.fusePrincipal as { organizationId: string; role?: string };
+          if (principal.role !== "admin") {
+            response.status(403).json({ error: { code: "ADMIN_CAPABILITY_REQUIRED" } });
+            return;
+          }
+          const sessionId = typeof request.params.sessionId === "string" ? request.params.sessionId.trim() : "";
+          if (!sessionId) {
+            response.status(400).json({ error: { code: "SESSION_ID_REQUIRED" } });
+            return;
+          }
+          try {
+            if (!dependencies.humanSessionStore!.revokeById) {
+              response.status(503).json({ error: { code: "SESSION_REVOCATION_UNAVAILABLE" } });
+              return;
+            }
+            const revoked = await dependencies.humanSessionStore!.revokeById(sessionId, principal.organizationId, new Date().toISOString());
+            if (!revoked) {
+              response.status(404).json({ error: { code: "SESSION_NOT_FOUND" } });
+              return;
+            }
+            response.status(204).send();
+          } catch {
+            response.status(503).json({ error: { code: "SESSION_UNAVAILABLE" } });
+          }
+        },
+      );
+    }
     let adminRateWindows = new Map<string, { startedAt: number; count: number }>();
     let adminRateGenerationStartedAt = 0;
     app.use(
       "/api/v1/admin",
       createAuthenticationGuard(dependencies.credentialAuthenticator),
-      (_request, response, next) => {
+      async (_request, response, next) => {
         const now = adminRateLimit.now?.() ?? Date.now();
+        const principal = response.locals.fusePrincipal;
+        const key = `${principal.organizationId}:${principal.principalType}:${principal.principalId}`;
+        if (adminRateLimit.consume) {
+          const decision = await adminRateLimit.consume(key, adminRateLimit.maxPerMinute, now);
+          if (!await auditOrUnavailable(response, {
+            eventType: "rate_limit.decided", scopeId: `admin:${key}`,
+            outcome: decision.allowed ? "allowed" : "denied",
+            metadata: { retryAfterSeconds: decision.retryAfterSeconds },
+          })) return;
+          if (!decision.allowed) {
+            disableCaching(response);
+            response.set("Retry-After", String(decision.retryAfterSeconds));
+            response.status(429).json({ error: { code: "RATE_LIMIT_EXCEEDED" } });
+            return;
+          }
+          next();
+          return;
+        }
         if (adminRateGenerationStartedAt === 0 || now - adminRateGenerationStartedAt >= 60_000) {
           adminRateGenerationStartedAt = now;
           adminRateWindows = new Map();
         }
-        const principal = response.locals.fusePrincipal;
-        const key = `${principal.organizationId}:${principal.principalType}:${principal.principalId}`;
         const window = adminRateWindows.get(key) ?? { startedAt: now, count: 0 };
         window.count += 1;
         adminRateWindows.set(key, window);
         if (window.count > adminRateLimit.maxPerMinute) {
+          disableCaching(response);
+          response.set("Retry-After", String(Math.max(1, Math.ceil((window.startedAt + 60_000 - now) / 1_000))));
+          response.status(429).json({ error: { code: "RATE_LIMIT_EXCEEDED" } });
+          return;
+        }
+        next();
+      },
+    );
+
+    const productRateLimit = dependencies.productRateLimit ?? adminRateLimit;
+    if (!Number.isSafeInteger(productRateLimit.maxPerMinute) || productRateLimit.maxPerMinute < 1) {
+      throw new Error("PRODUCT_RATE_LIMIT_INVALID");
+    }
+    let productRateWindows = new Map<string, { startedAt: number; count: number }>();
+    let productRateGenerationStartedAt = 0;
+    app.use(
+      "/api/v1/product",
+      createAuthenticationGuard(dependencies.credentialAuthenticator),
+      async (request, response, next) => {
+        const now = productRateLimit.now?.() ?? Date.now();
+        const principal = response.locals.fusePrincipal;
+        const key = `${principal.organizationId}:${principal.principalType}:${principal.principalId}`;
+        if (productRateLimit.consume) {
+          const decision = await productRateLimit.consume(key, productRateLimit.maxPerMinute, now);
+          if (!await auditOrUnavailable(response, {
+            eventType: "rate_limit.decided", scopeId: `product:${key}`,
+            outcome: decision.allowed ? "allowed" : "denied",
+            metadata: { retryAfterSeconds: decision.retryAfterSeconds },
+          })) return;
+          if (!decision.allowed) {
+            disableCaching(response);
+            response.set("Retry-After", String(decision.retryAfterSeconds));
+            response.status(429).json({ error: { code: "RATE_LIMIT_EXCEEDED" } });
+            return;
+          }
+          next();
+          return;
+        }
+        if (productRateGenerationStartedAt === 0 || now - productRateGenerationStartedAt >= 60_000) {
+          productRateGenerationStartedAt = now;
+          productRateWindows = new Map();
+        }
+        const window = productRateWindows.get(key) ?? { startedAt: now, count: 0 };
+        window.count += 1;
+        productRateWindows.set(key, window);
+        if (window.count > productRateLimit.maxPerMinute) {
           disableCaching(response);
           response.set("Retry-After", String(Math.max(1, Math.ceil((window.startedAt + 60_000 - now) / 1_000))));
           response.status(429).json({ error: { code: "RATE_LIMIT_EXCEEDED" } });
@@ -387,9 +897,15 @@ export function createFuseApp(dependencies: AppDependencies) {
 
   app.get("/ready", async (_request, response) => {
     disableCaching(response);
+    if (!dependencies.readiness) {
+      response.status(503).json({
+        ok: false, service: "fuse", error: "READINESS_NOT_CONFIGURED",
+      });
+      return;
+    }
     try {
-      const checks = dependencies.readiness ? await dependencies.readiness() : {};
-      const ready = Object.values(checks).every(Boolean);
+      const checks = await dependencies.readiness();
+      const ready = Object.keys(checks).length > 0 && Object.values(checks).every(Boolean);
       response.status(ready ? 200 : 503).json({ ok: ready, service: "fuse", checks });
     } catch {
       response.status(503).json({ ok: false, service: "fuse", error: "DEPENDENCY_UNAVAILABLE" });
@@ -405,6 +921,20 @@ export function createFuseApp(dependencies: AppDependencies) {
   });
 
   if (dependencies.credentialAuthenticator) {
+    if (dependencies.operationalReadiness) {
+      app.get(
+        "/api/v1/admin/readiness",
+        createCapabilityGuard(dependencies.credentialAuthenticator, "policies:read"),
+        async (_request, response) => {
+          disableCaching(response);
+          try {
+            response.json(await dependencies.operationalReadiness!());
+          } catch {
+            response.status(503).json({ error: { code: "OPERATIONAL_READINESS_UNAVAILABLE" } });
+          }
+        },
+      );
+    }
     app.get(
       "/api/v1/identity",
       createCapabilityGuard(dependencies.credentialAuthenticator, "mandates:read"),
@@ -413,6 +943,58 @@ export function createFuseApp(dependencies: AppDependencies) {
         response.json(response.locals.fusePrincipal);
       },
     );
+    app.get(
+      "/api/v1/product/readiness",
+      createCapabilityGuard(dependencies.credentialAuthenticator, "mandates:read"),
+      async (_request, response) => {
+        disableCaching(response);
+        try {
+          const principal = response.locals.fusePrincipal as { organizationId: string };
+          const input = dependencies.productReadiness
+            ? await dependencies.productReadiness(principal)
+            : {
+                paymentMode: dependencies.paymentMode ?? "control",
+                database: false,
+                providerConfiguration: false,
+                policyConfiguration: false,
+                agentCredential: false,
+                mandate: false,
+                signerConfiguration: false,
+                walletChain: false,
+                gatewayEnvironment: false,
+                sandbox: true,
+              };
+          response.json(buildProductReadiness(principal, input));
+        } catch {
+          response.status(503).json({ error: { code: "READINESS_UNAVAILABLE" } });
+        }
+      },
+    );
+  }
+
+  if (dependencies.credentialAuthenticator && dependencies.agentIdentityService) {
+    app.post("/api/v1/product/agents", createCapabilityGuard(dependencies.credentialAuthenticator, "agents:write"), async (request, response) => {
+      disableCaching(response);
+      const requestId = request.header("X-Request-Id")?.trim();
+      const parsed = agentRegistrationSchema.safeParse(request.body);
+      if (!requestId) { response.status(400).json({ error: { code: "REQUEST_ID_REQUIRED" } }); return; }
+      if (!parsed.success) { response.status(400).json({ error: { code: "INVALID_AGENT_REQUEST" } }); return; }
+      try {
+        await dependencies.agentIdentityService!.registerAgent(response.locals.fusePrincipal, { ...parsed.data, requestId } as ProductRegisterAgentInput);
+        response.status(201).json({ agentId: parsed.data.agentId });
+      } catch (error) { handleIdentityError(error, response); }
+    });
+    app.post("/api/v1/product/agent-credentials", createCapabilityGuard(dependencies.credentialAuthenticator, "credentials:issue"), async (request, response) => {
+      disableCaching(response);
+      const requestId = request.header("X-Request-Id")?.trim();
+      const parsed = agentCredentialIssueSchema.safeParse(request.body);
+      if (!requestId) { response.status(400).json({ error: { code: "REQUEST_ID_REQUIRED" } }); return; }
+      if (!parsed.success) { response.status(400).json({ error: { code: "INVALID_AGENT_CREDENTIAL_REQUEST" } }); return; }
+      try {
+        const issued = await dependencies.agentIdentityService!.issueCredential(response.locals.fusePrincipal, { ...parsed.data, requestId } as ProductIssueCredentialInput);
+        response.status(201).json(issued);
+      } catch (error) { handleIdentityError(error, response); }
+    });
   }
 
   if (dependencies.credentialAuthenticator && dependencies.credentialAdministration) {
@@ -639,6 +1221,30 @@ export function createFuseApp(dependencies: AppDependencies) {
         }
       },
     );
+    if (dependencies.providerAdministration.retry) {
+      app.post(
+        "/api/v1/admin/providers/:configId/retry",
+        createCapabilityGuard(dependencies.credentialAuthenticator, "providers:write"),
+        async (request, response) => {
+          disableCaching(response);
+          const requestId = request.header("X-Request-Id")?.trim();
+          const configIdParam = request.params["configId"];
+          const configId = typeof configIdParam === "string" ? configIdParam : "";
+          if (!requestId) {
+            response.status(400).json({ error: { code: "REQUEST_ID_REQUIRED" } });
+            return;
+          }
+          try {
+            const provider = await dependencies.providerAdministration!.retry!(
+              response.locals.fusePrincipal, configId, requestId,
+            );
+            response.status(200).json({ provider });
+          } catch (error) {
+            handleProviderError(error, response);
+          }
+        },
+      );
+    }
     app.get(
       "/api/v1/admin/providers",
       createCapabilityGuard(dependencies.credentialAuthenticator, "providers:read"),
@@ -654,6 +1260,130 @@ export function createFuseApp(dependencies: AppDependencies) {
         }
       },
     );
+  }
+
+  if (dependencies.credentialAuthenticator && dependencies.providerConnectionService) {
+    app.post(
+      "/api/v1/product/provider-connections",
+      createCapabilityGuard(dependencies.credentialAuthenticator, "providers:write"),
+      async (request, response) => {
+        disableCaching(response);
+        const requestId = request.header("X-Request-Id")?.trim();
+        if (!requestId) {
+          response.status(400).json({ error: { code: "REQUEST_ID_REQUIRED" } });
+          return;
+        }
+        const parsed = providerConfigurationSchema.safeParse(request.body);
+        if (!parsed.success) {
+          response.status(400).json({ error: { code: "INVALID_PROVIDER_CONFIGURATION" } });
+          return;
+        }
+        try {
+          const provider = await dependencies.providerConnectionService!.connect(
+            response.locals.fusePrincipal,
+            { ...parsed.data, requestId },
+          );
+          response.status(201).json({ provider });
+        } catch (error) {
+          handleProviderError(error, response);
+        }
+      },
+    );
+    app.get(
+      "/api/v1/product/provider-connections",
+      createCapabilityGuard(dependencies.credentialAuthenticator, "providers:read"),
+      async (_request, response) => {
+        disableCaching(response);
+        try {
+          const providers = await dependencies.providerConnectionService!.list(
+            response.locals.fusePrincipal,
+          );
+          response.json({ providers });
+        } catch (error) {
+          handleProviderError(error, response);
+        }
+      },
+    );
+  }
+
+  if (dependencies.credentialAuthenticator && dependencies.policyPublishingService) {
+    app.post("/api/v1/product/policies", createCapabilityGuard(dependencies.credentialAuthenticator, "policies:write"), async (request, response) => {
+      disableCaching(response);
+      const requestId = request.header("X-Request-Id")?.trim();
+      const parsed = policyPublishSchema.safeParse(request.body);
+      if (!requestId) { response.status(400).json({ error: { code: "REQUEST_ID_REQUIRED" } }); return; }
+      if (!parsed.success) { response.status(400).json({ error: { code: "INVALID_POLICY_REQUEST" } }); return; }
+      if ((parsed.data.workloadClasses?.length ?? 0) > 0 && !dependencies.workloadShadowEnabled) {
+        response.status(409).json({ error: { code: "WORKLOAD_SHADOW_ROLLOUT_DISABLED" } }); return;
+      }
+      try {
+        await dependencies.policyPublishingService!.publish(response.locals.fusePrincipal, parsed.data as unknown as ProductPolicyInput);
+        response.status(201).json({ policyId: parsed.data.policyId, version: parsed.data.version });
+      } catch (error) { handlePolicyError(error, response); }
+    });
+  }
+
+  if (dependencies.credentialAuthenticator && dependencies.mandateManagementService) {
+    const mandateProductGuard = createCapabilityGuard(
+      dependencies.credentialAuthenticator,
+      "mandates:admin",
+    );
+    app.post("/api/v1/product/mandates", mandateProductGuard, async (request, response) => {
+      disableCaching(response);
+      const requestId = request.header("X-Request-Id")?.trim();
+      const parsed = mandateCreateSchema.safeParse(request.body);
+      if (!requestId) { response.status(400).json({ error: { code: "REQUEST_ID_REQUIRED" } }); return; }
+      if (!parsed.success) { response.status(400).json({ error: { code: "INVALID_MANDATE_REQUEST" } }); return; }
+      try {
+        await dependencies.mandateManagementService!.createMandate(response.locals.fusePrincipal, {
+          ...parsed.data, maximumSpendAtomic: parsed.data.maximumSpendAtomic, requestId,
+        } as ProductMandateInput);
+        response.status(201).json({ mandateId: parsed.data.mandateId });
+      } catch (error) { handlePolicyError(error, response); }
+    });
+    app.post("/api/v1/product/mandates/:mandateId/agents", mandateProductGuard, async (request, response) => {
+      disableCaching(response);
+      const requestId = request.header("X-Request-Id")?.trim();
+      const mandateId = typeof request.params["mandateId"] === "string" ? request.params["mandateId"] : "";
+      const parsed = mandateAssignmentSchema.safeParse(request.body);
+      if (!requestId) { response.status(400).json({ error: { code: "REQUEST_ID_REQUIRED" } }); return; }
+      if (!mandateId || !parsed.success) { response.status(400).json({ error: { code: "INVALID_MANDATE_ASSIGNMENT" } }); return; }
+      try {
+        await dependencies.mandateManagementService!.assignAgent(response.locals.fusePrincipal, {
+          mandateId, agentId: parsed.data.agentId, requestId,
+        });
+        response.status(204).send();
+      } catch (error) { handlePolicyError(error, response); }
+    });
+    app.post("/api/v1/product/mandates/:mandateId/branches", mandateProductGuard, async (request, response) => {
+      disableCaching(response);
+      const requestId = request.header("X-Request-Id")?.trim();
+      const mandateId = typeof request.params["mandateId"] === "string" ? request.params["mandateId"] : "";
+      const parsed = mandateBranchSchema.safeParse(request.body);
+      if (!requestId) { response.status(400).json({ error: { code: "REQUEST_ID_REQUIRED" } }); return; }
+      if (!mandateId || !parsed.success) { response.status(400).json({ error: { code: "INVALID_MANDATE_BRANCH" } }); return; }
+      if (!dependencies.workloadShadowEnabled) { response.status(409).json({ error: { code: "WORKLOAD_SHADOW_ROLLOUT_DISABLED" } }); return; }
+      try {
+        const branch = await dependencies.mandateManagementService!.createBranch(response.locals.fusePrincipal, {
+          ...parsed.data, mandateId, maximumSpendAtomic: parsed.data.maximumSpendAtomic, requestId,
+        } as ProductBranchInput);
+        response.status(201).json({ branch: { ...branch, maximumSpendAtomic: branch.maximumSpendAtomic.toString() } });
+      } catch (error) { handlePolicyError(error, response); }
+    });
+    app.post("/api/v1/product/mandates/:mandateId/transitions", mandateProductGuard, async (request, response) => {
+      disableCaching(response);
+      const requestId = request.header("X-Request-Id")?.trim();
+      const mandateId = typeof request.params["mandateId"] === "string" ? request.params["mandateId"] : "";
+      const parsed = mandateTransitionSchema.safeParse(request.body);
+      if (!requestId) { response.status(400).json({ error: { code: "REQUEST_ID_REQUIRED" } }); return; }
+      if (!mandateId || !parsed.success) { response.status(400).json({ error: { code: "INVALID_MANDATE_TRANSITION" } }); return; }
+      try {
+        await dependencies.mandateManagementService!.transitionMandate(response.locals.fusePrincipal, {
+          mandateId, to: parsed.data.to, requestId,
+        });
+        response.status(204).send();
+      } catch (error) { handlePolicyError(error, response); }
+    });
   }
 
   if (dependencies.credentialAuthenticator && dependencies.policyAdministration) {
@@ -1105,6 +1835,151 @@ export function createFuseApp(dependencies: AppDependencies) {
     }
   });
 
+  if (dependencies.credentialAuthenticator && dependencies.sandboxRunStore) {
+    app.get("/api/v1/product/sandbox/runs/:runId", createCapabilityGuard(dependencies.credentialAuthenticator, "sandbox:run"), async (request, response) => {
+      disableCaching(response);
+      const rawRunId = request.params["runId"];
+      const runId = (typeof rawRunId === "string" ? rawRunId : "").trim();
+      if (!runId || runId.length > 128 || !/^sandbox_[a-f0-9]{24}$/.test(runId)) {
+        response.status(400).json({ error: { code: "INVALID_SANDBOX_REFERENCE" } });
+        return;
+      }
+      try {
+        const run = await dependencies.sandboxRunStore!.get(response.locals.fusePrincipal.organizationId, runId);
+        if (!run) { response.status(404).json({ error: { code: "SANDBOX_RUN_NOT_FOUND" } }); return; }
+        response.json(run);
+      } catch {
+        response.status(503).json({ error: { code: "SANDBOX_UNAVAILABLE" } });
+      }
+    });
+  }
+
+  if (dependencies.credentialAuthenticator && dependencies.sandboxRunService) {
+    app.post("/api/v1/product/sandbox/runs", createCapabilityGuard(dependencies.credentialAuthenticator, "sandbox:run"), async (request, response) => {
+      disableCaching(response);
+      const body = z.object({ seed: z.string().trim().min(1).max(128).optional() }).strict().safeParse(request.body ?? {});
+      if (!body.success) { response.status(400).json({ error: { code: "INVALID_SANDBOX_REQUEST" } }); return; }
+      try {
+        const run = dependencies.sandboxRunStore
+          ? await dependencies.sandboxRunService!.runDurable(
+            dependencies.sandboxRunStore,
+            response.locals.fusePrincipal.organizationId,
+            body.data.seed,
+          )
+          : dependencies.sandboxRunService!.run(response.locals.fusePrincipal.organizationId, body.data.seed);
+        response.status(201).json(run);
+      } catch (error) {
+        const code = error instanceof Error ? error.message : "";
+        if (["WORKSPACE_REQUIRED", "INVALID_SANDBOX_REFERENCE"].includes(code)) { response.status(400).json({ error: { code } }); return; }
+        response.status(503).json({ error: { code: "SANDBOX_UNAVAILABLE" } });
+      }
+    });
+  }
+
+  if (dependencies.credentialAuthenticator && dependencies.productReceiptService) {
+    app.get("/api/v1/product/receipts/:requestId", createCapabilityGuard(dependencies.credentialAuthenticator, "receipts:read"), async (request, response) => {
+      disableCaching(response);
+      const rawRequestId = request.params["requestId"];
+      const requestId = (typeof rawRequestId === "string" ? rawRequestId : "").trim();
+      const mandateId = request.header("X-Fuse-Mandate")?.trim() ?? "";
+      if (!requestId || requestId.length > 128) { response.status(400).json({ error: { code: "INVALID_RECEIPT_REFERENCE" } }); return; }
+      if (!mandateId || mandateId.length > 128) { response.status(400).json({ error: { code: "MISSING_MANDATE" } }); return; }
+      try {
+        const receipt = await dependencies.productReceiptService!.get(response.locals.fusePrincipal, mandateId, requestId);
+        response.json({ receipt });
+      } catch (error) {
+        const code = error instanceof Error ? error.message : "";
+        if (code === "RECEIPT_NOT_FOUND") { response.status(404).json({ error: { code } }); return; }
+        if (code === "MANDATE_REQUIRED" || code === "REQUEST_ID_REQUIRED") { response.status(400).json({ error: { code } }); return; }
+        response.status(503).json({ error: { code: "RECEIPT_QUERY_UNAVAILABLE" } });
+      }
+    });
+
+    app.get("/api/v1/product/mandates/:mandateId/receipts", createCapabilityGuard(dependencies.credentialAuthenticator, "receipts:read"), async (request, response) => {
+      disableCaching(response);
+      const rawMandateId = request.params["mandateId"];
+      const mandateId = (typeof rawMandateId === "string" ? rawMandateId : "").trim();
+      if (!mandateId || mandateId.length > 128) { response.status(400).json({ error: { code: "INVALID_MANDATE_REFERENCE" } }); return; }
+      try {
+        const rawLimit = request.query.limit;
+        const rawCursor = request.query.cursor;
+        const limit = rawLimit === undefined ? undefined : Number(rawLimit);
+        const cursor = typeof rawCursor === "string" ? rawCursor : undefined;
+        const page = await dependencies.productReceiptService!.listPage(response.locals.fusePrincipal, mandateId, { limit, cursor });
+        response.json(page);
+      } catch (error) {
+        if (error instanceof Error && ["MANDATE_REQUIRED", "INVALID_RECEIPT_PAGE_SIZE", "INVALID_RECEIPT_CURSOR"].includes(error.message)) { response.status(400).json({ error: { code: error.message } }); return; }
+        response.status(503).json({ error: { code: "RECEIPT_QUERY_UNAVAILABLE" } });
+      }
+    });
+  }
+
+  if (dependencies.productInferenceService && dependencies.credentialAuthenticator) {
+    app.post("/api/v1/product/inference", createCapabilityGuard(dependencies.credentialAuthenticator, "inference:invoke"), async (request, response) => {
+      disableCaching(response);
+      try {
+        const principal = response.locals.fusePrincipal;
+        const requestId = request.header("Idempotency-Key")?.trim() || request.header("X-Request-Id")?.trim();
+        const mandateId = request.header("X-Fuse-Mandate")?.trim();
+        if (!requestId) { response.status(400).json({ error: { code: "MISSING_IDEMPOTENCY_KEY" } }); return; }
+        if (!mandateId) { response.status(400).json({ error: { code: "MISSING_MANDATE" } }); return; }
+        const parsed = completionSchema.safeParse(request.body);
+        if (!parsed.success) { response.status(400).json({ error: { code: "INVALID_COMPLETION_REQUEST" } }); return; }
+        const branchId = request.header("X-Fuse-Branch")?.trim();
+        const workloadClass = parsed.data.workload_class;
+        if (Boolean(branchId) !== Boolean(workloadClass)) { response.status(400).json({ error: { code: "INCOMPLETE_WORKLOAD_SCOPE" } }); return; }
+        if (branchId && workloadClass && !dependencies.workloadShadowEnabled) { response.status(409).json({ error: { code: "WORKLOAD_SHADOW_ROLLOUT_DISABLED" } }); return; }
+        const inputTokens = dependencies.estimateInputTokens(parsed.data.messages as Array<{ role: string; content: string }>);
+        const productInferenceService = dependencies.productInferenceService!;
+        if (typeof productInferenceService.supportsPreview === "function" && productInferenceService.supportsPreview()) {
+          const preview = await productInferenceService.preview(principal, {
+            requestId, mandateId, requestedModel: parsed.data.model,
+            inputTokens, maxOutputTokens: parsed.data.max_tokens, messages: parsed.data.messages,
+            ...(branchId && workloadClass ? { branchId, workloadClass } : {}),
+          });
+          if (preview.status === "denied") {
+            response.status(403).json({ error: { code: "POLICY_DENIED", decisionId: preview.decision.id, reasonCodes: preview.decision.result.reasonCodes } });
+            return;
+          }
+        }
+        if (paymentRequired) {
+          const paymentAccepted = await requirePayment(
+            request,
+            response,
+            dependencies.paymentGuard!(maximumQuoteUsdc(inputTokens, parsed.data.max_tokens, dependencies.price)),
+          );
+          if (!paymentAccepted) return;
+        }
+        const execution = await dependencies.productInferenceService!.execute(principal, {
+          requestId, mandateId, requestedModel: parsed.data.model,
+          inputTokens,
+          maxOutputTokens: parsed.data.max_tokens, messages: parsed.data.messages,
+          ...(branchId && workloadClass ? { branchId, workloadClass } : {}),
+        });
+        if (execution.status === "denied") { response.status(403).json({ error: { code: "POLICY_DENIED", decisionId: execution.decision.id, reasonCodes: execution.decision.result.reasonCodes } }); return; }
+        if (execution.status === "in_progress") { response.status(409).json({ error: { code: "REQUEST_IN_PROGRESS" } }); return; }
+        if (execution.status === "failed") { response.status(409).json({ error: { code: "REQUEST_REQUIRES_REVIEW" } }); return; }
+        if (execution.status !== "completed") { response.status(503).json({ error: { code: "INFERENCE_EXECUTION_UNAVAILABLE" } }); return; }
+        const complete = () => response.json({ status: "completed", response: execution.response, decisionId: execution.decision.id,
+          reservedCostAtomic: execution.reservedCostAtomic.toString(), actualCostAtomic: execution.actualCostAtomic.toString() });
+        const payment = (request as unknown as { payment?: unknown }).payment;
+        if (dependencies.paymentEvidenceStore && payment !== undefined) {
+          await dependencies.paymentEvidenceStore.record({
+            requestId, organizationId: principal.organizationId,
+            actualCostAtomic: execution.actualCostAtomic.toString(), payment,
+            recordedAt: new Date().toISOString(),
+          });
+        }
+        complete();
+      } catch (error) {
+        logInferenceFailure("/api/v1/product/inference", request.header("Idempotency-Key")?.trim(), error);
+        if (error instanceof Error && error.message === "AGENT_CREDENTIAL_REQUIRED") { response.status(403).json({ error: { code: error.message } }); return; }
+        if (error instanceof Error && error.message === "IDEMPOTENCY_CONFLICT") { response.status(409).json({ error: { code: error.message } }); return; }
+        response.status(503).json({ error: { code: "INFERENCE_EXECUTION_UNAVAILABLE" } });
+      }
+    });
+  }
+
   if (dependencies.inferenceExecution && dependencies.credentialAuthenticator) {
     app.post(
       "/v1/chat/completions",
@@ -1194,6 +2069,22 @@ export function createFuseApp(dependencies: AppDependencies) {
             messages: parsed.data.messages,
             ...(reliabilityContext ? { reliabilityContext } : {}),
           };
+          if (!replayOperationId && paymentRequired) {
+            const inferenceExecution = dependencies.inferenceExecution!;
+            if (inferenceExecution.preview) {
+              const preview = await inferenceExecution.preview(executionInput);
+              if (preview.status === "denied") {
+                response.status(403).json({ error: { code: "POLICY_DENIED", decisionId: preview.decision.id, reasonCodes: preview.decision.result.reasonCodes } });
+                return;
+              }
+            }
+            const paymentAccepted = await requirePayment(
+              request,
+              response,
+              dependencies.paymentGuard!(maximumQuoteUsdc(executionInput.inputTokens, executionInput.maxOutputTokens, dependencies.price)),
+            );
+            if (!paymentAccepted) return;
+          }
           let execution: AdmissionResult;
           if (replayOperationId) {
             if (dependencies.sealedReplayExecution) {
@@ -1368,54 +2259,56 @@ export function createFuseApp(dependencies: AppDependencies) {
         return;
       }
 
+      const inputTokens = dependencies.estimateInputTokens(parsed.data.messages as Array<{ role: string; content: string }>);
+      if (paymentRequired) {
+        const paymentAccepted = await requirePayment(
+          request,
+          response,
+          dependencies.paymentGuard!(maximumQuoteUsdc(inputTokens, parsed.data.max_tokens, dependencies.price)),
+        );
+        if (!paymentAccepted) return;
+      }
       const quote = await mutateService((service) => service.prepareCompletion({
         requestId,
         childId,
         model: parsed.data.model,
-        inputTokens: dependencies.estimateInputTokens(parsed.data.messages),
+        inputTokens,
         maxOutputTokens: parsed.data.max_tokens,
         messages: parsed.data.messages,
       }));
-      const priceUsdc = microsToUsdc(quote.exactCostMicros);
-      const guard = dependencies.paymentGuard(priceUsdc);
-
-      guard(request, response, async () => {
-        try {
-          const gatewayPayment = (request as express.Request & {
-            payment?: { transaction?: string; network?: string; payer?: string };
-          }).payment;
-          const payment = response.locals.fusePayment ?? {
-            authorizationHash: gatewayPayment?.transaction ?? "gateway-accepted",
-            gatewayStatus: "accepted",
-          };
-          const completed = await mutateService(async (service) =>
-            service.releasePaidCompletion(requestId, payment));
-          response.json({
-            id: completed.response.id,
-            object: "chat.completion",
-            model: parsed.data.model,
-            choices: [{
-              index: 0,
-              finish_reason: "stop",
-              message: { role: "assistant", content: completed.response.content },
-            }],
-            usage: {
-              prompt_tokens: completed.response.usage.inputTokens,
-              completion_tokens: completed.response.usage.outputTokens,
-              total_tokens: completed.response.usage.inputTokens + completed.response.usage.outputTokens,
-            },
-            fuse: { receipt: completed.receipt },
-          });
-        } catch (error) {
-          next(error);
-        }
+      if (quote.status !== "payment_required") throw new Error("PAYMENT_QUOTE_INVALID");
+      const gatewayPayment = (request as express.Request & {
+        payment?: { transaction?: string; network?: string; payer?: string };
+      }).payment;
+      const payment = response.locals.fusePayment ?? {
+        authorizationHash: gatewayPayment?.transaction ?? "gateway-accepted",
+        gatewayStatus: "accepted",
+      };
+      const completed = await mutateService(async (service) =>
+        service.releasePaidCompletion(requestId, payment));
+      response.json({
+        id: completed.response.id,
+        object: "chat.completion",
+        model: parsed.data.model,
+        choices: [{
+          index: 0,
+          finish_reason: "stop",
+          message: { role: "assistant", content: completed.response.content },
+        }],
+        usage: {
+          prompt_tokens: completed.response.usage.inputTokens,
+          completion_tokens: completed.response.usage.outputTokens,
+          total_tokens: completed.response.usage.inputTokens + completed.response.usage.outputTokens,
+        },
+        fuse: { receipt: completed.receipt },
       });
     } catch (error) {
       next(error);
     }
   });
 
-  app.use((error: unknown, _request: express.Request, response: express.Response, _next: express.NextFunction) => {
+  app.use((error: unknown, request: express.Request, response: express.Response, _next: express.NextFunction) => {
+    logInferenceFailure("/v1/chat/completions", request.header("Idempotency-Key")?.trim(), error);
     const message = error instanceof Error ? error.message : "";
     const budgetError = message.endsWith("BUDGET_EXCEEDED") || message === "BRANCH_TRIPPED";
     if (budgetError) {

@@ -55,7 +55,8 @@ export class OpenRouterProvider implements InferenceProvider {
     const inputTokens = value.usage?.prompt_tokens;
     const outputTokens = value.usage?.completion_tokens;
     if (!generationId || typeof value.model !== "string" || value.model !== this.config.model || typeof content !== "string"
-      || choice?.finish_reason !== "stop" || !isValidTokenCount(inputTokens) || !isValidTokenCount(outputTokens)) {
+      || !["stop", "length"].includes(choice?.finish_reason ?? "")
+      || !isValidTokenCount(inputTokens) || !isValidTokenCount(outputTokens)) {
       throw new OpenRouterTransportError("OPENROUTER_INVALID_RESPONSE", "response_validation", true, response.status, generationId);
     }
     const providerCost = value.usage?.cost;

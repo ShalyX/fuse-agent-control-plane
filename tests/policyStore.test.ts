@@ -1,9 +1,11 @@
-import { DataType, newDb } from "pg-mem";
+import { DataType } from "pg-mem";
+import { newAdvisoryMemoryDb } from "./helpers/pgMemAdvisory.js";
 import type { Pool } from "pg";
 import { describe, expect, it } from "vitest";
 import { IdentityStore } from "../src/persistence/identityStore.js";
 import { PolicyStore } from "../src/persistence/policyStore.js";
 import type { PolicyVersion } from "../src/domain/policy.js";
+import { createApiCredential } from "../src/identity/apiCredentials.js";
 
 const context = {
   actorId: "service_account:admin-1",
@@ -31,7 +33,7 @@ const version = (overrides: Partial<PolicyVersion> = {}): PolicyVersion => ({
   ...overrides,
 });
 
-function policyMemoryDb(){const db=newDb({noAstCoverageCheck:true});db.public.registerFunction({name:"hashtextextended",args:[DataType.text,DataType.integer],returns:DataType.bigint,implementation:()=>1});db.public.registerFunction({name:"pg_advisory_xact_lock_shared",args:[DataType.bigint],returns:DataType.integer,implementation:()=>0});return db;}
+function policyMemoryDb(){return newAdvisoryMemoryDb({noAstCoverageCheck:true});}
 
 async function setup() {
   const db = policyMemoryDb();
@@ -47,6 +49,176 @@ async function setup() {
 }
 
 describe("PolicyStore", () => {
+  it("requires an executable active mandate path for readiness", async () => {
+    const { pool, identity, policies } = await setup();
+    await policies.publishPolicy(version({ workloadClasses: [{
+      id: "lookup", maxCostPerCallAtomic: 2_000n, maxInvocationsPerBranch: 2,
+      aggregateBudgetAtomic: 3_000n, minimumInputTokens: 10,
+      shadow: {
+        classPriorWindowSpendAtomic: 1_000n, windowSeconds: 900,
+        targetMinimumObservations: 3, siblingMinimumForScoring: 2,
+        siblingMinimumForIntervention: 3, confidenceConstant: 5,
+        divergenceThresholdBps: 30_000,
+      },
+    }] }), context);
+    await expect(policies.hasUsablePolicy(
+      "org-1", "anthropic", "claude-sonnet-4-6",
+    )).resolves.toBe(true);
+    await expect(policies.hasUsablePolicy(
+      "org-other", "anthropic", "claude-sonnet-4-6",
+    )).resolves.toBe(false);
+    await expect(policies.hasUsablePolicy(
+      "org-1", "anthropic", "model-not-allowed",
+    )).resolves.toBe(false);
+    const credential = createApiCredential({
+      id: "credential-1", organizationId: "org-1", agentId: "agent-1",
+      name: "Execution credential", capabilities: ["inference:invoke"],
+      createdAt: context.occurredAt, expiresAt: "2026-08-13T20:00:00.000Z",
+    }, () => Buffer.alloc(32, 27));
+    await identity.issueCredential(credential.record, context);
+    await policies.createMandate({
+      id: "mandate-ready", organizationId: "org-1", name: "Ready mandate",
+      assetId: "usd-micros", maximumSpendAtomic: 10_000n, state: "draft",
+      policyId: "policy-1", policyVersion: 1,
+      expiresAt: "2026-08-13T20:00:00.000Z", ...context,
+    });
+    await policies.assignAgent({
+      organizationId: "org-1", mandateId: "mandate-ready", agentId: "agent-1", ...context,
+    });
+    await policies.createBranch({
+      id: "branch-ready", organizationId: "org-1", mandateId: "mandate-ready",
+      parentBranchId: null, agentId: "agent-1", allowedWorkloadClasses: ["lookup"],
+      maximumSpendAtomic: 5_000n, expiresAt: "2026-08-13T20:00:00.000Z", ...context,
+    });
+
+    expect(await policies.hasExecutableMandate("org-1", "2026-07-13T20:01:00.000Z"))
+      .toBe(false);
+    await policies.transitionMandateState("org-1", "mandate-ready", "active", context);
+    expect(await policies.hasExecutableMandate("org-1", "2026-07-13T20:01:00.000Z"))
+      .toBe(true);
+    expect(await policies.hasExecutableMandate("org-other", "2026-07-13T20:01:00.000Z"))
+      .toBe(false);
+    expect(await policies.hasExecutableMandate(
+      "org-1", "2026-07-13T20:01:00.000Z", "anthropic", "model-not-allowed",
+    )).toBe(false);
+    await pool.query(
+      `INSERT INTO policy_decisions
+       (id, organization_id, request_id, mandate_id, agent_id, policy_id, policy_version,
+        outcome, would_outcome, enforced, reason_codes, input_snapshot, decided_at)
+       VALUES ('decision-branch-exhausted', 'org-1', 'request-branch-exhausted',
+        'mandate-ready', 'agent-1', 'policy-1', 1, 'ALLOW', 'ALLOW', true,
+        '[]'::jsonb, '{}'::jsonb, $1)`,
+      ["2026-07-13T20:01:00.000Z"],
+    );
+    await pool.query(
+      `INSERT INTO inference_executions
+       (organization_id, request_id, mandate_id, agent_id, decision_id, provider, model,
+        request_fingerprint, status, reserved_cost_atomic, actual_cost_atomic, input_tokens,
+        max_output_tokens, branch_id, workload_class, created_at, updated_at)
+       VALUES ('org-1', 'request-branch-exhausted', 'mandate-ready', 'agent-1',
+        'decision-branch-exhausted', 'anthropic', 'claude-sonnet-4-6',
+        'fingerprint-branch-exhausted', 'completed', 3000, 3000, 10, 10,
+        'branch-ready', 'lookup', $1, $1)`,
+      ["2026-07-13T20:01:00.000Z"],
+    );
+    expect(await policies.hasExecutableMandate("org-1", "2026-07-13T20:01:00.000Z"))
+      .toBe(false);
+    await pool.query("DELETE FROM inference_executions WHERE organization_id = 'org-1' AND request_id = 'request-branch-exhausted'");
+    await pool.query("DELETE FROM policy_decisions WHERE organization_id = 'org-1' AND id = 'decision-branch-exhausted'");
+    await pool.query(
+      `INSERT INTO policy_decisions
+       (id, organization_id, request_id, mandate_id, agent_id, policy_id, policy_version,
+        outcome, would_outcome, enforced, reason_codes, input_snapshot, decided_at)
+       VALUES
+        ('decision-invocation-1', 'org-1', 'request-invocation-1', 'mandate-ready',
+         'agent-1', 'policy-1', 1, 'ALLOW', 'ALLOW', true, '[]'::jsonb, '{}'::jsonb, $1),
+        ('decision-invocation-2', 'org-1', 'request-invocation-2', 'mandate-ready',
+         'agent-1', 'policy-1', 1, 'ALLOW', 'ALLOW', true, '[]'::jsonb, '{}'::jsonb, $1)`,
+      ["2026-07-13T20:01:00.000Z"],
+    );
+    await pool.query(
+      `INSERT INTO inference_executions
+       (organization_id, request_id, mandate_id, agent_id, decision_id, provider, model,
+        request_fingerprint, status, reserved_cost_atomic, actual_cost_atomic, input_tokens,
+        max_output_tokens, branch_id, workload_class, created_at, updated_at)
+       VALUES
+        ('org-1', 'request-invocation-1', 'mandate-ready', 'agent-1',
+         'decision-invocation-1', 'anthropic', 'claude-sonnet-4-6', 'fingerprint-invocation-1',
+         'completed', 1, 1, 10, 10, 'branch-ready', 'lookup', $1, $1),
+        ('org-1', 'request-invocation-2', 'mandate-ready', 'agent-1',
+         'decision-invocation-2', 'anthropic', 'claude-sonnet-4-6', 'fingerprint-invocation-2',
+         'completed', 1, 1, 10, 10, 'branch-ready', 'lookup', $1, $1)`,
+      ["2026-07-13T20:01:00.000Z"],
+    );
+    expect(await policies.hasExecutableMandate("org-1", "2026-07-13T20:01:00.000Z"))
+      .toBe(false);
+    await pool.query("DELETE FROM inference_executions WHERE organization_id = 'org-1' AND request_id IN ('request-invocation-1', 'request-invocation-2')");
+    await pool.query("DELETE FROM policy_decisions WHERE organization_id = 'org-1' AND id IN ('decision-invocation-1', 'decision-invocation-2')");
+    await pool.query(
+      "UPDATE policy_versions SET max_per_call_atomic = 0 WHERE organization_id = 'org-1' AND policy_id = 'policy-1' AND version = 1",
+    );
+    await expect(policies.hasUsablePolicy(
+      "org-1", "anthropic", "claude-sonnet-4-6",
+    )).resolves.toBe(false);
+    expect(await policies.hasExecutableMandate("org-1", "2026-07-13T20:01:00.000Z"))
+      .toBe(false);
+    await pool.query(
+      "UPDATE policy_versions SET max_per_call_atomic = 10000 WHERE organization_id = 'org-1' AND policy_id = 'policy-1' AND version = 1",
+    );
+    expect(await policies.hasExecutableMandate("org-1", "2026-08-13T20:00:00.000Z"))
+      .toBe(false);
+    await policies.publishPolicy(version({ version: 2 }), {
+      ...context, causationId: "request:unscoped-policy",
+    });
+    await policies.createMandate({
+      id: "mandate-unscoped", organizationId: "org-1", name: "Unscoped mandate",
+      assetId: "usd-micros", maximumSpendAtomic: 10_000n, state: "draft",
+      policyId: "policy-1", policyVersion: 2, expiresAt: null,
+      ...context, causationId: "request:unscoped-mandate",
+    });
+    await policies.assignAgent({
+      organizationId: "org-1", mandateId: "mandate-unscoped", agentId: "agent-1",
+      ...context, causationId: "request:unscoped-assignment",
+    });
+    await policies.transitionMandateState("org-1", "mandate-unscoped", "active", {
+      ...context, causationId: "request:unscoped-activation",
+    });
+    await policies.transitionMandateState("org-1", "mandate-ready", "paused", {
+      ...context, causationId: "request:pause-workload",
+    });
+    expect(await policies.hasExecutableMandate("org-1", "2026-07-13T20:01:00.000Z"))
+      .toBe(true);
+    await pool.query(
+      `INSERT INTO policy_decisions
+       (id, organization_id, request_id, mandate_id, agent_id, policy_id, policy_version,
+        outcome, would_outcome, enforced, reason_codes, input_snapshot, decided_at)
+       VALUES ('decision-exhausted', 'org-1', 'request-exhausted', 'mandate-unscoped',
+        'agent-1', 'policy-1', 2, 'ALLOW', 'ALLOW', true, '[]'::jsonb, '{}'::jsonb, $1)`,
+      ["2026-07-13T20:01:00.000Z"],
+    );
+    await pool.query(
+      `INSERT INTO inference_executions
+       (organization_id, request_id, mandate_id, agent_id, decision_id, provider, model,
+        request_fingerprint, status, reserved_cost_atomic, actual_cost_atomic, input_tokens,
+        max_output_tokens, created_at, updated_at)
+       VALUES ('org-1', 'request-exhausted', 'mandate-unscoped', 'agent-1',
+        'decision-exhausted', 'anthropic', 'claude-sonnet-4-6', 'fingerprint-exhausted',
+        'completed', 10000, 10000, 1, 1, $1, $1)`,
+      ["2026-07-13T20:01:00.000Z"],
+    );
+    expect(await policies.hasExecutableMandate("org-1", "2026-07-13T20:01:00.000Z"))
+      .toBe(false);
+    await pool.query("DELETE FROM inference_executions WHERE organization_id = 'org-1' AND request_id = 'request-exhausted'");
+    await pool.query("DELETE FROM policy_decisions WHERE organization_id = 'org-1' AND id = 'decision-exhausted'");
+    await pool.query(
+      "UPDATE api_credentials SET revoked_at = $1 WHERE organization_id = 'org-1' AND id = 'credential-1'",
+      ["2026-07-13T20:02:00.000Z"],
+    );
+    expect(await policies.hasExecutableMandate("org-1", "2026-07-13T20:03:00.000Z"))
+      .toBe(false);
+    await pool.end();
+  });
+
   it("serializes concurrent policy schema initialization", async () => {
     const db = policyMemoryDb();
     const adapter = db.adapters.createPg();

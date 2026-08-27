@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
-      DATABASE_URL: ${{ secrets.NEON_INTEGRATION_DATABASE_URL }}
+      DATABASE_URL_UNPOOLED: ${{ secrets.NEON_INTEGRATION_DATABASE_URL_UNPOOLED || secrets.NEON_INTEGRATION_DATABASE_URL }}
       FUSE_PROVIDER_CREDENTIAL_ACTIVE_KEY_ID: ${{ secrets.NEON_INTEGRATION_PROVIDER_KEY_ID }}
       FUSE_PROVIDER_CREDENTIAL_KEY_V1: ${{ secrets.NEON_INTEGRATION_PROVIDER_KEY_V1 }}
       RUN_NEON_INTEGRATION: "1"
@@ -28,7 +28,7 @@ jobs:
           cache: npm
       - name: Require protected integration credentials
         run: |
-          test -n "$DATABASE_URL"
+          test -n "$DATABASE_URL_UNPOOLED"
           test -n "$FUSE_PROVIDER_CREDENTIAL_ACTIVE_KEY_ID"
           test -n "$FUSE_PROVIDER_CREDENTIAL_KEY_V1"
       - name: Install dependencies
@@ -37,3 +37,9 @@ jobs:
         run: npx vitest run tests/providerConfigStore.neon.test.ts
       - name: Verify workload shadow migrations and evidence on Neon
         run: npx vitest run tests/workloadShadowStore.neon.test.ts
+      - name: Verify atomic credential recovery on Neon
+        run: npm run test:credential-recovery-postgres
+      - name: Verify stale workspace onboarding recovery on Neon
+        run: npm run test:workspace-onboarding-postgres
+      - name: Verify held-out reliability persistence on Neon
+        run: npx vitest run tests/reliabilityProtocolStore.postgres.test.ts

@@ -1,4 +1,5 @@
 import { newAdvisoryMemoryDb } from "./helpers/pgMemAdvisory.js";
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { IdentityStore } from "../src/persistence/identityStore.js";
 import { createApiCredential, createServiceAccountCredential } from "../src/identity/apiCredentials.js";
@@ -22,6 +23,47 @@ const context = {
 };
 
 describe("IdentityStore", () => {
+  it("requires an active agent with a live inference credential for execution readiness", async () => {
+    const { pool, identity } = await createStores();
+    await identity.createOrganization({ id: "org-ready", name: "Ready Org", ...context });
+    await identity.registerAgent({
+      id: "agent-ready", organizationId: "org-ready", name: "Ready agent", ...context,
+    });
+    const issued = createApiCredential({
+      id: "credential-ready", organizationId: "org-ready", agentId: "agent-ready",
+      name: "Execution credential", capabilities: ["inference:invoke"],
+      createdAt: context.occurredAt, expiresAt: "2026-08-13T17:00:00.000Z",
+    }, () => Buffer.alloc(32, 31));
+    await identity.issueCredential(issued.record, context);
+
+    expect(await identity.hasExecutableAgentCredential(
+      "org-ready", "2026-07-13T17:01:00.000Z",
+    )).toBe(true);
+    expect(await identity.hasExecutableAgentCredential(
+      "org-other", "2026-07-13T17:01:00.000Z",
+    )).toBe(false);
+    expect(await identity.hasExecutableAgentCredential(
+      "org-ready", "2026-08-13T17:00:00.000Z",
+    )).toBe(false);
+    await pool.query(
+      "UPDATE agent_identities SET revoked_at = $1 WHERE organization_id = 'org-ready' AND id = 'agent-ready'",
+      ["2026-07-13T17:01:30.000Z"],
+    );
+    expect(await identity.hasExecutableAgentCredential(
+      "org-ready", "2026-07-13T17:01:31.000Z",
+    )).toBe(false);
+    await pool.query(
+      "UPDATE agent_identities SET revoked_at = NULL WHERE organization_id = 'org-ready' AND id = 'agent-ready'",
+    );
+    await identity.revokeCredential("org-ready", "credential-ready", {
+      ...context, occurredAt: "2026-07-13T17:02:00.000Z",
+    });
+    expect(await identity.hasExecutableAgentCredential(
+      "org-ready", "2026-07-13T17:03:00.000Z",
+    )).toBe(false);
+    await pool.end();
+  });
+
   it("initializes a clean identity and audit schema before mutations", async () => {
     const db = newAdvisoryMemoryDb();
     const adapter = db.adapters.createPg();
@@ -206,6 +248,39 @@ describe("IdentityStore", () => {
     expect((await pool.query("SELECT id FROM organizations")).rowCount).toBe(1);
     expect((await pool.query("SELECT id FROM service_accounts")).rowCount).toBe(1);
     expect((await pool.query("SELECT id FROM service_account_credentials")).rowCount).toBe(1);
+    await pool.end();
+  });
+
+  it("checks credential activity against the exact principal type", async () => {
+    const { pool, identity } = await createStores();
+    await identity.createOrganization({ id: "org-collision", name: "Collision", ...context });
+    await identity.createServiceAccount({
+      id: "service-collision", organizationId: "org-collision", name: "Admin", role: "admin", ...context,
+    });
+    await identity.registerAgent({
+      id: "agent-collision", organizationId: "org-collision", name: "Agent", ...context,
+    });
+    const serviceCredential = createServiceAccountCredential({
+      id: "shared-credential", organizationId: "org-collision", serviceAccountId: "service-collision",
+      name: "Service credential", capabilities: ["credentials:revoke"], createdAt: context.occurredAt,
+    }, () => Buffer.alloc(32, 31));
+    const agentCredential = createApiCredential({
+      id: "shared-credential", organizationId: "org-collision", agentId: "agent-collision",
+      name: "Agent credential", capabilities: ["inference:invoke"], createdAt: context.occurredAt,
+    }, () => Buffer.alloc(32, 32));
+    await identity.issueServiceAccountCredential(serviceCredential.record, context);
+    await identity.issueCredential(agentCredential.record, context);
+    await pool.query(
+      "UPDATE service_account_credentials SET revoked_at = $3 WHERE organization_id = $1 AND id = $2",
+      ["org-collision", "shared-credential", "2026-07-13T17:30:00.000Z"],
+    );
+
+    await expect(identity.isCredentialActive(
+      "org-collision", "shared-credential", "service_account", "2026-07-13T18:00:00.000Z",
+    )).resolves.toBe(false);
+    await expect(identity.isCredentialActive(
+      "org-collision", "shared-credential", "agent", "2026-07-13T18:00:00.000Z",
+    )).resolves.toBe(true);
     await pool.end();
   });
 
@@ -447,6 +522,132 @@ describe("IdentityStore", () => {
     )).toBeNull();
     expect((await audit.listAuditEvents("org-1", "api_credential", "cred-1")).map((event) => event.action))
       .toEqual(["credential.issued", "credential.revoked"]);
+    await pool.end();
+  });
+
+  it("does not consume recovery authority or revoke the old credential when atomic rotation fails", async () => {
+    const { pool, identity } = await createStores();
+    await identity.createOrganization({ id: "org-recovery", name: "Recovery Org", ...context });
+    await identity.registerAgent({
+      id: "agent-recovery", organizationId: "org-recovery", name: "Recovery Agent", ...context,
+    });
+    const oldCredential = createApiCredential({
+      id: "credential-old", organizationId: "org-recovery", agentId: "agent-recovery",
+      name: "Old credential", capabilities: ["inference:invoke", "receipts:read"],
+      createdAt: context.occurredAt,
+    }, () => Buffer.alloc(32, 30));
+    await identity.issueCredential(oldCredential.record, context);
+    const recoveryCodeHash = createHash("sha256").update("fuse_rc_atomic_recovery").digest("hex");
+    await pool.query(`
+      CREATE TABLE fuse_workspace_onboarding_operations (
+        idempotency_key TEXT PRIMARY KEY,
+        recovery_code_hash TEXT,
+        recovery_consumed_at TIMESTAMPTZ,
+        recovery_consumed_hash TEXT,
+        recovery_delivery_envelope TEXT,
+        recovery_delivery_id TEXT,
+        identifiers JSONB NOT NULL,
+        status TEXT NOT NULL
+      )
+    `);
+    await pool.query(
+      `INSERT INTO fuse_workspace_onboarding_operations
+       (idempotency_key, recovery_code_hash, identifiers, status)
+       VALUES ('onboard-recovery', $1, $2::jsonb, 'completed')`,
+      [recoveryCodeHash, JSON.stringify({
+        workspaceId: "org-recovery", agentId: "agent-recovery", agentCredentialId: "credential-old",
+      })],
+    );
+    const conflictingReplacement = createApiCredential({
+      id: "credential-old", organizationId: "org-recovery", agentId: "agent-recovery",
+      name: "Replacement credential", capabilities: ["inference:invoke", "receipts:read"],
+      createdAt: "2026-07-14T01:00:00.000Z",
+    }, () => Buffer.alloc(32, 31));
+
+    await expect(identity.rotateAgentCredentialWithRecovery({
+      workspaceId: "org-recovery",
+      recoveryCodeHash,
+      recoveryDeliveryEnvelope: "sealed-failed-delivery",
+      recoveryDeliveryId: "recovery-failed-1",
+      replacement: conflictingReplacement.record,
+      actorId: "service_account:recovery",
+      causationId: "request:recovery-failure",
+      occurredAt: "2026-07-14T01:00:00.000Z",
+    })).rejects.toThrow();
+
+    await expect(identity.authenticateToken(oldCredential.token, "2026-07-14T02:00:00.000Z"))
+      .resolves.toMatchObject({ credentialId: "credential-old" });
+    expect((await pool.query(
+      "SELECT recovery_code_hash, recovery_consumed_at FROM fuse_workspace_onboarding_operations",
+    )).rows[0]).toEqual({ recovery_code_hash: recoveryCodeHash, recovery_consumed_at: null });
+    await pool.end();
+  });
+
+  it("allows only one atomic recovery rotation and activates only its replacement", async () => {
+    const { pool, identity } = await createStores();
+    await identity.createOrganization({ id: "org-race", name: "Recovery Race", ...context });
+    await identity.registerAgent({
+      id: "agent-race", organizationId: "org-race", name: "Recovery Agent", ...context,
+    });
+    const oldCredential = createApiCredential({
+      id: "credential-old", organizationId: "org-race", agentId: "agent-race",
+      name: "Old credential", capabilities: ["inference:invoke"], createdAt: context.occurredAt,
+    }, () => Buffer.alloc(32, 20));
+    await identity.issueCredential(oldCredential.record, context);
+    const recoveryCodeHash = createHash("sha256").update("fuse_rc_racing_recovery").digest("hex");
+    await pool.query(`
+      CREATE TABLE fuse_workspace_onboarding_operations (
+        idempotency_key TEXT PRIMARY KEY,
+        recovery_code_hash TEXT,
+        recovery_consumed_at TIMESTAMPTZ,
+        recovery_consumed_hash TEXT,
+        recovery_delivery_envelope TEXT,
+        recovery_delivery_id TEXT,
+        identifiers JSONB NOT NULL,
+        status TEXT NOT NULL
+      )
+    `);
+    await pool.query(
+      `INSERT INTO fuse_workspace_onboarding_operations
+       (idempotency_key, recovery_code_hash, identifiers, status)
+       VALUES ('onboard-race', $1, $2::jsonb, 'completed')`,
+      [recoveryCodeHash, JSON.stringify({
+        workspaceId: "org-race", agentId: "agent-race", agentCredentialId: "credential-old",
+      })],
+    );
+    const replacements = [21, 22].map((byte, index) => createApiCredential({
+      id: `credential-new-${index + 1}`,
+      organizationId: "org-race",
+      agentId: "agent-race",
+      name: `Replacement ${index + 1}`,
+      capabilities: ["inference:invoke"],
+      createdAt: "2026-07-14T01:00:00.000Z",
+    }, () => Buffer.alloc(32, byte)));
+
+    const results = await Promise.allSettled(replacements.map((replacement, index) => (
+      identity.rotateAgentCredentialWithRecovery({
+        workspaceId: "org-race",
+        recoveryCodeHash,
+        recoveryDeliveryEnvelope: `sealed-race-delivery-${index + 1}`,
+        recoveryDeliveryId: `recovery-race-${index + 1}`,
+        replacement: replacement.record,
+        actorId: "service_account:recovery",
+        causationId: `request:recovery-${index + 1}`,
+        occurredAt: "2026-07-14T01:00:00.000Z",
+      })
+    )));
+
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+    await expect(identity.authenticateToken(oldCredential.token, "2026-07-14T02:00:00.000Z"))
+      .resolves.toBeNull();
+    const activeReplacements = await Promise.all(replacements.map((replacement) => (
+      identity.authenticateToken(replacement.token, "2026-07-14T02:00:00.000Z")
+    )));
+    expect(activeReplacements.filter(Boolean)).toHaveLength(1);
+    expect((await pool.query(
+      "SELECT recovery_code_hash, recovery_consumed_at FROM fuse_workspace_onboarding_operations",
+    )).rows[0]).toMatchObject({ recovery_code_hash: null });
     await pool.end();
   });
 });

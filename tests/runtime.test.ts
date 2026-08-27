@@ -1,5 +1,8 @@
+import { readFileSync } from "node:fs";
 import { expect, it } from "vitest";
-import { createRuntimeApp, reliabilityProtocolEnabledFromEnv } from "../src/runtime.js";
+import * as runtime from "../src/runtime.js";
+
+const { createRuntimeApp, reliabilityProtocolEnabledFromEnv } = runtime;
 
 const databaseUrl = "postgres://localhost:5432/fuse";
 
@@ -80,4 +83,61 @@ it("fails closed instead of exposing paid OpenRouter without the controlled data
     FUSE_PROVIDER: "openrouter",
     OPENROUTER_API_KEY: "openrouter-key",
   })).toThrow("DATABASE_URL is required for OpenRouter controlled inference");
+});
+
+it("rejects executable payment configuration in the control-mode runtime", () => {
+  const base = {
+    DATABASE_URL: databaseUrl,
+    FUSE_PROVIDER_MODE: "tenant",
+    FUSE_PROVIDER_CREDENTIAL_ACTIVE_KEY_ID: "v1",
+    FUSE_PROVIDER_CREDENTIAL_KEY_V1: Buffer.alloc(32, 8).toString("base64"),
+  };
+  expect(() => createRuntimeApp({
+    ...base,
+    FUSE_PAYMENT_NETWORK: "eip155:8453",
+  })).toThrow("CONTROL_MODE_PAYMENT_CONFIGURATION_FORBIDDEN:FUSE_PAYMENT_NETWORK");
+});
+
+it("keeps the shipped control-plane environment template free of executable payment configuration", () => {
+  const template = readFileSync(new URL("../.env.example", import.meta.url), "utf8");
+  for (const name of ["FUSE_PAYER_ADDRESS", "FUSE_SELLER_ADDRESS", "FUSE_PAYMENT_NETWORK", "FUSE_PAYMENT_FACILITATOR_URL"]) {
+    expect(template).not.toMatch(new RegExp(`^${name}=\\S+`, "m"));
+  }
+  for (const name of [
+    "FUSE_BETA_INVITE_TOKEN_HASHES",
+    "FUSE_BETA_MAX_ACTIVE_WORKSPACES",
+    "FUSE_BETA_ACTIVE_WORKSPACE_IDS",
+  ]) {
+    expect(template).toMatch(new RegExp(`^${name}=`, "m"));
+  }
+  expect(template).toContain("sha256sum");
+});
+
+it("does not infer operational durability from database configuration alone", () => {
+  const readFlags = (runtime as unknown as {
+    operationalReadinessFlagsFromEnv(env: NodeJS.ProcessEnv): {
+      controlMode: boolean;
+      settlementDisabled: boolean;
+      durableInviteGate: boolean;
+      durableAdminRateLimit: boolean;
+      sourceCredentialRevocationEnforced: boolean;
+    };
+  }).operationalReadinessFlagsFromEnv;
+  expect(readFlags({})).toEqual({
+    controlMode: true,
+    settlementDisabled: true,
+    durableInviteGate: false,
+    durableAdminRateLimit: false,
+    sourceCredentialRevocationEnforced: false,
+  });
+  expect(readFlags({
+    DATABASE_URL_UNPOOLED: databaseUrl,
+    FUSE_BETA_INVITE_TOKEN_HASHES: "a".repeat(64),
+  })).toEqual({
+    controlMode: true,
+    settlementDisabled: true,
+    durableInviteGate: true,
+    durableAdminRateLimit: true,
+    sourceCredentialRevocationEnforced: true,
+  });
 });

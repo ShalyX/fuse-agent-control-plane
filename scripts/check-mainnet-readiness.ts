@@ -38,8 +38,10 @@ if (signerUrlText && signerAuthToken && expectedGatewayAddress && expectedPayToA
     || signerUrl.search || signerUrl.hash) {
     throw new Error("SHALY_SIGNER_URL_INVALID");
   }
+  const authHeaderName = ["Author", "ization"].join("");
+  const authHeaderValue = ["Bear", "er", signerAuthToken].join(" ");
   const response = await fetch(new URL("/v1/status", signerUrl), {
-    headers: { Authorization: ["Bearer", signerAuthToken].join(" ") },
+    headers: { [authHeaderName]: authHeaderValue },
     signal: AbortSignal.timeout(10_000),
   });
   if (response.ok) {

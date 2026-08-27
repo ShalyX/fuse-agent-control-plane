@@ -1,15 +1,8 @@
 import { readFileSync, writeFileSync } from "node:fs";
-import { createRequire } from "node:module";
-import type { initiateDeveloperControlledWalletsClient as InitiateClient } from "@circle-fin/developer-controlled-wallets";
 import { registerBatchScheme } from "@circle-fin/x402-batching/client";
 import { x402Client } from "@x402/core/client";
 import { x402HTTPClient } from "@x402/core/http";
-import { createCircleGatewaySigner } from "../src/circle/developerWalletSigner.js";
-
-const require = createRequire(import.meta.url);
-const { initiateDeveloperControlledWalletsClient } = require("@circle-fin/developer-controlled-wallets") as {
-  initiateDeveloperControlledWalletsClient: typeof InitiateClient;
-};
+import { createGatewaySigner } from "./gatewaySigner.js";
 const mode = process.argv[2];
 const statePath = "/tmp/fuse-cold-start-payment.json";
 const endpoint = process.env["FUSE_URL"] ?? "http://127.0.0.1:8787";
@@ -27,19 +20,7 @@ const body = JSON.stringify({
 });
 
 if (mode === "prepare") {
-  const apiKey = process.env["CIRCLE_API_KEY"]?.trim();
-  const entitySecret = process.env["CIRCLE_ENTITY_SECRET"]?.trim();
-  if (!apiKey || !entitySecret) throw new Error("Missing Circle credentials");
-  const circle = initiateDeveloperControlledWalletsClient({ apiKey, entitySecret });
-  const wallets = (await circle.listWallets()).data?.wallets ?? [];
-  const payer = (process.env["FUSE_PAYER_ADDRESS"] ?? "0x68abdce904bd68c53b0daf43c9b83a5aa8c0b2f7").toLowerCase();
-  const wallet = wallets.find((candidate) => candidate.address?.toLowerCase() === payer);
-  if (!wallet) throw new Error("PAYER_WALLET_NOT_FOUND");
-  const signer = createCircleGatewaySigner({
-    client: circle,
-    walletId: wallet.id,
-    walletAddress: wallet.address as `0x${string}`,
-  });
+  const { signer, mode: signerMode } = await createGatewaySigner(process.env);
   const client = new x402Client();
   registerBatchScheme(client, { signer });
   const http = new x402HTTPClient(client);
@@ -52,7 +33,7 @@ if (mode === "prepare") {
     requestId,
     headers: http.encodePaymentSignatureHeader(payload),
   }), { mode: 0o600 });
-  console.log(JSON.stringify({ status: "prepared", requestId, httpStatus: initial.status }));
+  console.log(JSON.stringify({ status: "prepared", requestId, httpStatus: initial.status, signerMode }));
 } else if (mode === "pay") {
   const persisted = JSON.parse(readFileSync(statePath, "utf8"));
   if (persisted.requestId !== requestId) throw new Error("COLD_START_REQUEST_MISMATCH");

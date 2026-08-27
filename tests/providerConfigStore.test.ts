@@ -1,4 +1,5 @@
-import { DataType, newDb } from "pg-mem";
+import { DataType } from "pg-mem";
+import { newAdvisoryMemoryDb } from "./helpers/pgMemAdvisory.js";
 import { describe, expect, it } from "vitest";
 import { IdentityStore } from "../src/persistence/identityStore.js";
 import { ProviderConfigStore } from "../src/persistence/providerConfigStore.js";
@@ -16,7 +17,7 @@ const context = {
 };
 
 async function createStores() {
-  const memoryDb = newDb({ noAstCoverageCheck: true });
+  const memoryDb = newAdvisoryMemoryDb({ noAstCoverageCheck: true });
   memoryDb.public.registerFunction({
     name: "char_length",
     args: [DataType.text],
@@ -133,6 +134,7 @@ describe("ProviderConfigStore", () => {
       "UPDATE provider_configurations SET encryption_key_id = 'v2' WHERE organization_id = 'org-1'",
     );
     await expect(store.resolve("org-1")).rejects.toThrow("PROVIDER_CREDENTIAL_DECRYPT_FAILED");
+    await expect(store.getVerifiedConfigurationSummary("org-1")).resolves.toBeNull();
     await pool.end();
   });
 
@@ -145,6 +147,53 @@ describe("ProviderConfigStore", () => {
     });
 
     await expect(store.resolve("org-2")).rejects.toThrow("PROVIDER_CONFIGURATION_NOT_FOUND");
+    await pool.end();
+  });
+
+  it("does not resolve a configuration that is pending verification", async () => {
+    const { pool, store } = await createStores();
+    await store.configure({
+      id: "primary", organizationId: "org-1", provider: "openrouter",
+      model: "anthropic/claude-sonnet-4.6", apiKey: "test-key",
+      inputUsdPerMillion: "3.00", outputUsdPerMillion: "15.00", ...context,
+    });
+    await pool.query(
+      "UPDATE provider_configurations SET verification_status = 'pending' WHERE organization_id = 'org-1'",
+    );
+
+    await expect(store.resolve("org-1")).rejects.toThrow("PROVIDER_CONFIGURATION_NOT_FOUND");
+    expect(await store.hasVerifiedConfiguration("org-1")).toBe(false);
+    await store.markVerificationStatus({
+      organizationId: "org-1", id: "primary", status: "verified",
+      expectedCredentialVersion: 1,
+      occurredAt: "2026-07-19T16:10:00.000Z",
+    });
+    expect(await store.hasVerifiedConfiguration("org-1")).toBe(true);
+    await expect(store.getVerifiedConfigurationSummary("org-1")).resolves.toMatchObject({
+      provider: "openrouter",
+      model: "anthropic/claude-sonnet-4.6",
+    });
+    await pool.end();
+  });
+
+  it("refuses to verify a provider credential after its version has rotated", async () => {
+    const { pool, store } = await createStores();
+    const base = {
+      id: "primary", organizationId: "org-1", provider: "openrouter" as const,
+      model: "anthropic/claude-sonnet-4.6", inputUsdPerMillion: "3.00",
+      outputUsdPerMillion: "15.00", ...context, verificationStatus: "pending" as const,
+    };
+    await store.configure({ ...base, apiKey: "«redacted:provider-version-one-token-123456»" });
+    await store.configure({
+      ...base, apiKey: "«redacted:provider-version-two-token-123456»",
+      causationId: "request:rotate", occurredAt: "2026-07-19T16:05:00.000Z",
+    });
+
+    await expect(store.markVerificationStatus({
+      organizationId: "org-1", id: "primary", status: "verified",
+      expectedCredentialVersion: 1, occurredAt: "2026-07-19T16:06:00.000Z",
+    })).rejects.toThrow("PROVIDER_VERIFICATION_STALE");
+    await expect(store.resolve("org-1")).rejects.toThrow("PROVIDER_CONFIGURATION_NOT_FOUND");
     await pool.end();
   });
 });

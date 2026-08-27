@@ -1,0 +1,115 @@
+{
+  "kind": "fuse-beta-independent-evidence-pack",
+  "freezeStatus": "frozen",
+  "frozenAt": "2026-08-22T00:31:00Z",
+  "mode": "invite-only-control-mode",
+  "deployment": "https://fuse-agent-control-plane.vercel.app",
+  "teams": [
+    {
+      "name": "Daemon",
+      "workspaceId": "4fcbe5f7-b231-421f-aa43-0b1ebf637fe7",
+      "agentId": "3e69694d-f2f7-4d76-8d2d-12bb594e53a9",
+      "mandateId": "0362db8e-2ed3-4f1c-a069-83da72cc3a31",
+      "recovery": "verified",
+      "oldCredentialStatus": 401,
+      "finalCredentialStatus": 200,
+      "paidInference": {
+        "requestId": "external-paid-1787352769057",
+        "status": "completed",
+        "actualCostAtomic": "168"
+      },
+      "artifacts": [
+        "/root/.config/fuse/external-beta-onboarding.json",
+        "/root/.config/fuse/external-beta-replacement.json"
+      ]
+    },
+    {
+      "name": "Aegis",
+      "workspaceId": "b53feaa1-1b2f-48c5-a0ca-5a66e2e7618b",
+      "agentId": "57bbd7ae-93dd-4b6c-a196-ac74e2e7618b",
+      "mandateId": "cfb7ba7e-332b-42d9-83d4-b7149de3fa9f",
+      "recovery": "verified",
+      "oldCredentialStatus": 401,
+      "finalCredentialStatus": 200,
+      "paidInference": {
+        "requestId": "aegis-paid-1787354145638",
+        "status": "completed",
+        "actualCostAtomic": "171"
+      },
+      "artifacts": [
+        "/root/.config/fuse/external-beta-second-workspace.json",
+        "/root/.config/fuse/external-beta-second-rotation.json",
+        "/root/.config/fuse/external-beta-second-replacement.json"
+      ]
+    },
+    {
+      "name": "Vanta",
+      "workspaceId": "9e5bc4db-407e-44ae-8784-7b66e85b2a38",
+      "agentId": "480d6751-af7b-4d77-871c-3394b65ab2f9",
+      "mandateId": "7c649fb5-c23c-46d4-937c-a0cad2c19584",
+      "recovery": "verified",
+      "oldCredentialStatus": 401,
+      "finalCredentialStatus": 200,
+      "paidInference": {
+        "status": "completed",
+        "httpStatus": 200,
+        "requestId": "vanta-paid-1787358348855"
+      },
+      "artifacts": [
+        "/root/.config/fuse/external-beta-third-workspace.json",
+        "/root/.config/fuse/external-beta-third-rotation.json",
+        "/root/.config/fuse/external-beta-third-replacement.json",
+        "/root/.config/fuse/external-beta-third-paid.json"
+      ]
+    }
+  ],
+  "guardrails": {
+    "maxActiveWorkspaces": 3,
+    "activeWorkspaceIdsConfigured": 3,
+    "fourthOnboardingProbe": {
+      "httpStatus": 503,
+      "error": "BETA_ONBOARDING_CAPACITY_EXHAUSTED"
+    },
+    "missingAllowlist": "fail_closed"
+  },
+  "reconciliationIncident": {
+    "kind": "isolated-provider-failure-drill",
+    "providerCalledOnce": true,
+    "receiptState": "reconciliation_hold",
+    "mandateState": "reconciliation_hold",
+    "duplicateRedispatch": false,
+    "automaticConfirmNotBilled": false,
+    "focusedTests": {
+      "providerAndHoldTests": 3,
+      "reconciliationStateMachineTests": 32
+    }
+  },
+  "verification": {
+    "fullTestFilesPassed": 97,
+    "fullTestsPassed": 655,
+    "fullTestsSkipped": 20,
+    "build": "passed",
+    "guardrailDeployment": "passed",
+    "liveAlerts": "verified clear after three-tenant usage readout; signer remaining authority 322"
+  },
+  "hostedVerification": {
+    "healthStatus": 200,
+    "readyStatus": 503,
+    "readyBody": "DEPENDENCY_UNAVAILABLE",
+    "receiptReadback": "three tenants passed",
+    "actualCostAtomic": "510",
+    "restartRedeployProof": "not-run; no deployment action permitted"
+  },
+  "knownBlockers": [
+    "Hosted /ready currently returns 503 DEPENDENCY_UNAVAILABLE, so restart/readiness proof is not closed.",
+    "ops:check requires FUSE_ADMIN_TOKEN, which is absent from the protected operator environment.",
+    "Public launch remains deferred pending hosted readiness, exact-candidate independent review, and release approval.",
+    "Independent review found invite-only onboarding enforcement, payment admission ordering, administrative limiter durability, session revocation, and payment-mode alignment blockers."
+  ],
+  "independentReview": {
+    "status": "blocked",
+    "reviewedFreeze": "978b1613f4d9df60e7bb5dd1b6018bdac77b2d78",
+    "recommendation": "do_not_label_invite_only_alpha",
+    "requiresNewFreezeAfterFixes": true
+  }
+}

@@ -4,19 +4,34 @@
   "private": true,
   "type": "module",
   "main": "api/index.ts",
+  "types": "dist/src/product/index.d.ts",
+  "exports": {
+    ".": "./api/index.ts",
+    "./product": {
+      "types": "./dist/src/product/index.d.ts",
+      "import": "./dist/src/product/index.js"
+    }
+  },
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
     "build": "tsc -p tsconfig.json",
+    "product:smoke": "npm run build && node dist/scripts/smoke-product-package.js",
     "start": "node dist/src/server.js",
     "dev": "node --env-file=.env --import tsx src/server.ts",
     "demo": "tsx scripts/demo.ts",
     "identity:bootstrap": "tsx scripts/bootstrap-identity.ts",
     "ops:check": "tsx scripts/check-operations.ts",
     "ops:reconcile": "tsx scripts/reconcile-inference.ts",
+    "ops:beta-alerts": "tsx scripts/check-beta-alerts.ts",
+    "ops:beta-usage": "tsx scripts/beta-usage-report.ts",
     "mainnet:readiness": "tsx scripts/check-mainnet-readiness.ts",
     "smoke:production": "tsx scripts/smoke-production.ts",
+    "verify:live-product": "tsx scripts/verify-live-product.ts",
     "migrate:provider-config": "tsx scripts/migrate-provider-config.ts",
+    "test:provider-postgres": "bash scripts/test-provider-postgres-integration.sh",
+    "test:credential-recovery-postgres": "bash scripts/test-credential-recovery-postgres.sh",
+    "test:workspace-onboarding-postgres": "bash scripts/test-workspace-onboarding-postgres.sh",
     "shadow:retry": "tsx scripts/process-shadow-queue.ts",
     "evidence:fixtures": "tsx scripts/generate-evidence-fixtures.ts",
     "evidence:fixtures:dry": "tsx scripts/generate-evidence-fixtures.ts --dry-run",
@@ -62,7 +77,8 @@
     "evidence:held-out:v4:replay": "tsx scripts/held-out-reliability-v4.ts replay",
     "evidence:held-out:v4:evidence": "tsx scripts/held-out-reliability-v4.ts evidence",
     "evidence:held-out:v4:report": "tsx scripts/held-out-reliability-v4.ts report",
-    "check": "npm test && npm run build"
+    "check": "npm test && npm run build && npm run client:build",
+    "client:build": "npm --prefix packages/fuse-client run build"
   },
   "dependencies": {
     "@circle-fin/developer-controlled-wallets": "^10.8.0",

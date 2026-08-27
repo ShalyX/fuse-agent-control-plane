@@ -1,9 +1,9 @@
-import { newDb } from "pg-mem";
+import { newAdvisoryMemoryDb } from "./helpers/pgMemAdvisory.js";
 import { expect, it } from "vitest";
 import { PostgresSignerAuthorizationStore } from "../src/signer/authorizationStore.js";
 
 function setup() {
-  const db = newDb({ noAstCoverageCheck: true });
+  const db = newAdvisoryMemoryDb({ noAstCoverageCheck: true });
   const adapter = db.adapters.createPg();
   const pool = new adapter.Pool();
   return { pool, store: new PostgresSignerAuthorizationStore(pool) };
@@ -66,7 +66,7 @@ it("reserves cumulative authority transactionally and holds ambiguous signing at
 });
 
 it("fails closed on unversioned signer authority tables", async () => {
-  const db = newDb({ noAstCoverageCheck: true });
+  const db = newAdvisoryMemoryDb({ noAstCoverageCheck: true });
   const adapter = db.adapters.createPg();
   const pool = new adapter.Pool();
   await pool.query("CREATE TABLE signer_authority_limits (organization_id TEXT PRIMARY KEY)");

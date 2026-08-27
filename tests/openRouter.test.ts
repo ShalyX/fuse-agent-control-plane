@@ -77,6 +77,32 @@ it("calls OpenRouter chat completions and uses provider-reported usage", async (
   );
 });
 
+it("accepts a bounded completion that OpenRouter finishes with length", async () => {
+  const provider = new OpenRouterProvider({
+    apiKey: "openrouter-key",
+    model: "anthropic/claude-sonnet-4.6",
+    fetch: vi.fn(async () => new Response(JSON.stringify({
+      id: "gen-openrouter-length",
+      model: "anthropic/claude-sonnet-4.6",
+      choices: [{ finish_reason: "length", message: { content: "FUSE BETA OK" } }],
+      usage: { prompt_tokens: 17, completion_tokens: 8, cost: 0.000171 },
+    }), { status: 200, headers: { "content-type": "application/json" } })),
+  });
+
+  await expect(provider.complete({
+    requestId: "req-openrouter-length",
+    childId: "scout",
+    model: "ignored",
+    inputTokens: 17,
+    maxOutputTokens: 8,
+    messages: [{ role: "user", content: "Reply with exactly: FUSE BETA OK" }],
+  })).resolves.toMatchObject({
+    id: "gen-openrouter-length",
+    providerCostUsd: "0.000171",
+    usage: { inputTokens: 17, outputTokens: 8 },
+  });
+});
+
 it("returns a sanitized completion error when OpenRouter reports a choice-level failure", async () => {
   const provider = new OpenRouterProvider({
     apiKey: "openrouter-key",

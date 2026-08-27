@@ -53,6 +53,14 @@ export interface BootstrapServiceAccountInput extends MutationContext {
   credential: ServiceAccountCredentialRecord;
 }
 
+export interface RotateAgentCredentialWithRecoveryInput extends MutationContext {
+  workspaceId: string;
+  recoveryCodeHash: string;
+  recoveryDeliveryId: string;
+  recoveryDeliveryEnvelope: string;
+  replacement: ApiCredentialRecord;
+}
+
 export interface AgentIdentity {
   id: string;
   organizationId: string;
@@ -554,6 +562,107 @@ export class IdentityStore {
     });
   }
 
+  async rotateAgentCredentialWithRecovery(
+    input: RotateAgentCredentialWithRecoveryInput,
+  ): Promise<{ agentId: string; previousCredentialId: string }> {
+    this.validateContext(input);
+    if (!input.workspaceId.trim()) throw new Error("WORKSPACE_ID_REQUIRED");
+    if (!/^[a-f0-9]{64}$/.test(input.recoveryCodeHash)) throw new Error("RECOVERY_CODE_HASH_INVALID");
+    const record = input.replacement;
+    if (record.organizationId !== input.workspaceId) throw new Error("RECOVERY_CREDENTIAL_WORKSPACE_MISMATCH");
+    if (!record.id.trim()) throw new Error("API_CREDENTIAL_ID_REQUIRED");
+    if (!record.agentId.trim()) throw new Error("API_CREDENTIAL_AGENT_REQUIRED");
+    if (!record.name.trim()) throw new Error("API_CREDENTIAL_NAME_REQUIRED");
+    if (!/^fuse_sk_[A-Za-z0-9_-]{12}$/.test(record.tokenPrefix)) throw new Error("API_CREDENTIAL_PREFIX_INVALID");
+    if (!/^[a-f0-9]{64}$/.test(record.tokenHash)) throw new Error("API_CREDENTIAL_HASH_INVALID");
+    const createdAt = Date.parse(record.createdAt);
+    if (Number.isNaN(createdAt)) throw new Error("API_CREDENTIAL_CREATED_AT_INVALID");
+    if (record.expiresAt !== null) {
+      const expiresAt = Date.parse(record.expiresAt);
+      if (Number.isNaN(expiresAt) || expiresAt <= createdAt) throw new Error("API_CREDENTIAL_EXPIRY_INVALID");
+    }
+    if (record.revokedAt !== null) throw new Error("API_CREDENTIAL_ALREADY_REVOKED");
+    if (new Set(record.capabilities).size !== record.capabilities.length) {
+      throw new Error("API_CREDENTIAL_CAPABILITY_DUPLICATE");
+    }
+    if (record.capabilities.length === 0 || record.capabilities.some(
+      (capability) => !API_CAPABILITIES.includes(capability),
+    )) throw new Error("API_CREDENTIAL_CAPABILITY_INVALID");
+    await this.ensureSchema();
+
+    return this.transaction(async (client) => {
+      const recovery = await client.query<{ identifiers: Record<string, string> }>(
+        `SELECT identifiers
+           FROM fuse_workspace_onboarding_operations
+          WHERE identifiers->>'workspaceId' = $1
+            AND recovery_code_hash = $2
+            AND status = 'completed'
+            AND recovery_consumed_at IS NULL
+          FOR UPDATE`,
+        [input.workspaceId, input.recoveryCodeHash],
+      );
+      const identifiers = recovery.rows[0]?.identifiers;
+      const agentId = identifiers?.agentId;
+      const previousCredentialId = identifiers?.agentCredentialId;
+      if (!agentId || !previousCredentialId) throw new Error("CREDENTIAL_RECOVERY_INVALID");
+      if (record.agentId !== agentId) throw new Error("RECOVERY_CREDENTIAL_AGENT_MISMATCH");
+      if (record.id === previousCredentialId) throw new Error("RECOVERY_CREDENTIAL_ID_CONFLICT");
+
+      const consumed = await client.query(
+        `UPDATE fuse_workspace_onboarding_operations
+            SET recovery_code_hash = NULL, recovery_consumed_hash = $2,
+                recovery_consumed_at = $3, recovery_delivery_envelope = $4,
+                recovery_delivery_id = $5
+          WHERE identifiers->>'workspaceId' = $1
+            AND recovery_code_hash = $2
+            AND status = 'completed'
+            AND recovery_consumed_at IS NULL`,
+        [input.workspaceId, input.recoveryCodeHash, input.occurredAt,
+          input.recoveryDeliveryEnvelope, input.recoveryDeliveryId],
+      );
+      if (consumed.rowCount !== 1) throw new Error("CREDENTIAL_RECOVERY_INVALID");
+
+      await client.query(
+        `INSERT INTO api_credentials
+         (id, organization_id, agent_id, name, token_prefix, token_hash, capabilities,
+          created_at, expires_at, revoked_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, NULL)`,
+        [record.id, record.organizationId, record.agentId, record.name, record.tokenPrefix,
+          record.tokenHash, JSON.stringify(record.capabilities), record.createdAt, record.expiresAt],
+      );
+      await this.appendAudit(client, {
+        organizationId: record.organizationId,
+        entityType: "api_credential",
+        entityId: record.id,
+        action: "credential.issued",
+        payload: {
+          agentId: record.agentId, tokenPrefix: record.tokenPrefix,
+          capabilities: record.capabilities, expiresAt: record.expiresAt, recovery: true,
+        },
+        actorId: input.actorId,
+        causationId: input.causationId,
+        occurredAt: input.occurredAt,
+      });
+      const revoked = await client.query(
+        `UPDATE api_credentials SET revoked_at = $3
+          WHERE organization_id = $1 AND id = $2 AND agent_id = $4 AND revoked_at IS NULL`,
+        [input.workspaceId, previousCredentialId, input.occurredAt, agentId],
+      );
+      if (revoked.rowCount !== 1) throw new Error("API_CREDENTIAL_NOT_ACTIVE");
+      await this.appendAudit(client, {
+        organizationId: input.workspaceId,
+        entityType: "api_credential",
+        entityId: previousCredentialId,
+        action: "credential.revoked",
+        payload: { recovery: true, replacementCredentialId: record.id },
+        actorId: input.actorId,
+        causationId: input.causationId,
+        occurredAt: input.occurredAt,
+      });
+      return { agentId, previousCredentialId };
+    });
+  }
+
   async authenticateToken(token: string, now: string): Promise<{
     principalType: "agent" | "service_account";
     principalId: string;
@@ -637,6 +746,65 @@ export class IdentityStore {
       capabilities: service.capabilities,
       role: service.principal_role,
     };
+  }
+
+  async isCredentialActive(
+    organizationId: string,
+    credentialId: string,
+    credentialType: "agent" | "service_account",
+    now: string,
+  ): Promise<boolean> {
+    const nowMs = Date.parse(now);
+    if (Number.isNaN(nowMs)) throw new Error("AUTHENTICATION_TIME_INVALID");
+    await this.ensureSchema();
+    const query = credentialType === "agent"
+      ? `SELECT 1
+         FROM api_credentials credentials
+         JOIN agent_identities principals
+           ON principals.organization_id = credentials.organization_id
+          AND principals.id = credentials.agent_id
+         WHERE credentials.organization_id = $1 AND credentials.id = $2
+           AND credentials.revoked_at IS NULL AND principals.revoked_at IS NULL
+           AND principals.status = 'active'
+           AND (credentials.expires_at IS NULL OR credentials.expires_at > $3)
+         LIMIT 1`
+      : `SELECT 1
+         FROM service_account_credentials credentials
+         JOIN service_accounts principals
+           ON principals.organization_id = credentials.organization_id
+          AND principals.id = credentials.service_account_id
+         WHERE credentials.organization_id = $1 AND credentials.id = $2
+           AND credentials.revoked_at IS NULL AND principals.revoked_at IS NULL
+           AND (credentials.expires_at IS NULL OR credentials.expires_at > $3)
+         LIMIT 1`;
+    const result = await this.pool.query(
+      query,
+      [organizationId, credentialId, new Date(nowMs)],
+    );
+    return (result.rowCount ?? 0) > 0;
+  }
+
+  async hasExecutableAgentCredential(organizationId: string, now: string): Promise<boolean> {
+    if (!organizationId.trim()) throw new Error("ORGANIZATION_ID_REQUIRED");
+    const nowMs = Date.parse(now);
+    if (Number.isNaN(nowMs)) throw new Error("CREDENTIAL_CHECK_TIME_INVALID");
+    await this.ensureSchema();
+    const result = await this.pool.query(
+      `SELECT 1
+       FROM agent_identities agents
+       JOIN api_credentials credentials
+         ON credentials.organization_id = agents.organization_id
+        AND credentials.agent_id = agents.id
+       WHERE agents.organization_id = $1
+         AND agents.status = 'active'
+         AND agents.revoked_at IS NULL
+         AND credentials.revoked_at IS NULL
+         AND (credentials.expires_at IS NULL OR credentials.expires_at > $2)
+         AND credentials.capabilities @> '["inference:invoke"]'::jsonb
+       LIMIT 1`,
+      [organizationId, new Date(nowMs)],
+    );
+    return (result.rowCount ?? 0) > 0;
   }
 
   async getAgent(organizationId: string, agentId: string): Promise<AgentIdentity | null> {

@@ -37,6 +37,7 @@ export class TenantProviderResolver {
 
   async resolve(organizationId: string): Promise<ProviderExecutionBinding> {
     const config = await this.source.resolve(organizationId);
+    if (config.organizationId !== organizationId) throw new Error("PROVIDER_CONFIGURATION_TENANT_MISMATCH");
     const provider = config.provider === "anthropic"
       ? this.factories.anthropic({
         apiKey: config.apiKey,

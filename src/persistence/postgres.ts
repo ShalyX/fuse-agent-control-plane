@@ -9,7 +9,7 @@ import {
 
 export function createPostgresPool(connectionString: string): Pool {
   const parsed = new URL(connectionString);
-  const isLocal = ["localhost", "127.0.0.1", "::1"].includes(parsed.hostname);
+  const isLocal = parsed.hostname === "" || ["localhost", "127.0.0.1", "::1"].includes(parsed.hostname);
   if (!isLocal) parsed.searchParams.set("sslmode", "verify-full");
   const config: PoolConfig = {
     connectionString: parsed.toString(),

@@ -13,6 +13,7 @@ export const API_CAPABILITIES = [
   "mandates:admin",
   "providers:read",
   "providers:write",
+  "sandbox:run",
 ] as const;
 
 export type ApiCapability = typeof API_CAPABILITIES[number];
@@ -22,7 +23,7 @@ const SERVICE_ACCOUNT_ROLE_CAPABILITIES: Record<ServiceAccountRole, readonly Api
   admin: API_CAPABILITIES,
   operator: [
     "inference:invoke", "mandates:read", "mandates:write", "receipts:read",
-    "policies:read", "providers:read",
+    "policies:read", "providers:read", "sandbox:run",
   ],
   viewer: ["mandates:read", "receipts:read", "policies:read", "providers:read"],
 };

@@ -61,6 +61,7 @@ function replayRequest(app: ReturnType<typeof createFuseApp>, operationId = cano
     .set("X-Fuse-Mandate", "mandate-1")
     .set("X-Fuse-Branch", "branch-1")
     .set("X-Fuse-Replay-Operation", operationId)
+    .set("PAYMENT-SIGNATURE", "signed-eip3009")
     .send(body);
 }
 
@@ -231,7 +232,7 @@ describe("authenticated replay operation trust boundary", () => {
     const authorize = vi.fn(async () => ({ authorized: true as const }));
     const app = createFuseApp({
       provider: { complete: async () => { throw new Error("unused"); } },
-      paymentGuard: () => (_request, response) => response.status(500).end(),
+      paymentGuard: () => (_request, _response, next) => next(),
       estimateInputTokens: () => 2,
       credentialAuthenticator: authenticator,
       workloadShadowEnabled: true,

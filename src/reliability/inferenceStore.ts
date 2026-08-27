@@ -25,6 +25,12 @@ export class ReliabilityInferenceExecutionStore implements InferenceExecutionSto
     });
     return result.status==="execute"?{...result,protocolAdmissionCommitted:true}:result;
   };
+  previewInference: NonNullable<InferenceExecutionStore["previewInference"]> = (input) => {
+    if (input.reliabilityAdmission) throw new Error("RELIABILITY_PREVIEW_UNSUPPORTED");
+    const preview = this.policy.previewInference;
+    if (!preview) throw new Error("POLICY_PREVIEW_REQUIRED");
+    return preview.call(this.policy, input);
+  };
   completeInference: InferenceExecutionStore["completeInference"] = (input) => this.policy.completeInference(input);
   completeReliabilityInference: NonNullable<InferenceExecutionStore["completeReliabilityInference"]> = async (input) => {
     const atomic=(this.policy as InferenceExecutionStore&{completeInferenceAtomically?:(ordinary:Parameters<InferenceExecutionStore["completeInference"]>[0],hook:(client:unknown,result:Awaited<ReturnType<InferenceExecutionStore["completeInference"]>>)=>Promise<void>)=>ReturnType<InferenceExecutionStore["completeInference"]>}).completeInferenceAtomically;

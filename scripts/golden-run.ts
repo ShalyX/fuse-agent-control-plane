@@ -1,30 +1,9 @@
-import { createRequire } from "node:module";
-import type { initiateDeveloperControlledWalletsClient as InitiateClient } from "@circle-fin/developer-controlled-wallets";
 import { registerBatchScheme } from "@circle-fin/x402-batching/client";
 import { x402Client } from "@x402/core/client";
 import { x402HTTPClient } from "@x402/core/http";
-import { createCircleGatewaySigner } from "../src/circle/developerWalletSigner.js";
-
-const require = createRequire(import.meta.url);
-const { initiateDeveloperControlledWalletsClient } = require("@circle-fin/developer-controlled-wallets") as {
-  initiateDeveloperControlledWalletsClient: typeof InitiateClient;
-};
+import { createGatewaySigner } from "./gatewaySigner.js";
 const env = process.env;
-const apiKey = env["CIRCLE_API_KEY"]?.trim();
-const entitySecret = env["CIRCLE_ENTITY_SECRET"]?.trim();
-if (!apiKey || !entitySecret) throw new Error("Missing Circle credentials");
-
-const circle = initiateDeveloperControlledWalletsClient({ apiKey, entitySecret });
-const wallets = (await circle.listWallets()).data?.wallets ?? [];
-const payerAddress = (env["FUSE_PAYER_ADDRESS"] ?? "0x68abdce904bd68c53b0daf43c9b83a5aa8c0b2f7").toLowerCase();
-const wallet = wallets.find((candidate) => candidate.address?.toLowerCase() === payerAddress);
-if (!wallet) throw new Error("NO_LIVE_ARC_EOA");
-
-const signer = createCircleGatewaySigner({
-  client: circle,
-  walletId: wallet.id,
-  walletAddress: wallet.address as `0x${string}`,
-});
+const { signer, payerAddress, mode: signerMode } = await createGatewaySigner(env);
 const client = new x402Client();
 registerBatchScheme(client, { signer });
 const http = new x402HTTPClient(client);
@@ -111,7 +90,8 @@ const state = await stateResponse.json();
 console.log(JSON.stringify({
   status: "golden_run_complete",
   network: "eip155:5042002",
-  payer: wallet.address,
+  payer: payerAddress,
+  signerMode,
   scout: scout.map((result) => ({
     usage: result.usage,
     costUsdc: result.fuse.receipt.costUsdc,

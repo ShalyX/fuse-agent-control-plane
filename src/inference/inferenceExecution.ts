@@ -124,6 +124,7 @@ export interface InferenceExecutionStore {
       };
     };
   }): Promise<AdmissionResult>;
+  previewInference?(input: Parameters<InferenceExecutionStore["admitInference"]>[0]): Promise<AdmissionResult>;
   completeInference(input: {
     requestId: string;
     organizationId: string;
@@ -172,6 +173,25 @@ type InferenceExecutionConfig = {
 
 export class InferenceExecutionService {
   constructor(private readonly config: InferenceExecutionConfig) {}
+
+  async preview(input: ControlledInferenceInput): Promise<AdmissionResult> {
+    if (!this.config.store.previewInference) throw new Error("POLICY_PREVIEW_REQUIRED");
+    const binding = await this.providerBinding(input.organizationId);
+    if (input.requestedModel !== undefined && input.requestedModel !== binding.model) {
+      throw new Error("REQUESTED_MODEL_MISMATCH");
+    }
+    return this.config.store.previewInference({
+      ...input,
+      provider: binding.providerName,
+      model: binding.model,
+      estimatedCostAtomic: calculateMaximumCostMicros({
+        inputTokens: input.inputTokens,
+        maxOutputTokens: input.maxOutputTokens,
+      }, binding.price),
+      requestFingerprint: this.requestFingerprint(input, binding),
+      decidedAt: this.now(),
+    });
+  }
 
   async execute(input: ControlledInferenceInput): Promise<AdmissionResult> {
     if (input.reliabilityContext && !issuedReliabilityContexts.has(input.reliabilityContext)) {
