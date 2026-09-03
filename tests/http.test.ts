@@ -1777,6 +1777,11 @@ describe("POST /v1/chat/completions", () => {
     expect(consolePage.text).toContain("/api/v1/product/agents");
     expect(consolePage.text).toContain("/api/v1/product/agent-credentials");
     expect(consolePage.text).toContain("Enable workload-shadow capability");
+    expect(consolePage.text).toContain("Run bounded inference");
+    expect(consolePage.text).toContain("Receipt read back:");
+    expect(consolePage.text).toContain("Resolve a reconciliation hold");
+    expect(consolePage.text).toContain("CONTROL_MODE_PAYMENT_UNEXPECTED");
+    expect(consolePage.text).not.toContain("Run paid inference");
     expect(consolePage.text).toContain("workloadClasses:v.includeWorkload?");
     expect(consolePage.text).not.toContain('name="includeWorkload" type="checkbox" value="yes" checked');
     expect(consolePage.text).toContain('id="createMandate"');
