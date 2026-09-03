@@ -1778,6 +1778,8 @@ describe("POST /v1/chat/completions", () => {
     expect(consolePage.text).toContain("/api/v1/product/agent-credentials");
     expect(consolePage.text).toContain("Enable workload-shadow capability");
     expect(consolePage.text).toContain("Run bounded inference");
+    expect(consolePage.text).toContain("result.className='notice show error'");
+    expect(consolePage.text).toContain("result.scrollIntoView({behavior:'smooth',block:'center'})");
     expect(consolePage.text).toContain("Receipt read back:");
     expect(consolePage.text).toContain("Resolve a reconciliation hold");
     expect(consolePage.text).toContain("CONTROL_MODE_PAYMENT_UNEXPECTED");
