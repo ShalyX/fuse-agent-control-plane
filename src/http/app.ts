@@ -64,6 +64,15 @@ function logInferenceFailure(route: string, requestId: string | undefined, error
   }));
 }
 
+function publicInferenceError(error: unknown): string {
+  const message = error instanceof Error ? error.message : "";
+  if (message === "OPENROUTER_401" || message === "OPENROUTER_403") return "PROVIDER_CREDENTIAL_REJECTED";
+  if (message === "OPENROUTER_429") return "PROVIDER_RATE_LIMITED";
+  if (message === "OPENROUTER_COMPLETION_ERROR") return "PROVIDER_REQUEST_REJECTED";
+  if (/^(OPENROUTER|ANTHROPIC)_/.test(message)) return "PROVIDER_UNAVAILABLE";
+  return "INFERENCE_EXECUTION_UNAVAILABLE";
+}
+
 const agentRegistrationSchema = z.object({
   agentId: z.string().min(1).max(128),
   name: z.string().min(1).max(128),
@@ -1975,7 +1984,9 @@ export function createFuseApp(dependencies: AppDependencies) {
         logInferenceFailure("/api/v1/product/inference", request.header("Idempotency-Key")?.trim(), error);
         if (error instanceof Error && error.message === "AGENT_CREDENTIAL_REQUIRED") { response.status(403).json({ error: { code: error.message } }); return; }
         if (error instanceof Error && error.message === "IDEMPOTENCY_CONFLICT") { response.status(409).json({ error: { code: error.message } }); return; }
-        response.status(503).json({ error: { code: "INFERENCE_EXECUTION_UNAVAILABLE" } });
+        const code = publicInferenceError(error);
+        response.status(code === "PROVIDER_RATE_LIMITED" ? 429 : code.startsWith("PROVIDER_") ? 502 : 503)
+          .json({ error: { code } });
       }
     });
   }
@@ -2333,7 +2344,8 @@ export function createFuseApp(dependencies: AppDependencies) {
       return;
     }
     if (/^(OPENROUTER|ANTHROPIC)_/.test(message)) {
-      response.status(502).json({ error: { code: "PROVIDER_UNAVAILABLE" } });
+      const code = publicInferenceError(error);
+      response.status(code === "PROVIDER_RATE_LIMITED" ? 429 : 502).json({ error: { code } });
       return;
     }
     response.status(500).json({ error: { code: "INTERNAL_ERROR" } });

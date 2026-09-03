@@ -273,6 +273,34 @@ describe("POST /v1/chat/completions", () => {
     expect(paymentAttempts).toBe(0);
   });
 
+  it("returns an actionable code when the provider rejects the tenant credential", async () => {
+    const credentialAuthenticator: CredentialAuthenticator = {
+      authenticateToken: async () => ({
+        principalType: "agent", principalId: "agent-provider-error", organizationId: "org-provider-error",
+        credentialId: "cred-provider-error", capabilities: ["inference:invoke"],
+      }),
+    };
+    const app = createFuseApp({
+      provider: new FakeProvider(),
+      estimateInputTokens: () => 20,
+      credentialAuthenticator,
+      productInferenceService: new ProductInferenceService({
+        execute: async () => { throw new Error("OPENROUTER_401"); },
+      }),
+    } as Parameters<typeof createFuseApp>[0]);
+
+    const response = await request(app)
+      .post("/api/v1/product/inference")
+      .set("Authorization", "Bearer provider-error")
+      .set("Idempotency-Key", "provider-error-1")
+      .set("X-Fuse-Mandate", "mandate-provider-error")
+      .send({ model: "anthropic/claude-sonnet-4.6", max_tokens: 1,
+        messages: [{ role: "user", content: "credential check" }] });
+
+    expect(response.status).toBe(502);
+    expect(response.body).toEqual({ error: { code: "PROVIDER_CREDENTIAL_REJECTED" } });
+  });
+
   it("rejects a policy-denied product request before payment settlement", async () => {
     let paymentAttempts = 0;
     let executionCalls = 0;
@@ -1765,12 +1793,14 @@ describe("POST /v1/chat/completions", () => {
     expect(consolePage.text).toContain("Branch containment");
     expect(consolePage.text).toContain('id="readinessStrip"');
     expect(consolePage.text).toContain("Provider boundary");
-    expect(consolePage.text).toContain("Your credential stays in this tab and is cleared on reload.");
+    expect(consolePage.text).toContain("Your session is scoped to this tab and clears when you sign out or close it.");
     expect(consolePage.text).toContain('name="inviteToken"');
     expect(consolePage.text).toContain("'X-Fuse-Invite':inviteToken");
     expect(consolePage.text).toContain('value="openrouter" selected');
     expect(consolePage.text).not.toContain('value="anthropic"');
-    expect(consolePage.text).not.toContain("sessionStorage");
+    expect(consolePage.text).toContain("sessionStorage");
+    expect(consolePage.text).toContain("ensureQuickInference");
+    expect(consolePage.text).toContain("restoreStoredSession");
     expect(consolePage.text).toContain("/api/v1/product/provider-connections");
     expect(consolePage.text).toContain("/api/v1/product/mandates");
     expect(consolePage.text).toContain("/api/v1/product/policies");
