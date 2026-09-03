@@ -1811,6 +1811,11 @@ describe("POST /v1/chat/completions", () => {
     expect(consolePage.text).toContain("result.className='notice show error'");
     expect(consolePage.text).toContain("result.scrollIntoView({behavior:'smooth',block:'center'})");
     expect(consolePage.text).toContain("Receipt read back:");
+    expect(consolePage.text).toContain("Save these one-time credentials before leaving this tab.");
+    expect(consolePage.text).toContain("onboardingServiceCredential");
+    expect(consolePage.text).toContain("onboardingAgentCredential");
+    expect(consolePage.text).toContain("onboardingRecoveryCode");
+    expect(consolePage.text).not.toContain("fuse_agent_…");
     expect(consolePage.text).toContain("Resolve a reconciliation hold");
     expect(consolePage.text).toContain("CONTROL_MODE_PAYMENT_UNEXPECTED");
     expect(consolePage.text).not.toContain("Run paid inference");
