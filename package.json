@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "main": "api/index.ts",
+  "main": "server.ts",
   "types": "dist/src/product/index.d.ts",
   "exports": {
     ".": "./api/index.ts",
