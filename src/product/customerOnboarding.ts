@@ -140,6 +140,7 @@ export interface CustomerOnboardingPort {
   createWorkspace(input: CreateWorkspaceInput): Promise<CustomerWorkspaceResult>;
   recoverWorkspaceCredential(input: { workspaceId: string; recoveryCode: string; idempotencyKey: string }): Promise<WorkspaceCredentialRecoveryResult>;
   issueReplacementCredentials?(principal: AdministrativePrincipal, workspaceId: string): Promise<WorkspaceCredentialPackage>;
+  issueReplacementCredentialsFromBetaRecovery?(): Promise<WorkspaceCredentialPackage>;
 }
 
 export class CustomerOnboardingService {
@@ -406,6 +407,29 @@ export class CustomerOnboardingService {
       agentCredential,
       recoveryCode,
     };
+  }
+
+  async issueReplacementCredentialsFromBetaRecovery(): Promise<WorkspaceCredentialPackage> {
+    const onboardingStore = this.dependencies.onboardingStore;
+    if (!onboardingStore?.listCompletedWorkspaceIds) throw new Error("CREDENTIAL_RECOVERY_UNAVAILABLE");
+    const workspaceIds = await onboardingStore.listCompletedWorkspaceIds();
+    if (workspaceIds.length === 0) throw new Error("WORKSPACE_NOT_FOUND");
+    if (workspaceIds.length !== 1) throw new Error("WORKSPACE_RECOVERY_AMBIGUOUS");
+    const metadata = onboardingStore.getWorkspaceCredentialMetadata
+      ? await onboardingStore.getWorkspaceCredentialMetadata(workspaceIds[0])
+      : null;
+    if (!metadata) throw new Error("WORKSPACE_NOT_FOUND");
+    return this.issueReplacementCredentials({
+      principalType: "service_account",
+      principalId: metadata.serviceAccountId,
+      organizationId: metadata.workspaceId,
+      credentialId: metadata.serviceCredentialId,
+      capabilities: [
+        ...adminCapabilities,
+        "providers:read", "policies:read", "mandates:read", "receipts:read", "sandbox:run",
+      ],
+      role: "admin",
+    }, metadata.workspaceId);
   }
 
   private validate(input: CreateWorkspaceInput): void {

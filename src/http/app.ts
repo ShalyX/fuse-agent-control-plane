@@ -282,6 +282,7 @@ type AppDependencies = {
     maxActiveWorkspaces: number;
     reserveCapacity: (idempotencyKey: string) => Promise<boolean>;
     authorizeInvite: (inviteToken: string, idempotencyKey: string) => Promise<boolean>;
+    authorizeRecoveryInvite?: (inviteToken: string, idempotencyKey: string) => Promise<boolean>;
   };
   productRateLimit?: {
     maxPerMinute: number;
@@ -692,6 +693,45 @@ export function createFuseApp(dependencies: AppDependencies) {
           }
         },
       );
+    }
+    const betaGuard = dependencies.betaOnboardingGuard;
+    const authorizeRecoveryInvite = betaGuard?.authorizeRecoveryInvite;
+    if (authorizeRecoveryInvite && onboardingService.issueReplacementCredentialsFromBetaRecovery) {
+      app.post("/api/v1/product/workspace-recovery", async (request, response) => {
+        disableCaching(response);
+        const idempotencyKey = request.header("Idempotency-Key")?.trim();
+        const inviteToken = request.header("X-Fuse-Invite")?.trim();
+        if (!idempotencyKey || !/^[A-Za-z0-9._:-]{8,128}$/.test(idempotencyKey)) {
+          response.status(400).json({ error: { code: "IDEMPOTENCY_KEY_INVALID" } });
+          return;
+        }
+        if (!inviteToken) {
+          response.status(403).json({ error: { code: "BETA_INVITE_REQUIRED" } });
+          return;
+        }
+        const authorized = await authorizeRecoveryInvite(inviteToken, idempotencyKey);
+        if (!authorized) {
+          response.status(403).json({ error: { code: "BETA_INVITE_INVALID" } });
+          return;
+        }
+        try {
+          const result = await onboardingService.issueReplacementCredentialsFromBetaRecovery!();
+          if (!await auditOrUnavailable(response, {
+            eventType: "credentials.beta_recovery_issued",
+            scopeId: result.workspaceId,
+            outcome: "completed",
+            metadata: {},
+          })) return;
+          response.status(200).json(result);
+        } catch (error) {
+          const code = error instanceof Error ? error.message : "CREDENTIAL_RECOVERY_FAILED";
+          const status = code === "WORKSPACE_NOT_FOUND" ? 404
+            : code === "WORKSPACE_RECOVERY_AMBIGUOUS" ? 409
+            : code === "CREDENTIAL_RECOVERY_UNAVAILABLE" ? 503
+            : 503;
+          response.status(status).json({ error: { code } });
+        }
+      });
     }
   }
 

@@ -220,6 +220,11 @@ export function createRuntimeApp(env: NodeJS.ProcessEnv = process.env) {
   if ([...betaInviteTokenHashes].some((value) => !/^[a-f0-9]{64}$/.test(value))) {
     throw new Error("FUSE_BETA_INVITE_TOKEN_HASHES_INVALID");
   }
+  const betaRecoveryTokenHashes = new Set((env["FUSE_BETA_RECOVERY_TOKEN_HASHES"] ?? "")
+    .split(",").map((value) => value.trim().toLowerCase()).filter(Boolean));
+  if ([...betaRecoveryTokenHashes].some((value) => !/^[a-f0-9]{64}$/.test(value))) {
+    throw new Error("FUSE_BETA_RECOVERY_TOKEN_HASHES_INVALID");
+  }
 
   const providerConnectionService = providerAdministration
     ? new ProviderConnectionService(providerAdministration)
@@ -299,6 +304,9 @@ export function createRuntimeApp(env: NodeJS.ProcessEnv = process.env) {
           }),
           authorizeInvite: (inviteToken, idempotencyKey) => workspaceOnboardingStore.consumeInvite({
             inviteToken, idempotencyKey, allowedInviteHashes: betaInviteTokenHashes,
+          }),
+          authorizeRecoveryInvite: (inviteToken, idempotencyKey) => workspaceOnboardingStore.consumeInvite({
+            inviteToken, idempotencyKey, allowedInviteHashes: betaRecoveryTokenHashes,
           }),
         }
       : undefined,
