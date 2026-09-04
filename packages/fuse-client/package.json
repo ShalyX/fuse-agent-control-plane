@@ -1,7 +1,17 @@
 {
   "name": "@fuse/fuse-client",
   "version": "0.1.0",
-  "private": true,
+  "private": false,
+  "description": "Typed TypeScript client for the Fuse bounded-inference control plane.",
+  "files": ["dist", "README.md"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ShalyX/fuse-agent-control-plane.git",
+    "directory": "packages/fuse-client"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -12,7 +22,8 @@
     }
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json"
+    "build": "tsc -p tsconfig.json",
+    "prepublishOnly": "npm run build"
   },
   "engines": {
     "node": ">=22"

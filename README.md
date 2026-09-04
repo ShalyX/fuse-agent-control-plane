@@ -179,6 +179,7 @@ node --env-file=.env --import tsx scripts/golden-run.ts
 ## Submission assets
 
 - [Production roadmap](docs/production-roadmap.md)
+- [OpenRouter integration quickstart](docs/integration-quickstart.md)
 - [Pitch deck source](docs/pitch-deck.md)
 - [Three-minute demo script](docs/demo-script.md)
 - [Encode / Arc submission copy](docs/submission.md)
