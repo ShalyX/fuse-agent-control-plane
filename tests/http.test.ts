@@ -1483,6 +1483,47 @@ describe("POST /v1/chat/completions", () => {
     expect(JSON.stringify(response.body)).not.toContain("provider-secret");
   });
 
+  it("restores the product setup context from an authenticated workspace session", async () => {
+    const principal = {
+      principalType: "service_account" as const,
+      principalId: "service-customer",
+      organizationId: "workspace-customer",
+      credentialId: "credential-customer-service",
+      capabilities: [...API_CAPABILITIES],
+      role: "admin" as const,
+    };
+    const app = createFuseApp({
+      provider: new FakeProvider(), paymentGuard: fakePaymentGuard, estimateInputTokens: () => 1,
+      credentialAuthenticator: { authenticateToken: async (token: string) => token === "admin-token" ? principal : null },
+      customerOnboardingService: {
+        createWorkspace: async () => { throw new Error("unused"); },
+        recoverWorkspaceCredential: async () => { throw new Error("unused"); },
+        getWorkspaceSetupMetadata: async () => ({
+          workspaceId: "workspace-customer", serviceAccountId: "service-customer",
+          serviceCredentialId: "credential-customer-service", agentId: "agent-customer",
+          agentCredentialId: "credential-customer-agent", expiresAt: null,
+          policyId: "policy-customer", mandateId: "mandate-customer", providerConfigId: "provider-customer",
+        }),
+      },
+      providerConnectionService: {
+        connect: async () => { throw new Error("unused"); },
+        list: async () => [{
+          id: "provider-customer", organizationId: "workspace-customer", provider: "openrouter" as const,
+          model: "anthropic/claude-sonnet-4.6", inputUsdPerMillion: "3.00", outputUsdPerMillion: "15.00",
+          credentialVersion: 1, status: "active" as const, updatedAt: "2026-09-04T00:00:00.000Z",
+        }],
+      },
+    });
+    const response = await request(app).get("/api/v1/product/workspace-context")
+      .set("Authorization", "Bearer admin-token");
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({
+      workspaceId: "workspace-customer", agentId: "agent-customer", policyId: "policy-customer",
+      mandateId: "mandate-customer", providerConfigId: "provider-customer",
+      provider: "openrouter", model: "anthropic/claude-sonnet-4.6",
+    });
+  });
+
   it("revokes the current human session through the HTTP boundary", async () => {
     const sessions = new MemoryHumanSessionStore();
     const sourceAuthenticator = {

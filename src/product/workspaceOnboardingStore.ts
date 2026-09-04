@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { Pool } from "pg";
-import type { CustomerWorkspaceResult, WorkspaceCredentialMetadata, WorkspaceCredentialRecoveryResult, WorkspaceOnboardingStore, WorkspaceRecoveryRecord } from "./customerOnboarding.js";
+import type { CustomerWorkspaceResult, WorkspaceCredentialMetadata, WorkspaceCredentialRecoveryResult, WorkspaceOnboardingStore, WorkspaceRecoveryRecord, WorkspaceSetupMetadata } from "./customerOnboarding.js";
 import { openSecretDelivery, sealSecretDelivery } from "./secretDelivery.js";
 import type { ProviderCredentialKeyRing } from "../providers/providerCredentials.js";
 
@@ -461,6 +461,33 @@ export class PostgresWorkspaceOnboardingStore implements WorkspaceOnboardingStor
     };
   }
 
+  async getWorkspaceSetupMetadata(workspaceId: string): Promise<WorkspaceSetupMetadata | null> {
+    await this.ensureSchema();
+    const result = await this.pool.query<{
+      identifiers: Record<string, string>;
+      result_json: CustomerWorkspaceResult | null;
+    }>(
+      `SELECT identifiers, result_json
+         FROM fuse_workspace_onboarding_operations
+        WHERE identifiers->>'workspaceId' = $1 AND status = 'completed'
+        LIMIT 1`,
+      [workspaceId],
+    );
+    const row = result.rows[0];
+    if (!row) return null;
+    return {
+      workspaceId,
+      serviceAccountId: row.identifiers.serviceAccountId,
+      serviceCredentialId: row.identifiers.serviceCredentialId,
+      agentId: row.identifiers.agentId,
+      agentCredentialId: row.identifiers.agentCredentialId,
+      expiresAt: row.result_json?.credential?.expiresAt ?? null,
+      policyId: row.identifiers.policyId,
+      mandateId: row.identifiers.mandateId,
+      providerConfigId: row.identifiers.providerConfigId,
+    };
+  }
+
   async rotateRecoveryCode(workspaceId: string, recoveryCodeHash: string, now?: Date): Promise<boolean> {
     await this.ensureSchema();
     const result = await this.pool.query(
@@ -740,6 +767,24 @@ export class MemoryWorkspaceOnboardingStore implements WorkspaceOnboardingStore 
         agentId: entry.identifiers.agentId,
         agentCredentialId: entry.identifiers.agentCredentialId,
         expiresAt: entry.result?.credential.expiresAt ?? null,
+      };
+    }
+    return null;
+  }
+
+  async getWorkspaceSetupMetadata(workspaceId: string): Promise<WorkspaceSetupMetadata | null> {
+    for (const entry of this.entries.values()) {
+      if (entry.status !== "completed" || entry.identifiers.workspaceId !== workspaceId) continue;
+      return {
+        workspaceId,
+        serviceAccountId: entry.identifiers.serviceAccountId,
+        serviceCredentialId: entry.identifiers.serviceCredentialId,
+        agentId: entry.identifiers.agentId,
+        agentCredentialId: entry.identifiers.agentCredentialId,
+        expiresAt: entry.result?.credential.expiresAt ?? null,
+        policyId: entry.identifiers.policyId,
+        mandateId: entry.identifiers.mandateId,
+        providerConfigId: entry.identifiers.providerConfigId,
       };
     }
     return null;

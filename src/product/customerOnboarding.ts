@@ -46,6 +46,12 @@ export type WorkspaceCredentialMetadata = {
   expiresAt: string | null;
 };
 
+export type WorkspaceSetupMetadata = WorkspaceCredentialMetadata & {
+  policyId: string;
+  mandateId: string;
+  providerConfigId: string;
+};
+
 export interface WorkspaceOnboardingStore {
   tryReserveCapacity(input: {
     idempotencyKey: string;
@@ -72,6 +78,7 @@ export interface WorkspaceOnboardingStore {
   recordRollbackFailure?(idempotencyKey: string, workspaceId: string, code: string): Promise<void>;
   getRecovery(workspaceId: string, recoveryCodeHash: string, deliveryId: string): Promise<WorkspaceRecoveryRecord | null>;
   getWorkspaceCredentialMetadata?(workspaceId: string): Promise<WorkspaceCredentialMetadata | null>;
+  getWorkspaceSetupMetadata?(workspaceId: string): Promise<WorkspaceSetupMetadata | null>;
   rotateRecoveryCode?(workspaceId: string, recoveryCodeHash: string, now?: Date): Promise<boolean>;
   sealRecoveryResult?(result: WorkspaceCredentialRecoveryResult, recoveryCodeHash: string, deliveryId: string): string;
   listCompletedWorkspaceIds(): Promise<string[]>;
@@ -139,6 +146,7 @@ export interface WorkspaceCredentialPackage {
 export interface CustomerOnboardingPort {
   createWorkspace(input: CreateWorkspaceInput): Promise<CustomerWorkspaceResult>;
   recoverWorkspaceCredential(input: { workspaceId: string; recoveryCode: string; idempotencyKey: string }): Promise<WorkspaceCredentialRecoveryResult>;
+  getWorkspaceSetupMetadata?(workspaceId: string): Promise<WorkspaceSetupMetadata | null>;
   issueReplacementCredentials?(principal: AdministrativePrincipal, workspaceId: string): Promise<WorkspaceCredentialPackage>;
   issueReplacementCredentialsFromBetaRecovery?(): Promise<WorkspaceCredentialPackage>;
 }
@@ -365,6 +373,11 @@ export class CustomerOnboardingService {
       occurredAt,
     });
     return result;
+  }
+
+  async getWorkspaceSetupMetadata(workspaceId: string): Promise<WorkspaceSetupMetadata | null> {
+    if (!/^[A-Za-z0-9._:-]{8,128}$/.test(workspaceId)) throw new Error("WORKSPACE_ID_INVALID");
+    return this.dependencies.onboardingStore?.getWorkspaceSetupMetadata?.(workspaceId) ?? null;
   }
 
   async issueReplacementCredentials(principal: AdministrativePrincipal, workspaceId: string): Promise<WorkspaceCredentialPackage> {

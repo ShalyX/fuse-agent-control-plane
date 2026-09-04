@@ -1054,6 +1054,40 @@ export function createFuseApp(dependencies: AppDependencies) {
     );
   }
 
+  if (dependencies.customerOnboardingService?.getWorkspaceSetupMetadata
+    && dependencies.providerConnectionService && dependencies.credentialAuthenticator) {
+    const customerOnboardingService = dependencies.customerOnboardingService;
+    const providerConnectionService = dependencies.providerConnectionService;
+    app.get(
+      "/api/v1/product/workspace-context",
+      createCapabilityGuard(dependencies.credentialAuthenticator, "mandates:read"),
+      async (_request, response) => {
+        disableCaching(response);
+        try {
+          const principal = response.locals.fusePrincipal as AdministrativePrincipal;
+          const setup = await customerOnboardingService.getWorkspaceSetupMetadata!(principal.organizationId);
+          if (!setup) {
+            response.status(404).json({ error: { code: "WORKSPACE_SETUP_NOT_FOUND" } });
+            return;
+          }
+          const providers = await providerConnectionService.list(principal);
+          const provider = providers.find((item) => item.id === setup.providerConfigId) ?? providers[0] ?? null;
+          response.json({
+            workspaceId: setup.workspaceId,
+            agentId: setup.agentId,
+            policyId: setup.policyId,
+            mandateId: setup.mandateId,
+            providerConfigId: setup.providerConfigId,
+            provider: provider?.provider ?? null,
+            model: provider?.model ?? null,
+          });
+        } catch {
+          response.status(503).json({ error: { code: "WORKSPACE_CONTEXT_UNAVAILABLE" } });
+        }
+      },
+    );
+  }
+
   if (dependencies.credentialAuthenticator && dependencies.agentIdentityService) {
     app.post("/api/v1/product/agents", createCapabilityGuard(dependencies.credentialAuthenticator, "agents:write"), async (request, response) => {
       disableCaching(response);
