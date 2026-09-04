@@ -70,6 +70,18 @@ export interface AgentIdentity {
   revokedAt: string | null;
 }
 
+export interface AgentCredentialSummary {
+  id: string;
+  organizationId: string;
+  agentId: string;
+  name: string;
+  tokenPrefix: string;
+  capabilities: ApiCapability[];
+  createdAt: string;
+  expiresAt: string | null;
+  revokedAt: string | null;
+}
+
 export class IdentityStore {
   private schemaReady: Promise<void> | null = null;
 
@@ -830,6 +842,69 @@ export class IdentityStore {
       createdAt: row.created_at.toISOString(),
       revokedAt: row.revoked_at?.toISOString() ?? null,
     } : null;
+  }
+
+  async listAgentDirectory(organizationId: string): Promise<{
+    agents: AgentIdentity[];
+    credentials: AgentCredentialSummary[];
+  }> {
+    if (!organizationId.trim()) throw new Error("ORGANIZATION_ID_REQUIRED");
+    await this.ensureSchema();
+    const [agentsResult, credentialsResult] = await Promise.all([
+      this.pool.query<{
+        id: string;
+        organization_id: string;
+        name: string;
+        status: "active" | "revoked";
+        created_at: Date;
+        revoked_at: Date | null;
+      }>(
+        `SELECT id, organization_id, name, status, created_at, revoked_at
+           FROM agent_identities
+          WHERE organization_id = $1
+          ORDER BY created_at DESC, id DESC`,
+        [organizationId],
+      ),
+      this.pool.query<{
+        id: string;
+        organization_id: string;
+        agent_id: string;
+        name: string;
+        token_prefix: string;
+        capabilities: ApiCapability[];
+        created_at: Date;
+        expires_at: Date | null;
+        revoked_at: Date | null;
+      }>(
+        `SELECT id, organization_id, agent_id, name, token_prefix, capabilities,
+                created_at, expires_at, revoked_at
+           FROM api_credentials
+          WHERE organization_id = $1
+          ORDER BY created_at DESC, id DESC`,
+        [organizationId],
+      ),
+    ]);
+    return {
+      agents: agentsResult.rows.map((row) => ({
+        id: row.id,
+        organizationId: row.organization_id,
+        name: row.name,
+        status: row.status,
+        createdAt: new Date(row.created_at).toISOString(),
+        revokedAt: row.revoked_at?.toISOString() ?? null,
+      })),
+      credentials: credentialsResult.rows.map((row) => ({
+        id: row.id,
+        organizationId: row.organization_id,
+        agentId: row.agent_id,
+        name: row.name,
+        tokenPrefix: row.token_prefix,
+        capabilities: row.capabilities,
+        createdAt: new Date(row.created_at).toISOString(),
+        expiresAt: row.expires_at?.toISOString() ?? null,
+        revokedAt: row.revoked_at?.toISOString() ?? null,
+      })),
+    };
   }
 
   private async transaction<T>(operation: (client: PoolClient) => Promise<T>): Promise<T> {

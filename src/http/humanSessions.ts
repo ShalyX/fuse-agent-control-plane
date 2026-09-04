@@ -37,6 +37,17 @@ export interface ResolvedHumanSession {
   expiresAt: string;
 }
 
+export interface HumanSessionSummary {
+  sessionId: string;
+  workspaceId: string;
+  userId: string;
+  sourceCredentialId: string;
+  role: HumanSessionRole;
+  createdAt: string;
+  expiresAt: string;
+  revokedAt: string | null;
+}
+
 function hashToken(token: string): string {
   return createHash("sha256").update(token, "utf8").digest("hex");
 }
@@ -88,6 +99,7 @@ export interface HumanSessionStore {
   put(record: HumanSessionRecord): Promise<void>;
   resolve(token: string, now: string): Promise<ResolvedHumanSession | null>;
   resolveForWorkspace(token: string, workspaceId: string, now: string): Promise<ResolvedHumanSession | null>;
+  listByWorkspace?(workspaceId: string, now: string): Promise<HumanSessionSummary[]>;
   revoke(token: string, revokedAt: string): Promise<void>;
   revokeById?(sessionId: string, workspaceId: string, revokedAt: string): Promise<boolean>;
 }
@@ -119,6 +131,22 @@ export class MemoryHumanSessionStore implements HumanSessionStore {
   async resolveForWorkspace(token: string, workspaceId: string, now: string): Promise<ResolvedHumanSession | null> {
     const session = await this.resolve(token, now);
     return session?.workspaceId === workspaceId ? session : null;
+  }
+
+  async listByWorkspace(workspaceId: string, _now: string): Promise<HumanSessionSummary[]> {
+    return [...this.records.values()]
+      .filter((record) => record.workspaceId === workspaceId)
+      .sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt))
+      .map((record) => ({
+        sessionId: record.id,
+        workspaceId: record.workspaceId,
+        userId: record.userId,
+        sourceCredentialId: record.sourceCredentialId,
+        role: record.role,
+        createdAt: record.createdAt,
+        expiresAt: record.expiresAt,
+        revokedAt: record.revokedAt,
+      }));
   }
 
   async revoke(token: string, revokedAt: string): Promise<void> {
@@ -258,6 +286,37 @@ export class PostgresHumanSessionStore implements HumanSessionStore {
   async resolveForWorkspace(token: string, workspaceId: string, now: string): Promise<ResolvedHumanSession | null> {
     const session = await this.resolve(token, now);
     return session?.workspaceId === workspaceId ? session : null;
+  }
+
+  async listByWorkspace(workspaceId: string, _now: string): Promise<HumanSessionSummary[]> {
+    await this.ensureSchema();
+    const result = await this.pool.query<{
+      id: string;
+      workspace_id: string;
+      user_id: string;
+      source_credential_id: string;
+      role: HumanSessionRole;
+      created_at: Date;
+      expires_at: Date;
+      revoked_at: Date | null;
+    }>(
+      `SELECT id, workspace_id, user_id, source_credential_id, role,
+              created_at, expires_at, revoked_at
+         FROM human_sessions
+        WHERE workspace_id = $1
+        ORDER BY created_at DESC, id DESC`,
+      [workspaceId],
+    );
+    return result.rows.map((record) => ({
+      sessionId: record.id,
+      workspaceId: record.workspace_id,
+      userId: record.user_id,
+      sourceCredentialId: record.source_credential_id,
+      role: record.role,
+      createdAt: new Date(record.created_at).toISOString(),
+      expiresAt: new Date(record.expires_at).toISOString(),
+      revokedAt: record.revoked_at ? new Date(record.revoked_at).toISOString() : null,
+    }));
   }
 
   async revoke(token: string, revokedAt: string): Promise<void> {

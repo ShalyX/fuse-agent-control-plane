@@ -254,6 +254,7 @@ export function createRuntimeApp(env: NodeJS.ProcessEnv = process.env) {
 
     credentialAuthenticator,
     humanSessionStore,
+    identityStore,
     credentialAdministration,
     agentIdentityService: credentialAdministration
       ? new AgentIdentityService(credentialAdministration)

@@ -11,6 +11,17 @@ describe("operator console beta paths", () => {
     expect(html).toContain("Copy quickstart");
   });
 
+  it("exposes the team-ready access and agent directory surfaces", () => {
+    const html = renderOperatorConsole();
+    expect(html).toContain('data-view="access"');
+    expect(html).toContain("Access &amp; sessions");
+    expect(html).toContain("/api/v1/admin/sessions");
+    expect(html).toContain("/api/v1/admin/agent-directory");
+    expect(html).toContain("Issue replacement access");
+    expect(html).toContain("Current operator");
+    expect(html).toContain("Agent directory");
+  });
+
   it("initializes DOM helpers before the session boot code uses them", () => {
     const html = renderOperatorConsole();
     const script = html.split("<script>")[1]?.split("</script>")[0] ?? "";

@@ -92,4 +92,29 @@ describe("human workspace sessions", () => {
     await expect(store.revokeById(session.record.id, "workspace-1", "2026-08-14T00:30:00.000Z")).resolves.toBe(true);
     await expect(store.resolve(session.token, "2026-08-14T00:45:00.000Z")).resolves.toBeNull();
   });
+
+  it("lists only sessions belonging to the requested workspace without token material", async () => {
+    const store = new MemoryHumanSessionStore();
+    const first = createHumanSession({
+      workspaceId: "workspace-1", userId: "user-1", sourceCredentialId: "credential-source", role: "owner",
+      createdAt: "2026-08-14T00:00:00.000Z", expiresAt: "2026-08-14T01:00:00.000Z",
+    }, () => Buffer.alloc(32, 11));
+    const second = createHumanSession({
+      workspaceId: "workspace-2", userId: "user-2", sourceCredentialId: "credential-other", role: "member",
+      createdAt: "2026-08-14T00:05:00.000Z", expiresAt: "2026-08-14T01:00:00.000Z",
+    }, () => Buffer.alloc(32, 12));
+    await store.put(first.record);
+    await store.put(second.record);
+
+    await expect(store.listByWorkspace("workspace-1", "2026-08-14T00:30:00.000Z")).resolves.toEqual([{
+      sessionId: first.record.id,
+      workspaceId: "workspace-1",
+      userId: "user-1",
+      sourceCredentialId: "credential-source",
+      role: "owner",
+      createdAt: first.record.createdAt,
+      expiresAt: first.record.expiresAt,
+      revokedAt: null,
+    }]);
+  });
 });

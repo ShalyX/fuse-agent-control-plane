@@ -1609,6 +1609,17 @@ describe("POST /v1/chat/completions", () => {
     const body = { userId: "user-1", expiresAt: new Date(Date.now() + 60_000).toISOString() };
     const first = await request(app).post("/api/v1/session").set("Authorization", "Bearer service-token").send(body);
     expect(first.status).toBe(201);
+    const listed = await request(app).get("/api/v1/admin/sessions")
+      .set("Authorization", "Bearer service-token");
+    expect(listed.status).toBe(200);
+    expect(listed.body.sessions).toHaveLength(1);
+    expect(listed.body.sessions[0]).toMatchObject({
+      sessionId: first.body.sessionId,
+      workspaceId: "org-session",
+      userId: "service-1",
+      role: "owner",
+    });
+    expect(JSON.stringify(listed.body)).not.toContain("fuse_hs_");
     const second = await request(app).post("/api/v1/session").set("Authorization", "Bearer service-token").send(body);
     expect(second.status).toBe(429);
     expect(second.body).toEqual({ error: { code: "RATE_LIMIT_EXCEEDED" } });

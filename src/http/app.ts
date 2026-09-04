@@ -9,6 +9,7 @@ import { renderLandingPage } from "./landing.js";
 import { createAuthenticationGuard, createCapabilityGuard, type CredentialAuthenticator } from "./auth.js";
 import { createHumanSession, type HumanSessionStore } from "./humanSessions.js";
 import type { AdministrativePrincipal, CredentialAdministrationPort } from "../identity/credentialAdministration.js";
+import type { IdentityStore } from "../persistence/identityStore.js";
 import { API_CAPABILITIES } from "../identity/apiCredentials.js";
 import type { PolicyAdministrationPort } from "../policy/policyAdministration.js";
 import type { ProviderAdministrationPort } from "../providers/providerAdministration.js";
@@ -228,6 +229,7 @@ type AppDependencies = {
   stateStore?: ServiceStateStore;
   credentialAuthenticator?: CredentialAuthenticator;
   humanSessionStore?: HumanSessionStore;
+  identityStore?: IdentityStore;
   credentialAdministration?: CredentialAdministrationPort;
   agentIdentityService?: AgentIdentityService;
   policyAdministration?: PolicyAdministrationPort;
@@ -827,6 +829,31 @@ export function createFuseApp(dependencies: AppDependencies) {
           response.status(503).json({ error: { code: "SESSION_UNAVAILABLE" } });
         }
       });
+      app.get(
+        "/api/v1/admin/sessions",
+        createCapabilityGuard(dependencies.credentialAuthenticator, "policies:read"),
+        async (_request, response) => {
+          disableCaching(response);
+          const principal = response.locals.fusePrincipal as { organizationId: string; role?: string };
+          if (principal.role !== "admin") {
+            response.status(403).json({ error: { code: "ADMIN_CAPABILITY_REQUIRED" } });
+            return;
+          }
+          try {
+            if (!dependencies.humanSessionStore!.listByWorkspace) {
+              response.status(503).json({ error: { code: "SESSION_LIST_UNAVAILABLE" } });
+              return;
+            }
+            const sessions = await dependencies.humanSessionStore!.listByWorkspace(
+              principal.organizationId,
+              new Date().toISOString(),
+            );
+            response.json({ sessions });
+          } catch {
+            response.status(503).json({ error: { code: "SESSION_UNAVAILABLE" } });
+          }
+        },
+      );
       app.delete("/api/v1/session", async (request, response) => {
         disableCaching(response);
         const authorization = request.header("Authorization");
@@ -1114,6 +1141,24 @@ export function createFuseApp(dependencies: AppDependencies) {
   }
 
   if (dependencies.credentialAuthenticator && dependencies.credentialAdministration) {
+    if (dependencies.identityStore) {
+      app.get(
+        "/api/v1/admin/agent-directory",
+        createCapabilityGuard(dependencies.credentialAuthenticator, "agents:write"),
+        async (_request, response) => {
+          disableCaching(response);
+          try {
+            const principal = response.locals.fusePrincipal as AdministrativePrincipal;
+            const directory = await dependencies.identityStore!.listAgentDirectory(principal.organizationId);
+            response.json(directory);
+          } catch (error) {
+            const message = error instanceof Error ? error.message : "IDENTITY_ADMINISTRATION_UNAVAILABLE";
+            response.status(message === "ORGANIZATION_ID_REQUIRED" ? 400 : 503)
+              .json({ error: { code: message } });
+          }
+        },
+      );
+    }
     app.post(
       "/api/v1/admin/agents",
       createCapabilityGuard(dependencies.credentialAuthenticator, "agents:write"),
