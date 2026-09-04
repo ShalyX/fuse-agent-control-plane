@@ -37,6 +37,15 @@ export type WorkspaceRecoveryRecord = {
   expiresAt: string | null;
 } | { deliveryResult: WorkspaceCredentialRecoveryResult };
 
+export type WorkspaceCredentialMetadata = {
+  workspaceId: string;
+  serviceAccountId: string;
+  serviceCredentialId: string;
+  agentId: string;
+  agentCredentialId: string;
+  expiresAt: string | null;
+};
+
 export interface WorkspaceOnboardingStore {
   tryReserveCapacity(input: {
     idempotencyKey: string;
@@ -62,13 +71,16 @@ export interface WorkspaceOnboardingStore {
   rollback(idempotencyKey: string, workspaceId: string, code: string): Promise<void>;
   recordRollbackFailure?(idempotencyKey: string, workspaceId: string, code: string): Promise<void>;
   getRecovery(workspaceId: string, recoveryCodeHash: string, deliveryId: string): Promise<WorkspaceRecoveryRecord | null>;
+  getWorkspaceCredentialMetadata?(workspaceId: string): Promise<WorkspaceCredentialMetadata | null>;
+  rotateRecoveryCode?(workspaceId: string, recoveryCodeHash: string, now?: Date): Promise<boolean>;
   sealRecoveryResult?(result: WorkspaceCredentialRecoveryResult, recoveryCodeHash: string, deliveryId: string): string;
   listCompletedWorkspaceIds(): Promise<string[]>;
 }
 
 export interface CustomerOnboardingDependencies {
   identityStore: Pick<IdentityStore, "bootstrapServiceAccount" | "rotateAgentCredentialWithRecovery">;
-  credentialAdministration: Pick<CredentialAdministrationPort, "registerAgent" | "issueAgentCredential" | "revokeAgentCredential">;
+  credentialAdministration: Pick<CredentialAdministrationPort, "registerAgent" | "issueAgentCredential" | "revokeAgentCredential">
+    & Partial<Pick<CredentialAdministrationPort, "issueServiceAccountCredential">>;
   providerConnectionService: Pick<ProviderConnectionService, "connect">;
   policyPublishingService: Pick<PolicyPublishingService, "publish">;
   mandateManagementService: Pick<MandateManagementService, "createMandate" | "assignAgent" | "transitionMandate">;
@@ -111,9 +123,23 @@ export interface WorkspaceCredentialRecoveryResult {
   credential: CustomerWorkspaceResult["credential"];
 }
 
+export interface WorkspaceCredentialPackage {
+  workspaceId: string;
+  serviceCredential: {
+    credentialId: string;
+    token: string;
+    tokenPrefix: string;
+    capabilities: ApiCapability[];
+    expiresAt: string | null;
+  };
+  agentCredential: CustomerWorkspaceResult["credential"];
+  recoveryCode: string;
+}
+
 export interface CustomerOnboardingPort {
   createWorkspace(input: CreateWorkspaceInput): Promise<CustomerWorkspaceResult>;
   recoverWorkspaceCredential(input: { workspaceId: string; recoveryCode: string; idempotencyKey: string }): Promise<WorkspaceCredentialRecoveryResult>;
+  issueReplacementCredentials?(principal: AdministrativePrincipal, workspaceId: string): Promise<WorkspaceCredentialPackage>;
 }
 
 export class CustomerOnboardingService {
@@ -338,6 +364,48 @@ export class CustomerOnboardingService {
       occurredAt,
     });
     return result;
+  }
+
+  async issueReplacementCredentials(principal: AdministrativePrincipal, workspaceId: string): Promise<WorkspaceCredentialPackage> {
+    if (!/^[A-Za-z0-9._:-]{8,128}$/.test(workspaceId)) throw new Error("WORKSPACE_ID_INVALID");
+    if (principal.organizationId !== workspaceId) throw new Error("WORKSPACE_SCOPE_MISMATCH");
+    const onboardingStore = this.dependencies.onboardingStore;
+    const issueServiceAccountCredential = this.dependencies.credentialAdministration.issueServiceAccountCredential;
+    if (!onboardingStore?.getWorkspaceCredentialMetadata || !onboardingStore.rotateRecoveryCode
+      || !issueServiceAccountCredential) throw new Error("CREDENTIAL_RECOVERY_UNAVAILABLE");
+    const metadata = await onboardingStore.getWorkspaceCredentialMetadata(workspaceId);
+    if (!metadata) throw new Error("WORKSPACE_NOT_FOUND");
+    const occurredAt = this.now();
+    const serviceCredential = await issueServiceAccountCredential(principal, {
+      credentialId: this.ids(),
+      serviceAccountId: metadata.serviceAccountId,
+      name: "Fuse customer administration replacement",
+      capabilities: [
+        ...adminCapabilities,
+        "providers:read", "policies:read", "mandates:read", "receipts:read", "sandbox:run",
+      ],
+      expiresAt: metadata.expiresAt,
+      requestId: `${workspaceId}:service-credential-replacement:${this.ids()}`,
+    });
+    const agentCredential = await this.dependencies.credentialAdministration.issueAgentCredential(principal, {
+      credentialId: this.ids(),
+      agentId: metadata.agentId,
+      name: "Replacement inference credential",
+      capabilities: agentCapabilities,
+      expiresAt: metadata.expiresAt,
+      requestId: `${workspaceId}:agent-credential-replacement:${this.ids()}`,
+    });
+    const recoveryCode = `fuse_rc_${randomBytes(18).toString("base64url")}`;
+    const recoveryCodeHash = createHash("sha256").update(recoveryCode).digest("hex");
+    if (!await onboardingStore.rotateRecoveryCode(workspaceId, recoveryCodeHash, new Date(occurredAt))) {
+      throw new Error("WORKSPACE_NOT_FOUND");
+    }
+    return {
+      workspaceId,
+      serviceCredential,
+      agentCredential,
+      recoveryCode,
+    };
   }
 
   private validate(input: CreateWorkspaceInput): void {

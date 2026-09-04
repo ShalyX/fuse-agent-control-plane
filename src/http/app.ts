@@ -8,7 +8,7 @@ import { renderOperatorConsole } from "./console.js";
 import { renderLandingPage } from "./landing.js";
 import { createAuthenticationGuard, createCapabilityGuard, type CredentialAuthenticator } from "./auth.js";
 import { createHumanSession, type HumanSessionStore } from "./humanSessions.js";
-import type { CredentialAdministrationPort } from "../identity/credentialAdministration.js";
+import type { AdministrativePrincipal, CredentialAdministrationPort } from "../identity/credentialAdministration.js";
 import { API_CAPABILITIES } from "../identity/apiCredentials.js";
 import type { PolicyAdministrationPort } from "../policy/policyAdministration.js";
 import type { ProviderAdministrationPort } from "../providers/providerAdministration.js";
@@ -660,6 +660,39 @@ export function createFuseApp(dependencies: AppDependencies) {
         }
       }
     });
+    const onboardingService = dependencies.customerOnboardingService;
+    if (dependencies.credentialAuthenticator && onboardingService.issueReplacementCredentials) {
+      app.post(
+        "/api/v1/product/workspaces/:workspaceId/credential-package",
+        createCapabilityGuard(dependencies.credentialAuthenticator, "credentials:issue"),
+        async (request, response) => {
+          disableCaching(response);
+          const principal = response.locals.fusePrincipal as AdministrativePrincipal;
+          if (principal.organizationId !== request.params.workspaceId) {
+            response.status(403).json({ error: { code: "WORKSPACE_SCOPE_MISMATCH" } });
+            return;
+          }
+          try {
+            const result = await onboardingService.issueReplacementCredentials!(principal, request.params.workspaceId);
+            if (!await auditOrUnavailable(response, {
+              eventType: "credentials.replacement_issued",
+              scopeId: request.params.workspaceId,
+              outcome: "completed",
+              metadata: {},
+            })) return;
+            response.status(200).json(result);
+          } catch (error) {
+            const code = error instanceof Error ? error.message : "CREDENTIAL_RECOVERY_FAILED";
+            const status = code === "WORKSPACE_NOT_FOUND" ? 404
+              : code === "WORKSPACE_SCOPE_MISMATCH" ? 403
+              : code === "CREDENTIAL_RECOVERY_UNAVAILABLE" ? 503
+              : code.endsWith("_INVALID") ? 400
+              : 503;
+            response.status(status).json({ error: { code } });
+          }
+        },
+      );
+    }
   }
 
   if (dependencies.credentialAuthenticator) {

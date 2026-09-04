@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { Pool } from "pg";
-import type { CustomerWorkspaceResult, WorkspaceCredentialRecoveryResult, WorkspaceOnboardingStore, WorkspaceRecoveryRecord } from "./customerOnboarding.js";
+import type { CustomerWorkspaceResult, WorkspaceCredentialMetadata, WorkspaceCredentialRecoveryResult, WorkspaceOnboardingStore, WorkspaceRecoveryRecord } from "./customerOnboarding.js";
 import { openSecretDelivery, sealSecretDelivery } from "./secretDelivery.js";
 import type { ProviderCredentialKeyRing } from "../providers/providerCredentials.js";
 
@@ -437,6 +437,46 @@ export class PostgresWorkspaceOnboardingStore implements WorkspaceOnboardingStor
     }
   }
 
+  async getWorkspaceCredentialMetadata(workspaceId: string): Promise<WorkspaceCredentialMetadata | null> {
+    await this.ensureSchema();
+    const result = await this.pool.query<{
+      identifiers: Record<string, string>;
+      result_json: CustomerWorkspaceResult | null;
+    }>(
+      `SELECT identifiers, result_json
+         FROM fuse_workspace_onboarding_operations
+        WHERE identifiers->>'workspaceId' = $1 AND status = 'completed'
+        LIMIT 1`,
+      [workspaceId],
+    );
+    const row = result.rows[0];
+    if (!row) return null;
+    return {
+      workspaceId,
+      serviceAccountId: row.identifiers.serviceAccountId,
+      serviceCredentialId: row.identifiers.serviceCredentialId,
+      agentId: row.identifiers.agentId,
+      agentCredentialId: row.identifiers.agentCredentialId,
+      expiresAt: row.result_json?.credential?.expiresAt ?? null,
+    };
+  }
+
+  async rotateRecoveryCode(workspaceId: string, recoveryCodeHash: string, now?: Date): Promise<boolean> {
+    await this.ensureSchema();
+    const result = await this.pool.query(
+      `UPDATE fuse_workspace_onboarding_operations
+          SET recovery_code_hash = $2,
+              recovery_consumed_at = NULL,
+              recovery_consumed_hash = NULL,
+              recovery_delivery_envelope = NULL,
+              recovery_delivery_id = NULL,
+              updated_at = COALESCE($3::timestamptz, CURRENT_TIMESTAMP)
+        WHERE identifiers->>'workspaceId' = $1 AND status = 'completed'`,
+      [workspaceId, recoveryCodeHash, now?.toISOString() ?? null],
+    );
+    return result.rowCount === 1;
+  }
+
   sealRecoveryResult(result: WorkspaceCredentialRecoveryResult, recoveryCodeHash: string, deliveryId: string): string {
     if (!this.deliveryKeyRing) throw new Error("WORKSPACE_DELIVERY_KEY_UNAVAILABLE");
     return sealSecretDelivery(
@@ -688,6 +728,30 @@ export class MemoryWorkspaceOnboardingStore implements WorkspaceOnboardingStore 
       };
     }
     return null;
+  }
+
+  async getWorkspaceCredentialMetadata(workspaceId: string): Promise<WorkspaceCredentialMetadata | null> {
+    for (const entry of this.entries.values()) {
+      if (entry.status !== "completed" || entry.identifiers.workspaceId !== workspaceId) continue;
+      return {
+        workspaceId,
+        serviceAccountId: entry.identifiers.serviceAccountId,
+        serviceCredentialId: entry.identifiers.serviceCredentialId,
+        agentId: entry.identifiers.agentId,
+        agentCredentialId: entry.identifiers.agentCredentialId,
+        expiresAt: entry.result?.credential.expiresAt ?? null,
+      };
+    }
+    return null;
+  }
+
+  async rotateRecoveryCode(workspaceId: string, recoveryCodeHash: string): Promise<boolean> {
+    for (const entry of this.entries.values()) {
+      if (entry.status !== "completed" || entry.identifiers.workspaceId !== workspaceId) continue;
+      entry.recoveryCodeHash = recoveryCodeHash;
+      return true;
+    }
+    return false;
   }
 
   sealRecoveryResult(result: WorkspaceCredentialRecoveryResult, _recoveryCodeHash: string, _recoveryDeliveryId: string): string {
