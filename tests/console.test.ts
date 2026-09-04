@@ -10,4 +10,14 @@ describe("operator console beta paths", () => {
     expect(html).toContain("inferenceWithReceipt");
     expect(html).toContain("Copy quickstart");
   });
+
+  it("initializes DOM helpers before the session boot code uses them", () => {
+    const html = renderOperatorConsole();
+    const script = html.split("<script>")[1]?.split("</script>")[0] ?? "";
+    expect(script.indexOf("const $=")).toBeGreaterThanOrEqual(0);
+    expect(script.indexOf("const sessionAgentField=")).toBeGreaterThanOrEqual(0);
+    expect(script.indexOf("const $=")).toBeLessThan(script.indexOf("const sessionAgentField="));
+    expect(script).toContain("$('#continueSession').onclick");
+    expect(script).toContain("$('#recoverWorkspace').onclick");
+  });
 });

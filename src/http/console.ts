@@ -30,8 +30,8 @@ export function renderOperatorConsole(): string {
 </main><aside class="side"><div class="label">Session</div><div class="record"><strong id="principalName">Not connected</strong><span id="principalOrg">Organization unavailable</span></div><div class="label" style="margin-top:18px">Activity</div><div id="activity" class="events"><div class="empty">Administrative actions will appear here.</div></div></aside></div>
 </div><script>
 const state={token:'',agentToken:'',principal:null,agentId:'',policyId:'',providerConfigId:'',productMandateId:'',model:'',lastInferenceRequestId:'',readiness:null};const runState={receipts:[],selected:null};
-const sessionAgentField=$('#sessionAgentToken');if(sessionAgentField){sessionAgentField.placeholder='fuse_sk_… (required for inference)';sessionAgentField.setAttribute('aria-label','Agent credential (required for inference)')}
 const $=(s)=>document.querySelector(s);const all=(s)=>[...document.querySelectorAll(s)];
+const sessionAgentField=$('#sessionAgentToken');if(sessionAgentField){sessionAgentField.placeholder='fuse_sk_… (required for inference)';sessionAgentField.setAttribute('aria-label','Agent credential (required for inference)')}
 function notice(message,error=false){const node=$('#notice');node.textContent=message;node.className='notice show'+(error?' error':'');setTimeout(()=>node.classList.remove('show'),5000)}
 function activity(title,detail){const box=$('#activity');if(box.querySelector('.empty'))box.innerHTML='';const row=document.createElement('div');row.className='event';const b=document.createElement('b');b.textContent=title;const p=document.createElement('p');p.textContent=detail;row.append(b,p);box.prepend(row)}
  function requestId(prefix){return prefix+'-'+Date.now()+'-'+Math.random().toString(16).slice(2)}
