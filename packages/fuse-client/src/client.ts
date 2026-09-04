@@ -10,10 +10,12 @@ import type {
   FuseHttpMethod,
   FuseInferenceInput,
   FuseInferenceResult,
+  FuseInferenceWithReceiptResult,
   FuseReceipt,
   FuseReceiptPage,
   FuseSandboxRun,
   FuseTransport,
+  FuseWorkspaceContext,
 } from "./types.js";
 
 class FetchTransport implements FuseTransport {
@@ -47,6 +49,10 @@ export class FuseClient {
 
   readiness(): Promise<Record<string, unknown>> {
     return this.transport.request("GET", "/api/v1/product/readiness");
+  }
+
+  workspaceContext(): Promise<FuseWorkspaceContext> {
+    return this.transport.request("GET", "/api/v1/product/workspace-context");
   }
 
   registerAgent(input: FuseAgentRegistrationInput): Promise<FuseAgentRegistrationResult> {
@@ -106,6 +112,12 @@ export class FuseClient {
         ...(input.workloadClass === undefined ? {} : { workload_class: input.workloadClass }),
       },
     });
+  }
+
+  async inferenceWithReceipt(input: FuseInferenceInput): Promise<FuseInferenceWithReceiptResult> {
+    const result = await this.inference(input);
+    const { receipt } = await this.getReceipt(input.mandateId, input.requestId);
+    return { result, receipt };
   }
 }
 

@@ -11,10 +11,12 @@ export type {
   FuseHttpMethod,
   FuseInferenceInput,
   FuseInferenceResult,
+  FuseInferenceWithReceiptResult,
   FuseReceipt,
   FuseReceiptPage,
   FuseSandboxRun,
   FuseTransport,
   FuseWorkspaceCreateInput,
   FuseWorkspaceCreateResult,
+  FuseWorkspaceContext,
 } from "./types.js";

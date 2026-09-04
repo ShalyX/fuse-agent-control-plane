@@ -10,6 +10,52 @@ The package does not contain provider credentials, Circle keys, signer secrets, 
 npm run build
 ```
 
+## OpenRouter integration quickstart
+
+Fuse control mode keeps the provider key in your workspace and gives the runtime a scoped agent credential. Your application uses the `fuse_sk_…` or derived agent credential; it never needs a Fuse wallet or settlement key.
+
+```bash
+npm install @fuse/fuse-client
+```
+
+```ts
+import { createFuseClient } from "@fuse/fuse-client";
+
+const fuse = createFuseClient({
+  baseUrl: process.env.FUSE_BASE_URL ?? "https://fuse-agent-control-plane.vercel.app",
+  credential: process.env.FUSE_AGENT_CREDENTIAL!,
+});
+
+const workspace = await fuse.workspaceContext();
+const requestId = crypto.randomUUID();
+const { result, receipt } = await fuse.inferenceWithReceipt({
+  mandateId: workspace.mandateId,
+  requestId,
+  model: workspace.model!,
+  maxTokens: 256,
+  messages: [{ role: "user", content: "Summarize this task in one sentence." }],
+});
+
+console.log(result.response);
+console.log({
+  requestId: receipt.requestId,
+  status: receipt.executionStatus,
+  reserved: receipt.reservedCostAtomic,
+  actual: receipt.actualCostAtomic,
+});
+```
+
+The helper performs one inference request and then reads the durable receipt. It does not retry an uncertain execution. Keep the `requestId` if you need to inspect the same run later with `fuse.getReceipt(workspace.mandateId, requestId)`.
+
+Required environment variables:
+
+```bash
+FUSE_BASE_URL=https://fuse-agent-control-plane.vercel.app
+FUSE_AGENT_CREDENTIAL=fuse_sk_...
+```
+
+The agent credential needs `inference:invoke`, `mandates:read`, and `receipts:read`. Provider API keys remain configured in the Fuse workspace and are never returned to the client.
+
 ## Usage
 
 ```ts
@@ -25,6 +71,8 @@ console.log(run.scout.circuitState, run.reviewer.status);
 
 const receipt = await fuse.getReceipt("mandate-1", "request-1");
 ```
+
+For a copyable version of this flow, see [`docs/integration-quickstart.md`](../../docs/integration-quickstart.md).
 
 ## Safety
 

@@ -58,6 +58,30 @@ describe("@fuse/fuse-client", () => {
     expect(calls[1]).toMatchObject({ method: "GET", path: "/api/v1/product/receipts/request%2F1", options: { headers: { "X-Fuse-Mandate": "mandate/1" } } });
   });
 
+  it("loads workspace context and reads a receipt after inference", async () => {
+    const calls: string[] = [];
+    const transport: FuseTransport = {
+      async request<T>(method, path) {
+        calls.push(`${method} ${path}`);
+        if (path === "/api/v1/product/workspace-context") {
+          return { workspaceId: "workspace-1", agentId: "agent-1", policyId: "policy-1", mandateId: "mandate-1", providerConfigId: "primary", provider: "openrouter", model: "anthropic/claude-sonnet-4.6" } as T;
+        }
+        if (path === "/api/v1/product/inference") {
+          return { status: "completed", response: { ok: true }, decisionId: "decision-1", reservedCostAtomic: "100", actualCostAtomic: "9" } as T;
+        }
+        return { receipt: { requestId: "request-1", actualCostAtomic: "9" } } as T;
+      },
+    };
+    const fuse = createFuseClient({ baseUrl: "https://fuse.test", credential: "credential", transport });
+    await expect(fuse.workspaceContext()).resolves.toMatchObject({ mandateId: "mandate-1", provider: "openrouter" });
+    await expect(fuse.inferenceWithReceipt({ mandateId: "mandate-1", requestId: "request-1", model: "anthropic/claude-sonnet-4.6", maxTokens: 32, messages: [{ role: "user", content: "hello" }] })).resolves.toMatchObject({ receipt: { requestId: "request-1" } });
+    expect(calls).toEqual([
+      "GET /api/v1/product/workspace-context",
+      "POST /api/v1/product/inference",
+      "GET /api/v1/product/receipts/request-1",
+    ]);
+  });
+
   it("preserves idempotency and workload scope for inference", async () => {
     const { calls, transport } = recorder();
     const fuse = createFuseClient({ baseUrl: "https://fuse.test", credential: "credential", transport });

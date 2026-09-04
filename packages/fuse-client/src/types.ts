@@ -63,6 +63,16 @@ export interface FuseClientOptions {
   transport?: FuseTransport;
 }
 
+export interface FuseWorkspaceContext {
+  workspaceId: string;
+  agentId: string;
+  policyId: string;
+  mandateId: string;
+  providerConfigId: string;
+  provider: "openrouter" | null;
+  model: string | null;
+}
+
 export interface FuseReceipt {
   decisionId: string;
   requestId: string;
@@ -115,6 +125,11 @@ export interface FuseInferenceResult {
   decisionId: string;
   reservedCostAtomic: string;
   actualCostAtomic: string;
+}
+
+export interface FuseInferenceWithReceiptResult {
+  result: FuseInferenceResult;
+  receipt: FuseReceipt;
 }
 
 export class FuseClientError extends Error {
