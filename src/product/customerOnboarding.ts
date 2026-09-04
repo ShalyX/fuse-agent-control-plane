@@ -371,7 +371,8 @@ export class CustomerOnboardingService {
     if (!/^[A-Za-z0-9._:-]{8,128}$/.test(workspaceId)) throw new Error("WORKSPACE_ID_INVALID");
     if (principal.organizationId !== workspaceId) throw new Error("WORKSPACE_SCOPE_MISMATCH");
     const onboardingStore = this.dependencies.onboardingStore;
-    const issueServiceAccountCredential = this.dependencies.credentialAdministration.issueServiceAccountCredential;
+    const issueServiceAccountCredential = this.dependencies.credentialAdministration.issueServiceAccountCredential
+      ?.bind(this.dependencies.credentialAdministration);
     if (!onboardingStore?.getWorkspaceCredentialMetadata || !onboardingStore.rotateRecoveryCode
       || !issueServiceAccountCredential) throw new Error("CREDENTIAL_RECOVERY_UNAVAILABLE");
     const metadata = await onboardingStore.getWorkspaceCredentialMetadata(workspaceId);
