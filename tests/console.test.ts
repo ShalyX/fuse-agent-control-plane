@@ -19,5 +19,6 @@ describe("operator console beta paths", () => {
     expect(script.indexOf("const $=")).toBeLessThan(script.indexOf("const sessionAgentField="));
     expect(script).toContain("$('#continueSession').onclick");
     expect(script).toContain("$('#recoverWorkspace').onclick");
+    expect(script).toContain("workspace&&!workspace.hidden?$('#notice'):$('#onboardingResult')");
   });
 });
