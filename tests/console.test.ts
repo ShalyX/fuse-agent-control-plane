@@ -5,7 +5,12 @@ describe("operator console beta paths", () => {
   it("includes the run explorer and TypeScript integration path", () => {
     const html = renderOperatorConsole();
     expect(html).toContain('data-view="runs"');
+    expect(html).toContain('data-view="sandbox"');
     expect(html).toContain('data-view="integration"');
+    expect(html).toContain("/api/v1/product/sandbox/runs");
+    expect(html).toContain("Run deterministic sandbox");
+    expect(html).toContain("Scout tripped");
+    expect(html).toContain("Reviewer continued");
     expect(html).toContain("/api/v1/product/mandates/");
     expect(html).toContain("inferenceWithReceipt");
     expect(html).toContain("Copy quickstart");
@@ -46,5 +51,7 @@ describe("operator console beta paths", () => {
     expect(script).toContain("if(workspaceVisible)setTimeout");
     expect(script).toContain("const humanReadOnly=viewer||operator");
     expect(script).toContain("OPERATOR_AGENT_SESSION_REQUIRED");
+    expect(script).toContain("sandboxRun");
+    expect(script).toContain("SANDBOX_RUN_NOT_FOUND");
   });
 });
