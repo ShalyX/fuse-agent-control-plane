@@ -73,4 +73,29 @@ describe("workspace invites", () => {
     expect((await service.list("org-revoke"))[0].revokedAt).toBe(now);
     await expect(service.accept(issued.inviteToken)).rejects.toThrow("WORKSPACE_INVITE_INVALID");
   });
+
+  it("adds the invite table when upgrading an existing identity schema", async () => {
+    const db = newAdvisoryMemoryDb();
+    const pool = new (db.adapters.createPg().Pool)();
+    await pool.query(`
+      CREATE TABLE identity_schema_migrations (version INTEGER PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL);
+      INSERT INTO identity_schema_migrations (version, applied_at) VALUES (1, CURRENT_TIMESTAMP);
+      CREATE TABLE audit_events (
+        id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, entity_type TEXT NOT NULL,
+        entity_id TEXT NOT NULL, action TEXT NOT NULL, actor_id TEXT NOT NULL,
+        causation_id TEXT NOT NULL, occurred_at TIMESTAMPTZ NOT NULL, payload JSONB NOT NULL
+      );
+      CREATE TABLE organizations (id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL);
+      CREATE TABLE organization_users (
+        id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL, disabled_at TIMESTAMPTZ
+      );
+    `);
+    const upgradedStore = new IdentityStore(pool);
+    await upgradedStore.ensureSchema();
+    await upgradedStore.createOrganization({
+      id: "org-upgrade", name: "Upgrade Workspace", actorId: "test", causationId: "setup", occurredAt: "2026-09-05T10:00:00.000Z",
+    });
+    await expect(upgradedStore.listWorkspaceInvites("org-upgrade")).resolves.toEqual([]);
+  });
 });

@@ -245,6 +245,39 @@ export class IdentityStore {
       );
     `;
     await this.migrateTenantLocalKeys(legacyTables, schemaSql);
+    await this.migrateWorkspaceInvites();
+  }
+
+  private async migrateWorkspaceInvites(): Promise<void> {
+    await this.transaction(async (client) => {
+      const claimed = await client.query(
+        `INSERT INTO identity_schema_migrations (version, applied_at)
+         VALUES (2, CURRENT_TIMESTAMP)
+         ON CONFLICT (version) DO NOTHING
+         RETURNING version`,
+      );
+      if (claimed.rowCount === 0) return;
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS workspace_invites (
+          id TEXT PRIMARY KEY,
+          organization_id TEXT NOT NULL REFERENCES organizations(id),
+          email TEXT NOT NULL,
+          name TEXT NOT NULL,
+          role TEXT NOT NULL CHECK (role IN ('admin', 'operator', 'viewer')),
+          source_credential_id TEXT NOT NULL,
+          source_credential_type TEXT NOT NULL DEFAULT 'service_account'
+            CHECK (source_credential_type = 'service_account'),
+          token_hash TEXT NOT NULL UNIQUE,
+          created_at TIMESTAMPTZ NOT NULL,
+          expires_at TIMESTAMPTZ NOT NULL,
+          user_id TEXT REFERENCES organization_users(id),
+          accepted_at TIMESTAMPTZ,
+          revoked_at TIMESTAMPTZ
+        );
+        CREATE INDEX IF NOT EXISTS workspace_invites_organization_idx
+          ON workspace_invites (organization_id, created_at DESC);
+      `);
+    });
   }
 
   private async migrateTenantLocalKeys(
