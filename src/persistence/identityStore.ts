@@ -257,6 +257,11 @@ export class IdentityStore {
          RETURNING version`,
       );
       if (claimed.rowCount === 0) return;
+      const existingInviteTable = await client.query<{ table_name: string }>(
+        `SELECT table_name FROM information_schema.tables
+         WHERE table_schema = current_schema() AND table_name = 'workspace_invites'`,
+      );
+      if (existingInviteTable.rows.length > 0) return;
       await client.query(`
         CREATE TABLE IF NOT EXISTS workspace_invites (
           id TEXT PRIMARY KEY,
