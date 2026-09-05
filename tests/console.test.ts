@@ -53,5 +53,6 @@ describe("operator console beta paths", () => {
     expect(script).toContain("OPERATOR_AGENT_SESSION_REQUIRED");
     expect(script).toContain("sandboxRun");
     expect(script).toContain("SANDBOX_RUN_NOT_FOUND");
+    expect(script).toContain("body:JSON.stringify({seed})");
   });
 });
