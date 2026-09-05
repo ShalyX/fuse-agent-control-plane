@@ -88,7 +88,7 @@ describe("IdentityStore", () => {
       new IdentityStore(pool).ensureSchema(),
     ]);
     expect((await pool.query("SELECT version FROM identity_schema_migrations")).rows)
-      .toEqual([{ version: 1 }]);
+      .toEqual([{ version: 1 }, { version: 2 }]);
     await pool.end();
   });
 
@@ -221,7 +221,7 @@ describe("IdentityStore", () => {
       { organization_id: "org-2", id: "shared-agent-credential" },
     ]);
     expect((await pool.query("SELECT version FROM identity_schema_migrations")).rows)
-      .toEqual([{ version: 1 }]);
+      .toEqual([{ version: 1 }, { version: 2 }]);
     await pool.end();
   });
 
