@@ -7,6 +7,7 @@ describe("operator console beta paths", () => {
     expect(html).toContain('data-view="runs"');
     expect(html).toContain('data-view="sandbox"');
     expect(html).toContain('data-view="integration"');
+    expect(html).toContain('id="consoleHero"');
     expect(html).toContain("/api/v1/product/sandbox/runs");
     expect(html).toContain("Run deterministic sandbox");
     expect(html).toContain("Scout tripped");
@@ -54,5 +55,6 @@ describe("operator console beta paths", () => {
     expect(script).toContain("sandboxRun");
     expect(script).toContain("SANDBOX_RUN_NOT_FOUND");
     expect(script).toContain("body:JSON.stringify({seed})");
+    expect(script).toContain("hero.firstElementChild");
   });
 });
