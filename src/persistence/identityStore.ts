@@ -29,6 +29,7 @@ export interface RegisterAgentInput extends MutationContext {
 }
 
 export type OrganizationRole = "owner" | "admin" | "operator" | "viewer";
+export type WorkspaceInviteRole = "admin" | "operator" | "viewer";
 
 export interface AddOrganizationUserInput extends MutationContext {
   id: string;
@@ -36,6 +37,40 @@ export interface AddOrganizationUserInput extends MutationContext {
   email: string;
   name: string;
   role: OrganizationRole;
+}
+
+export interface CreateWorkspaceInviteInput extends MutationContext {
+  id: string;
+  organizationId: string;
+  email: string;
+  name: string;
+  role: WorkspaceInviteRole;
+  sourceCredentialId: string;
+  sourceCredentialType: "service_account";
+  tokenHash: string;
+  createdAt: string;
+  expiresAt: string;
+}
+
+export interface WorkspaceInviteSummary {
+  inviteId: string;
+  workspaceId: string;
+  email: string;
+  name: string;
+  role: WorkspaceInviteRole;
+  createdAt: string;
+  expiresAt: string;
+  acceptedAt: string | null;
+  revokedAt: string | null;
+}
+
+export interface ConsumedWorkspaceInvite {
+  workspaceId: string;
+  userId: string;
+  role: WorkspaceInviteRole;
+  sourceCredentialId: string;
+  sourceCredentialType: "service_account";
+  expiresAt: string;
 }
 
 export interface CreateServiceAccountInput extends MutationContext {
@@ -142,6 +177,24 @@ export class IdentityStore {
         revoked_at TIMESTAMPTZ,
         PRIMARY KEY (organization_id, user_id)
       );
+      CREATE TABLE IF NOT EXISTS workspace_invites (
+        id TEXT PRIMARY KEY,
+        organization_id TEXT NOT NULL REFERENCES organizations(id),
+        email TEXT NOT NULL,
+        name TEXT NOT NULL,
+        role TEXT NOT NULL CHECK (role IN ('admin', 'operator', 'viewer')),
+        source_credential_id TEXT NOT NULL,
+        source_credential_type TEXT NOT NULL DEFAULT 'service_account'
+          CHECK (source_credential_type = 'service_account'),
+        token_hash TEXT NOT NULL UNIQUE,
+        created_at TIMESTAMPTZ NOT NULL,
+        expires_at TIMESTAMPTZ NOT NULL,
+        user_id TEXT REFERENCES organization_users(id),
+        accepted_at TIMESTAMPTZ,
+        revoked_at TIMESTAMPTZ
+      );
+      CREATE INDEX IF NOT EXISTS workspace_invites_organization_idx
+        ON workspace_invites (organization_id, created_at DESC);
       CREATE TABLE IF NOT EXISTS service_accounts (
         id TEXT NOT NULL,
         organization_id TEXT NOT NULL REFERENCES organizations(id),
@@ -346,6 +399,187 @@ export class IdentityStore {
         causationId: input.causationId,
         occurredAt: input.occurredAt,
       });
+    });
+  }
+
+  async createWorkspaceInvite(input: CreateWorkspaceInviteInput): Promise<void> {
+    this.validateContext(input);
+    if (!input.id.trim()) throw new Error("WORKSPACE_INVITE_ID_REQUIRED");
+    if (!input.organizationId.trim()) throw new Error("WORKSPACE_INVITE_ORGANIZATION_REQUIRED");
+    const email = input.email.trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new Error("WORKSPACE_INVITE_EMAIL_INVALID");
+    if (!input.name.trim()) throw new Error("WORKSPACE_INVITE_NAME_REQUIRED");
+    if (!( ["admin", "operator", "viewer"] as const).includes(input.role)) {
+      throw new Error("WORKSPACE_INVITE_ROLE_INVALID");
+    }
+    if (!input.sourceCredentialId.trim()) throw new Error("WORKSPACE_INVITE_SOURCE_REQUIRED");
+    if (!/^[a-f0-9]{64}$/.test(input.tokenHash)) throw new Error("WORKSPACE_INVITE_HASH_INVALID");
+    const createdAt = Date.parse(input.createdAt);
+    const expiresAt = Date.parse(input.expiresAt);
+    if (Number.isNaN(createdAt) || Number.isNaN(expiresAt) || expiresAt <= createdAt) {
+      throw new Error("WORKSPACE_INVITE_TIME_INVALID");
+    }
+    await this.ensureSchema();
+    await this.transaction(async (client) => {
+      await client.query(
+        `INSERT INTO workspace_invites
+         (id, organization_id, email, name, role, source_credential_id,
+          source_credential_type, token_hash, created_at, expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+        [input.id, input.organizationId, email, input.name.trim(), input.role,
+          input.sourceCredentialId, input.sourceCredentialType, input.tokenHash,
+          input.createdAt, input.expiresAt],
+      );
+      await this.appendAudit(client, {
+        organizationId: input.organizationId,
+        entityType: "workspace_invite",
+        entityId: input.id,
+        action: "workspace_invite.created",
+        payload: { email, name: input.name.trim(), role: input.role, expiresAt: input.expiresAt },
+        actorId: input.actorId,
+        causationId: input.causationId,
+        occurredAt: input.occurredAt,
+      });
+    });
+  }
+
+  async listWorkspaceInvites(organizationId: string): Promise<WorkspaceInviteSummary[]> {
+    if (!organizationId.trim()) throw new Error("WORKSPACE_INVITE_ORGANIZATION_REQUIRED");
+    await this.ensureSchema();
+    const result = await this.pool.query<{
+      id: string;
+      organization_id: string;
+      email: string;
+      name: string;
+      role: WorkspaceInviteRole;
+      created_at: Date;
+      expires_at: Date;
+      accepted_at: Date | null;
+      revoked_at: Date | null;
+    }>(
+      `SELECT id, organization_id, email, name, role, created_at, expires_at,
+              accepted_at, revoked_at
+         FROM workspace_invites
+        WHERE organization_id = $1
+        ORDER BY created_at DESC, id DESC`,
+      [organizationId],
+    );
+    return result.rows.map((row) => ({
+      inviteId: row.id,
+      workspaceId: row.organization_id,
+      email: row.email,
+      name: row.name,
+      role: row.role,
+      createdAt: new Date(row.created_at).toISOString(),
+      expiresAt: new Date(row.expires_at).toISOString(),
+      acceptedAt: row.accepted_at?.toISOString() ?? null,
+      revokedAt: row.revoked_at?.toISOString() ?? null,
+    }));
+  }
+
+  async revokeWorkspaceInvite(
+    organizationId: string,
+    inviteId: string,
+    context: MutationContext,
+  ): Promise<boolean> {
+    this.validateContext(context);
+    if (!organizationId.trim()) throw new Error("WORKSPACE_INVITE_ORGANIZATION_REQUIRED");
+    if (!inviteId.trim()) throw new Error("WORKSPACE_INVITE_ID_REQUIRED");
+    await this.ensureSchema();
+    return this.transaction(async (client) => {
+      const revoked = await client.query<{ id: string }>(
+        `UPDATE workspace_invites
+            SET revoked_at = $3
+          WHERE organization_id = $1 AND id = $2
+            AND accepted_at IS NULL AND revoked_at IS NULL
+          RETURNING id`,
+        [organizationId, inviteId, context.occurredAt],
+      );
+      if (!revoked.rows[0]) return false;
+      await this.appendAudit(client, {
+        organizationId,
+        entityType: "workspace_invite",
+        entityId: inviteId,
+        action: "workspace_invite.revoked",
+        payload: {},
+        ...context,
+      });
+      return true;
+    });
+  }
+
+  async consumeWorkspaceInvite(tokenHash: string, now: string): Promise<ConsumedWorkspaceInvite | null> {
+    if (!/^[a-f0-9]{64}$/.test(tokenHash)) throw new Error("WORKSPACE_INVITE_HASH_INVALID");
+    const nowMs = Date.parse(now);
+    if (Number.isNaN(nowMs)) throw new Error("WORKSPACE_INVITE_TIME_INVALID");
+    await this.ensureSchema();
+    return this.transaction(async (client) => {
+      const inviteResult = await client.query<{
+        id: string;
+        organization_id: string;
+        email: string;
+        name: string;
+        role: WorkspaceInviteRole;
+        source_credential_id: string;
+        source_credential_type: "service_account";
+        expires_at: Date;
+      }>(
+        `SELECT id, organization_id, email, name, role, source_credential_id,
+                source_credential_type, expires_at
+           FROM workspace_invites
+          WHERE token_hash = $1
+            AND accepted_at IS NULL
+            AND revoked_at IS NULL
+            AND expires_at > $2
+          FOR UPDATE`,
+        [tokenHash, new Date(nowMs)],
+      );
+      const invite = inviteResult.rows[0];
+      if (!invite) return null;
+
+      const existingUser = await client.query<{ id: string }>(
+        "SELECT id FROM organization_users WHERE email = $1",
+        [invite.email],
+      );
+      const userId = existingUser.rows[0]?.id ?? `usr_${randomUUID().replaceAll("-", "")}`;
+      if (!existingUser.rows[0]) {
+        await client.query(
+          `INSERT INTO organization_users (id, email, name, created_at)
+           VALUES ($1, $2, $3, $4)`,
+          [userId, invite.email, invite.name, now],
+        );
+      }
+      await client.query(
+        `INSERT INTO organization_memberships
+         (organization_id, user_id, role, created_at)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (organization_id, user_id) DO UPDATE SET
+           role = EXCLUDED.role, revoked_at = NULL`,
+        [invite.organization_id, userId, invite.role, now],
+      );
+      await client.query(
+        `UPDATE workspace_invites SET user_id = $2, accepted_at = $3
+          WHERE id = $1`,
+        [invite.id, userId, now],
+      );
+      await this.appendAudit(client, {
+        organizationId: invite.organization_id,
+        entityType: "workspace_invite",
+        entityId: invite.id,
+        action: "workspace_invite.accepted",
+        payload: { userId, email: invite.email, role: invite.role },
+        actorId: `organization_user:${userId}`,
+        causationId: invite.id,
+        occurredAt: now,
+      });
+      return {
+        workspaceId: invite.organization_id,
+        userId,
+        role: invite.role,
+        sourceCredentialId: invite.source_credential_id,
+        sourceCredentialType: invite.source_credential_type,
+        expiresAt: new Date(invite.expires_at).toISOString(),
+      };
     });
   }
 

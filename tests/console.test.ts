@@ -22,6 +22,17 @@ describe("operator console beta paths", () => {
     expect(html).toContain("Agent directory");
   });
 
+  it("exposes the workspace invite and scoped join flow", () => {
+    const html = renderOperatorConsole();
+    expect(html).toContain("Invite a teammate");
+    expect(html).toContain("Accept workspace invite");
+    expect(html).toContain("/api/v1/product/workspace-invites");
+    expect(html).toContain("/api/v1/product/workspace-invites/accept");
+    expect(html).toContain("applyRoleVisibility");
+    expect(html).toContain("Operator · run and inspect");
+    expect(html).toContain("Viewer · read-only");
+  });
+
   it("initializes DOM helpers before the session boot code uses them", () => {
     const html = renderOperatorConsole();
     const script = html.split("<script>")[1]?.split("</script>")[0] ?? "";

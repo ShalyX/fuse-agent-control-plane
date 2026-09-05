@@ -14,6 +14,8 @@ export interface AdministrativePrincipal {
   credentialId: string;
   capabilities: readonly ApiCapability[];
   role?: ServiceAccountRole;
+  sessionSourceCredentialId?: string;
+  sessionSourceCredentialType?: "agent" | "service_account";
 }
 
 export interface RegisterAgentInput {

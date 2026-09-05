@@ -30,6 +30,7 @@ import { ReliabilityInferenceExecutionStore } from "./reliability/inferenceStore
 import { PostgresHumanSessionStore } from "./http/humanSessions.js";
 import { createSessionAwareAuthenticator } from "./http/auth.js";
 import { PostgresOperationalAuditStore } from "./product/operationalAudit.js";
+import { WorkspaceInviteService } from "./identity/workspaceInvites.js";
 
 const unavailableLegacyProvider: InferenceProvider = {
   async complete() {
@@ -96,6 +97,9 @@ export function createRuntimeApp(env: NodeJS.ProcessEnv = process.env) {
   const identityStore = databasePool ? new IdentityStore(databasePool) : undefined;
   const sandboxRunStore = databasePool ? new PostgresSandboxRunStore(databasePool) : undefined;
   const humanSessionStore = databasePool ? new PostgresHumanSessionStore(databasePool) : undefined;
+  const workspaceInviteService = identityStore && humanSessionStore
+    ? new WorkspaceInviteService(identityStore, humanSessionStore)
+    : undefined;
   const workspaceOnboardingStore = databasePool && providerKeyRing
     ? new PostgresWorkspaceOnboardingStore(databasePool, providerKeyRing)
     : undefined;
@@ -255,6 +259,7 @@ export function createRuntimeApp(env: NodeJS.ProcessEnv = process.env) {
     credentialAuthenticator,
     humanSessionStore,
     identityStore,
+    workspaceInviteService,
     credentialAdministration,
     agentIdentityService: credentialAdministration
       ? new AgentIdentityService(credentialAdministration)

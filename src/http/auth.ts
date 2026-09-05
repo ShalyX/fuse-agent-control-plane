@@ -10,6 +10,8 @@ export interface AuthenticatedPrincipal {
   capabilities: ApiCapability[];
   role?: ServiceAccountRole;
   expiresAt?: string;
+  sessionSourceCredentialId?: string;
+  sessionSourceCredentialType?: HumanSessionSourceCredentialType;
 }
 
 export type CredentialAuthenticator = {
@@ -52,6 +54,8 @@ export function createSessionAwareAuthenticator(
         capabilities,
         role,
         expiresAt: session.expiresAt,
+        sessionSourceCredentialId: session.sourceCredentialId,
+        sessionSourceCredentialType: session.sourceCredentialType,
       };
     },
   };

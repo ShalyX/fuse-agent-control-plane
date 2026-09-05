@@ -31,6 +31,7 @@ import { calculateMaximumCostMicros } from "../core/pricing.js";
 import { buildSetupReadiness, type SetupReadinessInput } from "../product/setupReadiness.js";
 import { buildProductReadiness, type ProductReadinessInput } from "../product/productReadiness.js";
 import { CustomerOnboardingService, type CustomerOnboardingPort, type CreateWorkspaceInput } from "../product/customerOnboarding.js";
+import { WorkspaceInviteService } from "../identity/workspaceInvites.js";
 import { withTrustedReplayOperation } from "../reliability/replayOperationContext.js";
 import type { StableSuccessfulResponseProjection } from "../reliability/commitments.js";
 import type { OperationalAuditEvent, OperationalAuditStore } from "../product/operationalAudit.js";
@@ -98,6 +99,15 @@ const serviceCredentialIssueSchema = z.object({
   name: z.string().min(1).max(128),
   capabilities: z.array(z.enum(API_CAPABILITIES)).min(1),
   expiresAt: z.string().datetime().nullable().optional(),
+}).strict();
+
+const workspaceInviteSchema = z.object({
+  email: z.string().email().max(320),
+  name: z.string().min(1).max(128),
+  role: z.enum(["admin", "operator", "viewer"]),
+}).strict();
+const workspaceInviteAcceptSchema = z.object({
+  inviteToken: z.string().min(1).max(256),
 }).strict();
 
 const providerPriceSchema = z.string().regex(/^\d+(?:\.\d{1,12})?$/).max(64)
@@ -247,6 +257,7 @@ type AppDependencies = {
   sandboxRunStore?: SandboxRunStore;
   paymentEvidenceStore?: PaymentEvidenceStore;
   customerOnboardingService?: CustomerOnboardingPort;
+  workspaceInviteService?: WorkspaceInviteService;
   operationalAudit?: OperationalAuditStore;
   reliabilityContextIssuer?: (input: {
     runId: string | null; laneId: string | null; block: number | null; requestId: string;
@@ -737,7 +748,112 @@ export function createFuseApp(dependencies: AppDependencies) {
     }
   }
 
+  if (dependencies.workspaceInviteService) {
+    app.post("/api/v1/product/workspace-invites/accept", async (request, response) => {
+      disableCaching(response);
+      const parsed = workspaceInviteAcceptSchema.safeParse(request.body);
+      if (!parsed.success) {
+        response.status(400).json({ error: { code: "WORKSPACE_INVITE_REQUEST_INVALID" } });
+        return;
+      }
+      try {
+        const result = await dependencies.workspaceInviteService!.accept(parsed.data.inviteToken);
+        response.status(201).json(result);
+      } catch (error) {
+        const code = error instanceof Error ? error.message : "WORKSPACE_INVITE_ACCEPT_FAILED";
+        response.status(code === "WORKSPACE_INVITE_INVALID" ? 401 : 503)
+          .json({ error: { code } });
+      }
+    });
+  }
+
   if (dependencies.credentialAuthenticator) {
+    if (dependencies.workspaceInviteService) {
+      app.post(
+        "/api/v1/product/workspace-invites",
+        createCapabilityGuard(dependencies.credentialAuthenticator, "credentials:issue"),
+        async (request, response) => {
+          disableCaching(response);
+          const requestId = request.header("X-Request-Id")?.trim();
+          const parsed = workspaceInviteSchema.safeParse(request.body);
+          if (!requestId) {
+            response.status(400).json({ error: { code: "REQUEST_ID_REQUIRED" } });
+            return;
+          }
+          if (!parsed.success) {
+            response.status(400).json({ error: { code: "INVALID_WORKSPACE_INVITE" } });
+            return;
+          }
+          try {
+            const invite = await dependencies.workspaceInviteService!.issue(
+              response.locals.fusePrincipal as AdministrativePrincipal,
+              { ...parsed.data, requestId },
+            );
+            response.status(201).json(invite);
+          } catch (error) {
+            const message = error instanceof Error ? error.message : "WORKSPACE_INVITE_UNAVAILABLE";
+            const databaseCode = typeof error === "object" && error !== null && "code" in error
+              ? String((error as { code?: unknown }).code ?? "") : "";
+            const status = ["SERVICE_ACCOUNT_ADMIN_REQUIRED", "SERVICE_ACCOUNT_SOURCE_REQUIRED"]
+              .includes(message) ? 403
+              : databaseCode === "23505" ? 409
+              : message.endsWith("_REQUIRED") || message.endsWith("_INVALID") ? 400
+              : 503;
+            response.status(status).json({ error: { code: message } });
+          }
+        },
+      );
+      app.get(
+        "/api/v1/product/workspace-invites",
+        createCapabilityGuard(dependencies.credentialAuthenticator, "policies:read"),
+        async (_request, response) => {
+          disableCaching(response);
+          const principal = response.locals.fusePrincipal as AdministrativePrincipal;
+          if (principal.principalType !== "service_account" || principal.role !== "admin") {
+            response.status(403).json({ error: { code: "SERVICE_ACCOUNT_ADMIN_REQUIRED" } });
+            return;
+          }
+          try {
+            response.json({ invites: await dependencies.workspaceInviteService!.list(principal.organizationId) });
+          } catch {
+            response.status(503).json({ error: { code: "WORKSPACE_INVITE_UNAVAILABLE" } });
+          }
+        },
+      );
+      app.post(
+        "/api/v1/product/workspace-invites/:inviteId/revoke",
+        createCapabilityGuard(dependencies.credentialAuthenticator, "credentials:revoke"),
+        async (request, response) => {
+          disableCaching(response);
+          const requestId = request.header("X-Request-Id")?.trim();
+          const inviteId = typeof request.params.inviteId === "string" ? request.params.inviteId.trim() : "";
+          if (!requestId) {
+            response.status(400).json({ error: { code: "REQUEST_ID_REQUIRED" } });
+            return;
+          }
+          if (!inviteId) {
+            response.status(400).json({ error: { code: "WORKSPACE_INVITE_ID_REQUIRED" } });
+            return;
+          }
+          try {
+            await dependencies.workspaceInviteService!.revoke(
+              response.locals.fusePrincipal as AdministrativePrincipal,
+              inviteId,
+              requestId,
+            );
+            response.status(204).send();
+          } catch (error) {
+            const message = error instanceof Error ? error.message : "WORKSPACE_INVITE_UNAVAILABLE";
+            const status = ["SERVICE_ACCOUNT_ADMIN_REQUIRED", "SERVICE_ACCOUNT_SOURCE_REQUIRED"]
+              .includes(message) ? 403
+              : message === "WORKSPACE_INVITE_NOT_ACTIVE" ? 404
+              : message.endsWith("_REQUIRED") || message.endsWith("_INVALID") ? 400
+              : 503;
+            response.status(status).json({ error: { code: message } });
+          }
+        },
+      );
+    }
     if (dependencies.humanSessionStore) {
       const sessionRateLimit = dependencies.sessionRateLimit ?? dependencies.adminRateLimit;
       if (sessionRateLimit && (!Number.isSafeInteger(sessionRateLimit.maxPerMinute) || sessionRateLimit.maxPerMinute < 1)) {
