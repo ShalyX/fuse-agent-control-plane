@@ -144,7 +144,7 @@ $('#providerForm').onsubmit=async(e)=>{e.preventDefault();const form=e.currentTa
 $('#agentForm').onsubmit=async(e)=>{e.preventDefault();const value=formObject(e.currentTarget);try{await api('/api/v1/product/agents',{method:'POST',body:JSON.stringify(value)});notice('Agent registered.');activity('Agent registered',value.agentId);await loadAgentDirectory()}catch(err){notice(err.message,true)}};
 $('#credentialForm').onsubmit=async(e)=>{e.preventDefault();const value=formObject(e.currentTarget);try{const result=await api('/api/v1/product/agent-credentials',{method:'POST',body:JSON.stringify({...value,capabilities:['inference:invoke','mandates:read','receipts:read']})});$('#issuedCredential').textContent='Copy now: '+result.token;notice('Credential issued once.');activity('Credential issued',value.credentialId);await loadAgentDirectory()}catch(err){notice(err.message,true)}};
 function renderCredentialValues(selector,result){const box=$(selector);const prefix=selector==='#workspaceRecoveryResult'?'recovery':'replacement';box.innerHTML='<p>Save these values now. They will not be shown again.</p><div class="field"><label>Service credential — Restore existing admin session</label><input id="'+prefix+'ServiceCredential" type="text" readonly><button class="ghost" type="button" data-copy="#'+prefix+'ServiceCredential">Copy</button></div><div class="field"><label>Agent credential — inference</label><input id="'+prefix+'AgentCredential" type="text" readonly><button class="ghost" type="button" data-copy="#'+prefix+'AgentCredential">Copy</button></div><div class="field"><label>Recovery code</label><input id="'+prefix+'RecoveryCode" type="text" readonly><button class="ghost" type="button" data-copy="#'+prefix+'RecoveryCode">Copy</button></div>';$('#'+prefix+'ServiceCredential').value=result.serviceCredential.token;$('#'+prefix+'AgentCredential').value=result.agentCredential.token;$('#'+prefix+'RecoveryCode').value=result.recoveryCode;wireCopyButtons()}
-function renderCredentialPackage(result){renderCredentialValues('#workspaceCredentialsResult',result)}
+function renderCredentialPackage(result){renderCredentialValues('#workspaceCredentialsResult',result);renderIntegrationConnection()}
 $('#issueWorkspaceCredentials').onclick=async()=>{const button=$('#issueWorkspaceCredentials');if(!state.principal?.organizationId)return;button.disabled=true;button.textContent='Issuing replacement access…';try{const result=await api('/api/v1/product/workspaces/'+encodeURIComponent(state.principal.organizationId)+'/credential-package',{method:'POST'});state.agentToken=result.agentCredential.token;persistSession();renderCredentialPackage(result);notice('Replacement credentials issued once. Save them before leaving this tab.');activity('Replacement credentials issued',state.principal.organizationId)}catch(err){notice(err.message,true)}finally{button.disabled=false;button.textContent='Issue replacement access'}};
 $('#policyForm').onsubmit=async(e)=>{e.preventDefault();const v=formObject(e.currentTarget);const body={policyId:v.policyId,version:Number(v.version),mode:'enforce',allowedProviders:[v.allowedProvider],allowedModels:[v.allowedModel],requiredCapability:'inference:invoke',limits:{maxPerCallAtomic:v.maxPerCallAtomic,maxHourlyAtomic:v.maxDailyAtomic,maxDailyAtomic:v.maxDailyAtomic,maxRequestsPerMinute:30,maxInputTokens:Number(v.maxInputTokens),maxOutputTokens:Number(v.maxOutputTokens)},workloadClasses:v.includeWorkload?[{id:v.workloadClass,maxCostPerCallAtomic:v.maxClassPerCallAtomic,maxInvocationsPerBranch:Number(v.maxClassInvocations),aggregateBudgetAtomic:v.classBudgetAtomic,minimumInputTokens:1,shadow:{classPriorWindowSpendAtomic:v.classPriorWindowSpendAtomic,windowSeconds:900,targetMinimumObservations:3,siblingMinimumForScoring:2,siblingMinimumForIntervention:3,confidenceConstant:5,divergenceThresholdBps:Number(v.divergenceThresholdBps)}}]:[]};try{await api('/api/v1/product/policies',{method:'POST',body:JSON.stringify(body)});notice('Policy version published.');activity('Policy published',v.policyId+' · v'+v.version+' · '+(v.includeWorkload?v.workloadClass:'ceiling-only'))}catch(err){notice(err.message,true)}};
 function mandateValue(){const form=$('#mandateForm');if(!form.reportValidity())return null;return formObject(form)}
@@ -170,11 +170,45 @@ function ensureAdminInviteSurface(){
   grid.insertAdjacentHTML('afterbegin','<div id="workspaceInviteEditor" class="card full"><div class="viewhead"><div><div class="label">Team access</div><h3>Invite a teammate</h3><p>Issue a one-time invite for a scoped human session. In this beta, copy the token to the teammate through your approved channel.</p></div><button id="refreshInvites" class="ghost" type="button">Refresh</button></div><form id="workspaceInviteAdminForm"><div class="row"><div class="field"><label>Name</label><input name="name" required maxlength="128"></div><div class="field"><label>Email</label><input name="email" type="email" required maxlength="320"></div></div><div class="row"><div class="field"><label>Role</label><select name="role"><option value="operator" selected>Operator · inspect and verify</option><option value="viewer">Viewer · read-only</option><option value="admin">Admin · manage workspace</option></select></div><div class="actions"><button class="primary">Create invite</button></div></div></form><div id="workspaceInviteIssued"></div></div><div id="workspaceInviteListCard" class="card full"><div class="viewhead"><div><h3>Workspace invites</h3><p>Pending invites can be revoked before they are accepted.</p></div></div><div id="workspaceInviteList" class="empty">Loading invites…</div></div>');
   const inviteSubmit=$('#workspaceInviteAdminForm')?.querySelector('button.primary');if(inviteSubmit)inviteSubmit.type='submit';
   $('#workspaceInviteAdminForm').onsubmit=async(e)=>{e.preventDefault();const form=e.currentTarget;const value=formObject(form);const button=form.querySelector('button[type="submit"]');button.disabled=true;button.textContent='Creating invite…';try{const result=await api('/api/v1/product/workspace-invites',{method:'POST',body:JSON.stringify(value)});renderIssuedWorkspaceInvite(result);notice('Invite issued once. Share it through your approved channel.');activity('Workspace invite issued',value.email);form.reset();await loadInvites()}catch(error){notice(error instanceof Error?error.message:'WORKSPACE_INVITE_UNAVAILABLE',true)}finally{button.disabled=false;button.textContent='Create invite'}};
-  $('#refreshInvites').onclick=loadInvites;
-  applyRoleVisibility(state.principal);
-}
-void ensureJoinInviteSurface();
-void restoreStoredSession();
+   $('#refreshInvites').onclick=loadInvites;
+   applyRoleVisibility(state.principal);
+ }
+ function renderIntegrationConnection(){
+   const token=String(state.agentToken||'').trim();
+   const credential=$('#integrationAgentCredential');
+   const credentialStatus=$('#integrationCredentialStatus');
+   const env=$('#integrationEnv');
+   const verify=$('#verifyIntegrationAgent');
+   const copyCredential=$('#copyIntegrationAgentCredential');
+   const copyEnv=$('#copyIntegrationEnv');
+   if(credential){credential.value=token;credential.type='password';credential.placeholder=token?'fuse_sk_…':'Restore session with agent credential'}
+   if(env)env.value=['FUSE_BASE_URL=https://fuse-agent-control-plane.vercel.app','FUSE_AGENT_CREDENTIAL='+(token?'(loaded in this tab)':'fuse_sk_…')].join(String.fromCharCode(10));
+   if(credentialStatus)credentialStatus.textContent=token?'Loaded in this tab · keep it server-side':'Not loaded · restore with the agent credential to connect your runtime';
+   if(verify)verify.disabled=!token;
+   if(copyCredential)copyCredential.disabled=!token;
+   if(copyEnv)copyEnv.disabled=!token;
+ }
+ function ensureIntegrationConnectSurface(){
+   const grid=document.querySelector('[data-page="integration"] .grid');
+   if(!grid)return;
+   if(!$('#integrationConnectCard'))grid.insertAdjacentHTML('afterbegin','<div id="integrationConnectCard" class="card full"><div class="label">01 · Runtime connection</div><h3>Connect your agent</h3><p class="integration-note">Use the agent credential in your server-side runtime. It is never required in a browser bundle and this console only keeps it in the active tab.</p><div class="field"><label for="integrationAgentCredential">Agent credential</label><input id="integrationAgentCredential" type="password" readonly autocomplete="off" placeholder="Restore session with agent credential"><div class="actions"><button id="revealIntegrationCredential" class="ghost" type="button">Show</button><button id="copyIntegrationAgentCredential" class="ghost" type="button">Copy credential</button></div><span id="integrationCredentialStatus" class="integration-note" aria-live="polite"></span></div><div class="field"><label for="integrationEnv">Server environment</label><textarea id="integrationEnv" readonly rows="2">FUSE_BASE_URL=https://fuse-agent-control-plane.vercel.app&#10;FUSE_AGENT_CREDENTIAL=fuse_sk_…</textarea><div class="actions"><button id="copyIntegrationEnv" class="ghost" type="button">Copy env</button><button id="verifyIntegrationAgent" class="primary" type="button">Verify agent access</button></div></div><p id="integrationCheckStatus" class="integration-note" aria-live="polite">Verification checks workspace access only; it makes no provider call.</p></div>');
+   const card=$('#integrationConnectCard');
+   if(!card)return;
+   if(card.dataset.wired!=='true'){
+     const reveal=$('#revealIntegrationCredential');
+     if(reveal)reveal.onclick=()=>{const input=$('#integrationAgentCredential');if(!input)return;const showing=input.type==='text';input.type=showing?'password':'text';reveal.textContent=showing?'Show':'Hide'};
+     const copyCredential=$('#copyIntegrationAgentCredential');
+     if(copyCredential)copyCredential.onclick=async()=>{const token=String(state.agentToken||'').trim();if(!token)return;try{await navigator.clipboard.writeText(token);copyCredential.textContent='Copied';setTimeout(()=>copyCredential.textContent='Copy credential',1600)}catch{notice('Copy failed; use Show and press Ctrl+C to copy.',true)}};
+     const copyEnv=$('#copyIntegrationEnv');
+     if(copyEnv)copyEnv.onclick=async()=>{const token=String(state.agentToken||'').trim();if(!token)return;const value=['FUSE_BASE_URL=https://fuse-agent-control-plane.vercel.app','FUSE_AGENT_CREDENTIAL='+token].join(String.fromCharCode(10));try{await navigator.clipboard.writeText(value);copyEnv.textContent='Copied';setTimeout(()=>copyEnv.textContent='Copy env',1600)}catch{notice('Copy failed; select the environment block and press Ctrl+C.',true)}};
+     const verify=$('#verifyIntegrationAgent');
+     if(verify)verify.onclick=async()=>{const token=String(state.agentToken||'').trim();const status=$('#integrationCheckStatus');if(!token){if(status)status.textContent='Agent credential unavailable · restore the admin session with the agent credential';return}verify.disabled=true;verify.textContent='Verifying…';if(status)status.textContent='Checking agent credential · no provider call…';try{const response=await fetch('/api/v1/product/workspace-context',{headers:{Authorization:'Bearer '+token},cache:'no-store'});const body=await response.json().catch(()=>({}));if(!response.ok)throw new Error(body?.error?.code||'AGENT_CREDENTIAL_INVALID');if(status)status.textContent='Agent access verified · '+(body.agentId||'agent')+' · '+(body.provider||'provider')+' · no provider call made';activity('Agent access verified',body.agentId||'agent')}catch(error){if(status)status.textContent=error instanceof Error?error.message:'AGENT_CREDENTIAL_INVALID'}finally{verify.disabled=!state.agentToken;verify.textContent='Verify agent access'}};
+     card.dataset.wired='true';
+   }
+   renderIntegrationConnection();
+ }
+ void ensureJoinInviteSurface();
+ void restoreStoredSession();
 
 function updateSetupPath(result){
   const viewer=state.principal?.role==='viewer';
@@ -213,7 +247,8 @@ function applyRoleVisibility(principal){
   hide('#reconciliationForm',!admin);
   hide('[data-view="sandbox"],[data-page="sandbox"]',viewer);
   hide('[data-go-inference],[data-step-inference],#quickInference',humanReadOnly);
-   hide('[data-view="integration"],[data-page="integration"]',viewer);
+    hide('[data-view="integration"],[data-page="integration"]',viewer);
+    ensureIntegrationConnectSurface();
    const hero=$('#consoleHero');
    if(hero){const intro=hero.firstElementChild;if(intro)intro.hidden=true;if($('#sessionPanel')?.hidden)hero.hidden=true}
    if(viewer){const box=$('#agentDirectory');if(box){box.textContent='';box.className='empty';box.hidden=true}}

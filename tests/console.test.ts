@@ -15,6 +15,12 @@ describe("operator console beta paths", () => {
     expect(html).toContain("/api/v1/product/mandates/");
     expect(html).toContain("inferenceWithReceipt");
     expect(html).toContain("Copy quickstart");
+    expect(html).toContain("ensureIntegrationConnectSurface");
+    expect(html).toContain("integrationConnectCard");
+    expect(html).toContain("verifyIntegrationAgent");
+    expect(html).toContain("copyIntegrationEnv");
+    expect(html).toContain("FUSE_AGENT_CREDENTIAL");
+    expect(html).toContain("no provider call");
   });
 
   it("exposes the team-ready access and agent directory surfaces", () => {
