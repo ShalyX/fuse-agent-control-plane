@@ -51,6 +51,7 @@ describe("API credentials", () => {
     expect(serviceAccountRoleAllowsCapabilities("viewer", [policiesRead])).toBe(true);
     expect(serviceAccountRoleAllowsCapabilities("viewer", [policiesWrite])).toBe(false);
     expect(serviceAccountRoleAllowsCapabilities("operator", [mandateAdmin])).toBe(false);
+    expect(serviceAccountRoleAllowsCapabilities("operator", ["inference:invoke"])).toBe(true);
   });
 
   it("rejects unknown capabilities and invalid expiry windows", () => {

@@ -29,8 +29,9 @@ describe("operator console beta paths", () => {
     expect(html).toContain("/api/v1/product/workspace-invites");
     expect(html).toContain("/api/v1/product/workspace-invites/accept");
     expect(html).toContain("applyRoleVisibility");
-    expect(html).toContain("Operator · run and inspect");
+    expect(html).toContain("Operator · inspect and verify");
     expect(html).toContain("Viewer · read-only");
+    expect(html).toContain("Live inference runs through an agent credential. Operator sessions can inspect receipts");
   });
 
   it("initializes DOM helpers before the session boot code uses them", () => {
@@ -43,5 +44,7 @@ describe("operator console beta paths", () => {
     expect(script).toContain("$('#recoverWorkspace').onclick");
     expect(script).toContain("const workspaceVisible=Boolean(workspace&&!workspace.hidden)");
     expect(script).toContain("if(workspaceVisible)setTimeout");
+    expect(script).toContain("const humanReadOnly=viewer||operator");
+    expect(script).toContain("OPERATOR_AGENT_SESSION_REQUIRED");
   });
 });

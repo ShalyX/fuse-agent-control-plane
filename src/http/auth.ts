@@ -24,6 +24,15 @@ export type CredentialAuthenticator = {
   ): Promise<boolean>;
 };
 
+const HUMAN_SESSION_ROLE_CAPABILITIES: Record<ServiceAccountRole, ApiCapability[]> = {
+  admin: [...API_CAPABILITIES],
+  // Human operators inspect the control plane and verify bounded execution. Live
+  // inference remains an agent-credential operation, while service-account
+  // operators retain the SDK capability map in apiCredentials.ts.
+  operator: ["mandates:read", "receipts:read", "policies:read", "providers:read", "sandbox:run"],
+  viewer: ["mandates:read", "receipts:read", "policies:read", "providers:read"],
+};
+
 export function createSessionAwareAuthenticator(
   credentials: CredentialAuthenticator,
   sessions: HumanSessionStore,
@@ -42,10 +51,7 @@ export function createSessionAwareAuthenticator(
         )) return null;
       const role: ServiceAccountRole = session.role === "owner" ? "admin"
         : session.role === "member" ? "operator" : "viewer";
-      const capabilities: ApiCapability[] = role === "admin" ? [...API_CAPABILITIES]
-        : role === "operator"
-          ? ["inference:invoke", "mandates:read", "mandates:write", "receipts:read", "policies:read", "providers:read", "sandbox:run"]
-          : ["mandates:read", "receipts:read", "policies:read", "providers:read"];
+      const capabilities = [...HUMAN_SESSION_ROLE_CAPABILITIES[role]];
       return {
         principalType: "service_account",
         principalId: session.userId,

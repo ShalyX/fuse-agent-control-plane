@@ -113,7 +113,7 @@ function ensureJoinInviteSurface(){const panel=$('#sessionPanel');if(!panel||$('
 function ensureAdminInviteSurface(){
   const grid=document.querySelector('[data-page="access"] .grid');
   if(!grid||$('#workspaceInviteEditor'))return;
-  grid.insertAdjacentHTML('afterbegin','<div id="workspaceInviteEditor" class="card full"><div class="viewhead"><div><div class="label">Team access</div><h3>Invite a teammate</h3><p>Issue a one-time invite for a scoped human session. In this beta, copy the token to the teammate through your approved channel.</p></div><button id="refreshInvites" class="ghost" type="button">Refresh</button></div><form id="workspaceInviteAdminForm"><div class="row"><div class="field"><label>Name</label><input name="name" required maxlength="128"></div><div class="field"><label>Email</label><input name="email" type="email" required maxlength="320"></div></div><div class="row"><div class="field"><label>Role</label><select name="role"><option value="operator" selected>Operator · run and inspect</option><option value="viewer">Viewer · read-only</option><option value="admin">Admin · manage workspace</option></select></div><div class="actions"><button class="primary">Create invite</button></div></div></form><div id="workspaceInviteIssued"></div></div><div id="workspaceInviteListCard" class="card full"><div class="viewhead"><div><h3>Workspace invites</h3><p>Pending invites can be revoked before they are accepted.</p></div></div><div id="workspaceInviteList" class="empty">Loading invites…</div></div>');
+  grid.insertAdjacentHTML('afterbegin','<div id="workspaceInviteEditor" class="card full"><div class="viewhead"><div><div class="label">Team access</div><h3>Invite a teammate</h3><p>Issue a one-time invite for a scoped human session. In this beta, copy the token to the teammate through your approved channel.</p></div><button id="refreshInvites" class="ghost" type="button">Refresh</button></div><form id="workspaceInviteAdminForm"><div class="row"><div class="field"><label>Name</label><input name="name" required maxlength="128"></div><div class="field"><label>Email</label><input name="email" type="email" required maxlength="320"></div></div><div class="row"><div class="field"><label>Role</label><select name="role"><option value="operator" selected>Operator · inspect and verify</option><option value="viewer">Viewer · read-only</option><option value="admin">Admin · manage workspace</option></select></div><div class="actions"><button class="primary">Create invite</button></div></div></form><div id="workspaceInviteIssued"></div></div><div id="workspaceInviteListCard" class="card full"><div class="viewhead"><div><h3>Workspace invites</h3><p>Pending invites can be revoked before they are accepted.</p></div></div><div id="workspaceInviteList" class="empty">Loading invites…</div></div>');
   const inviteSubmit=$('#workspaceInviteAdminForm')?.querySelector('button.primary');if(inviteSubmit)inviteSubmit.type='submit';
   $('#workspaceInviteAdminForm').onsubmit=async(e)=>{e.preventDefault();const form=e.currentTarget;const value=formObject(form);const button=form.querySelector('button[type="submit"]');button.disabled=true;button.textContent='Creating invite…';try{const result=await api('/api/v1/product/workspace-invites',{method:'POST',body:JSON.stringify(value)});renderIssuedWorkspaceInvite(result);notice('Invite issued once. Share it through your approved channel.');activity('Workspace invite issued',value.email);form.reset();await loadInvites()}catch(error){notice(error instanceof Error?error.message:'WORKSPACE_INVITE_UNAVAILABLE',true)}finally{button.disabled=false;button.textContent='Create invite'}};
   $('#refreshInvites').onclick=loadInvites;
@@ -124,15 +124,17 @@ void restoreStoredSession();
 
 function updateSetupPath(result){
   const viewer=state.principal?.role==='viewer';
+  const operator=state.principal?.role==='operator';
+  const humanReadOnly=viewer||operator;
   const checks=result?.checks||{};
   const providerReady=readinessReady(checks.provider);
-  const agentReady=!viewer&&readinessReady(checks.agentCredential)&&Boolean(state.agentToken);
+  const agentReady=!humanReadOnly&&readinessReady(checks.agentCredential)&&Boolean(state.agentToken);
   const authorityReady=readinessReady(checks.policy)&&readinessReady(checks.mandate);
   setReadinessState('#readinessProvider',checks.provider);
-  setReadinessState('#readinessAgent',viewer?'unavailable':(agentReady?'configured':'unavailable'),viewer?'Read-only role':(agentReady?'Ready':'Paste agent credential'));
+  setReadinessState('#readinessAgent',humanReadOnly?'unavailable':(agentReady?'configured':'unavailable'),viewer?'Read-only role':operator?'SDK-only agent credential':(agentReady?'Ready':'Paste agent credential'));
   setReadinessState('#readinessAuthority',authorityReady?'configured':'unavailable',authorityReady?'Ready':'Needs policy + mandate');
   setReadinessState('#readinessEvidence',state.lastInferenceRequestId?'configured':'unavailable',state.lastInferenceRequestId?'Receipt available':'Open run history');
-  const steps=viewer
+  const steps=humanReadOnly
     ? [{key:'provider',ready:providerReady,label:readinessLabel(checks.provider)},{key:'receipt',ready:Boolean(state.lastInferenceRequestId),label:'Open run history'}]
     : [{key:'provider',ready:providerReady,label:readinessLabel(checks.provider)},{key:'agent',ready:agentReady,label:agentReady?'Ready':'Paste agent credential'},{key:'policy',ready:readinessReady(checks.policy),label:readinessLabel(checks.policy)},{key:'mandate',ready:readinessReady(checks.mandate),label:readinessLabel(checks.mandate)},{key:'inference',ready:Boolean(state.lastInferenceRequestId),label:state.lastInferenceRequestId?'Completed':'Run one bounded call'},{key:'receipt',ready:Boolean(state.lastInferenceRequestId),label:state.lastInferenceRequestId?'Available':'Read back after call'}];
   const next=steps.find(step=>!step.ready);
@@ -146,6 +148,8 @@ function updateSetupPath(result){
 function applyRoleVisibility(principal){
   const admin=principal?.role==='admin';
   const viewer=principal?.role==='viewer';
+  const operator=principal?.role==='operator';
+  const humanReadOnly=viewer||operator;
   const hide=(selector,hidden)=>all(selector).forEach(node=>{node.hidden=hidden});
   hide('[data-view="access"],[data-page="access"]',!admin);
   hide('[data-view="agents"],[data-page="agents"]',!admin);
@@ -153,7 +157,7 @@ function applyRoleVisibility(principal){
   hide('[data-step="agent"],[data-step="policy"],[data-step="mandate"]',!admin);
   hide('#providerForm,#agentForm,#credentialForm,#policyForm,#mandateForm,#workspaceInviteAdminForm',!admin);
   hide('#reconciliationForm',!admin);
-  hide('[data-go-inference],[data-step-inference],#quickInference',viewer);
+  hide('[data-go-inference],[data-step-inference],#quickInference',humanReadOnly);
   hide('[data-view="integration"],[data-page="integration"]',viewer);
   if(viewer){const box=$('#agentDirectory');if(box){box.textContent='';box.className='empty';box.hidden=true}}
 }
@@ -165,6 +169,7 @@ function runBoundedInference(e){
   const status=form.querySelector('#quickInferenceStatus')||form.querySelector('[data-inference-status]');
   if(!prompt){form.reportValidity();return}
   if(state.principal?.role==='viewer'){if(status)status.textContent='VIEWER_READ_ONLY';notice('Viewer access is read-only and cannot run inference.',true);return}
+  if(state.principal?.role==='operator'){if(status)status.textContent='OPERATOR_AGENT_SESSION_REQUIRED';notice('Live inference runs through an agent credential. Operator sessions can inspect receipts and verify the control path.',true);return}
   if(!state.agentToken||!state.productMandateId){if(status)status.textContent='AGENT_SESSION_REQUIRED';notice('Agent credential and mandate are required for inference.',true);return}
   const model=state.model.trim();
   if(!model){if(status)status.textContent='PROVIDER_MODEL_REQUIRED';notice('Save a provider model before running inference.',true);return}
@@ -175,7 +180,7 @@ function runBoundedInference(e){
 
 function ensureQuickInference(){
   let form=$('#quickInference');
-  if(state.principal?.role==='viewer'){if(form)form.hidden=true;return}
+  if(state.principal?.role==='viewer'||state.principal?.role==='operator'){if(form)form.hidden=true;return}
   if(!form){const overview=$('[data-page="overview"]');if(!overview)return;form=document.createElement('form');form.id='quickInference';form.className='card quick-inference';form.innerHTML='<h3>First bounded inference</h3><p>Run one provider call inside the active mandate and read its receipt back immediately.</p><div class="field"><label>Prompt</label><textarea name="prompt" required placeholder="Ask a small, bounded question"></textarea></div><button class="primary" type="submit">Run bounded inference</button><span data-inference-status aria-live="polite"></span>';overview.append(form)}
   form.hidden=false;
   form.onsubmit=runBoundedInference;

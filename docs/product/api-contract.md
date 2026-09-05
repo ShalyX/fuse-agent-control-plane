@@ -10,6 +10,12 @@ Every protected route requires a bearer credential authenticated by the control 
 
 Capabilities are checked at the route boundary. The workspace is always derived from the authenticated principal. Callers cannot select or override the workspace in request bodies or query parameters.
 
+Human workspace sessions are intentionally narrower than the service credentials that created
+them. An owner session can administer the workspace. An operator session can inspect provider
+metadata, policies, mandates, receipts, and sandbox evidence, but live product inference must be
+performed with an agent credential through the SDK. A viewer session is read-only metadata access.
+This keeps a human session from being mistaken for runtime agent authority.
+
 Capability groups:
 
 - `mandates:read` for readiness and mandate reads

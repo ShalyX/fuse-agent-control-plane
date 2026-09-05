@@ -4,6 +4,7 @@ import {
   createHumanSession,
 } from "../src/http/humanSessions.js";
 import { createSessionAwareAuthenticator } from "../src/http/auth.js";
+import { API_CAPABILITIES } from "../src/identity/apiCredentials.js";
 
 describe("human workspace sessions", () => {
   it("rejects a session after its source credential is revoked", async () => {
@@ -116,5 +117,34 @@ describe("human workspace sessions", () => {
       expiresAt: first.record.expiresAt,
       revokedAt: null,
     }]);
+  });
+
+  it("gives human operators inspection and sandbox access without live inference authority", async () => {
+    const store = new MemoryHumanSessionStore();
+    const session = createHumanSession({
+      workspaceId: "workspace-1", userId: "operator-1", sourceCredentialId: "credential-source", role: "member",
+      createdAt: "2026-08-14T00:00:00.000Z", expiresAt: "2026-08-14T01:00:00.000Z",
+    }, () => Buffer.alloc(32, 13));
+    await store.put(session.record);
+    const authenticator = createSessionAwareAuthenticator({
+      authenticateToken: async () => ({
+        principalType: "service_account" as const,
+        principalId: "service-1",
+        organizationId: "workspace-1",
+        credentialId: "credential-source",
+        capabilities: [...API_CAPABILITIES],
+        role: "operator" as const,
+      }),
+      isCredentialActive: async () => true,
+    }, store);
+
+    await expect(authenticator.authenticateToken(session.token, "2026-08-14T00:30:00.000Z"))
+      .resolves.toMatchObject({
+        role: "operator",
+        capabilities: expect.arrayContaining(["mandates:read", "receipts:read", "policies:read", "providers:read", "sandbox:run"]),
+      });
+    const principal = await authenticator.authenticateToken(session.token, "2026-08-14T00:30:00.000Z");
+    expect(principal?.capabilities).not.toContain("inference:invoke");
+    expect(principal?.capabilities).not.toContain("mandates:write");
   });
 });
