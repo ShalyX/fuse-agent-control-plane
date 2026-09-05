@@ -121,5 +121,64 @@ function ensureAdminInviteSurface(){
 }
 void ensureJoinInviteSurface();
 void restoreStoredSession();
+
+function updateSetupPath(result){
+  const viewer=state.principal?.role==='viewer';
+  const checks=result?.checks||{};
+  const providerReady=readinessReady(checks.provider);
+  const agentReady=!viewer&&readinessReady(checks.agentCredential)&&Boolean(state.agentToken);
+  const authorityReady=readinessReady(checks.policy)&&readinessReady(checks.mandate);
+  setReadinessState('#readinessProvider',checks.provider);
+  setReadinessState('#readinessAgent',viewer?'unavailable':(agentReady?'configured':'unavailable'),viewer?'Read-only role':(agentReady?'Ready':'Paste agent credential'));
+  setReadinessState('#readinessAuthority',authorityReady?'configured':'unavailable',authorityReady?'Ready':'Needs policy + mandate');
+  setReadinessState('#readinessEvidence',state.lastInferenceRequestId?'configured':'unavailable',state.lastInferenceRequestId?'Receipt available':'Open run history');
+  const steps=viewer
+    ? [{key:'provider',ready:providerReady,label:readinessLabel(checks.provider)},{key:'receipt',ready:Boolean(state.lastInferenceRequestId),label:'Open run history'}]
+    : [{key:'provider',ready:providerReady,label:readinessLabel(checks.provider)},{key:'agent',ready:agentReady,label:agentReady?'Ready':'Paste agent credential'},{key:'policy',ready:readinessReady(checks.policy),label:readinessLabel(checks.policy)},{key:'mandate',ready:readinessReady(checks.mandate),label:readinessLabel(checks.mandate)},{key:'inference',ready:Boolean(state.lastInferenceRequestId),label:state.lastInferenceRequestId?'Completed':'Run one bounded call'},{key:'receipt',ready:Boolean(state.lastInferenceRequestId),label:state.lastInferenceRequestId?'Available':'Read back after call'}];
+  const next=steps.find(step=>!step.ready);
+  steps.forEach(step=>{const node=document.querySelector('[data-step="'+step.key+'"]');if(!node)return;node.classList.toggle('complete',step.ready);node.classList.toggle('current',Boolean(next&&next.key===step.key));const status=node.querySelector('[data-step-status]');if(status)status.textContent=step.label});
+  const nextText=next?(next.key==='provider'?'Inspect provider':next.key==='agent'?'Add the agent credential':next.key==='policy'?'Publish policy':next.key==='mandate'?'Review mandate':next.key==='inference'?'Run first bounded inference':'Open run history'):'Control path verified';
+  $('#readinessSetup').textContent=nextText;
+  const summary=$('#setupPathSummary');
+  if(summary){const text=summary.querySelector('[data-path-summary]');if(text)text.textContent=nextText;const dot=summary.querySelector('.dot');if(dot)dot.classList.toggle('on',!next)}
+}
+
+function applyRoleVisibility(principal){
+  const admin=principal?.role==='admin';
+  const viewer=principal?.role==='viewer';
+  const hide=(selector,hidden)=>all(selector).forEach(node=>{node.hidden=hidden});
+  hide('[data-view="access"],[data-page="access"]',!admin);
+  hide('[data-view="agents"],[data-page="agents"]',!admin);
+  hide('[data-view="policy"],[data-page="policy"]',!admin);
+  hide('[data-step="agent"],[data-step="policy"],[data-step="mandate"]',!admin);
+  hide('#providerForm,#agentForm,#credentialForm,#policyForm,#mandateForm,#workspaceInviteAdminForm',!admin);
+  hide('#reconciliationForm',!admin);
+  hide('[data-go-inference],[data-step-inference],#quickInference',viewer);
+  hide('[data-view="integration"],[data-page="integration"]',viewer);
+  if(viewer){const box=$('#agentDirectory');if(box){box.textContent='';box.className='empty';box.hidden=true}}
+}
+
+function runBoundedInference(e){
+  e.preventDefault();
+  const form=e.currentTarget;
+  const prompt=String(new FormData(form).get('prompt')||'').trim();
+  const status=form.querySelector('#quickInferenceStatus')||form.querySelector('[data-inference-status]');
+  if(!prompt){form.reportValidity();return}
+  if(state.principal?.role==='viewer'){if(status)status.textContent='VIEWER_READ_ONLY';notice('Viewer access is read-only and cannot run inference.',true);return}
+  if(!state.agentToken||!state.productMandateId){if(status)status.textContent='AGENT_SESSION_REQUIRED';notice('Agent credential and mandate are required for inference.',true);return}
+  const model=state.model.trim();
+  if(!model){if(status)status.textContent='PROVIDER_MODEL_REQUIRED';notice('Save a provider model before running inference.',true);return}
+  const inferenceRequestId=requestId('infer');
+  if(status)status.textContent='Running bounded inference…';
+  void (async()=>{try{const response=await fetch('/api/v1/product/inference',{method:'POST',headers:{'Content-Type':'application/json',Authorization:'Bearer '+state.agentToken,'Idempotency-Key':inferenceRequestId,'X-Fuse-Mandate':state.productMandateId},body:JSON.stringify({model,messages:[{role:'user',content:prompt}],max_tokens:256}),cache:'no-store'});const body=await response.json().catch(()=>({}));if(response.status===402)throw new Error('CONTROL_MODE_PAYMENT_UNEXPECTED');if(!response.ok)throw new Error(body?.error?.code||'INFERENCE_FAILED');const receiptResponse=await fetch('/api/v1/product/receipts/'+encodeURIComponent(inferenceRequestId),{headers:{Authorization:'Bearer '+state.agentToken,'X-Fuse-Mandate':state.productMandateId},cache:'no-store'});const receiptBody=await receiptResponse.json().catch(()=>({}));if(!receiptResponse.ok)throw new Error(receiptBody?.error?.code||'RECEIPT_READBACK_FAILED');const receipt=receiptBody.receipt;state.lastInferenceRequestId=receipt.requestId;persistSession();if(status)status.textContent='Receipt read back: '+receipt.requestId+' · '+receipt.executionStatus+' · reserved '+receipt.reservedCostAtomic+' · actual '+(receipt.actualCostAtomic??'unresolved');updateSetupPath(state.readiness);await loadRuns();activity('Bounded inference completed',inferenceRequestId)}catch(error){const message=error instanceof Error?error.message:'INFERENCE_FAILED';if(status)status.textContent=message;notice(message,true)}})();
+}
+
+function ensureQuickInference(){
+  let form=$('#quickInference');
+  if(state.principal?.role==='viewer'){if(form)form.hidden=true;return}
+  if(!form){const overview=$('[data-page="overview"]');if(!overview)return;form=document.createElement('form');form.id='quickInference';form.className='card quick-inference';form.innerHTML='<h3>First bounded inference</h3><p>Run one provider call inside the active mandate and read its receipt back immediately.</p><div class="field"><label>Prompt</label><textarea name="prompt" required placeholder="Ask a small, bounded question"></textarea></div><button class="primary" type="submit">Run bounded inference</button><span data-inference-status aria-live="polite"></span>';overview.append(form)}
+  form.hidden=false;
+  form.onsubmit=runBoundedInference;
+}
 </script></body></html>`;
 }
